@@ -23,6 +23,8 @@ analysis/probes/vtof
 analysis/probes/vtofdiag
 analysis/probes/vtofq
 analysis/probes/vtrender
+analysis/probes/vthdr
+analysis/probes/vtp010
 
 # ---------------------------------------------------------------------------
 # CoreML conversion artefacts: 200 MB of .mlpackage plus 91 MB of upstream

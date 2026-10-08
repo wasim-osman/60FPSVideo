@@ -1,97 +1,136 @@
 import CoreVideo
 import Foundation
 
-/// NV12 as packed raw bytes, and the CVPixelBuffer ↔ raw-bytes bridge.
+/// A biplanar 4:2:0 format the pipeline can carry from decode to encode.
 ///
-/// The pipeline stays in `420YpCbCr8BiPlanarVideoRange` from decode to encode
-/// (invariant 4 and invariant 16). That is the format VideoToolbox decodes to and
-/// `VTCompressionSession` encodes from, so there is no colour conversion anywhere —
-/// and no chance of the range mismatch that made the first engine comparison wrong
-/// by 96%.
-public enum NV12 {
+/// Both cases have the same shape — a full-size luma plane, then an interleaved
+/// CbCr plane at half height — and differ only in sample width. That is why one
+/// implementation covers both, and why adding 10-bit did not need a second code
+/// path through the engine.
+///
+/// Staying inside these formats is invariant 4 and invariant 16: VideoToolbox
+/// decodes *to* them and `VTCompressionSession` encodes *from* them, so there is
+/// no colour conversion anywhere. Leaving for RGB and coming back is what made the
+/// first engine comparison wrong by 96%.
+public enum FrameFormat: Sendable {
 
-    public static let pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    /// 8-bit, `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange` ("420v").
+    /// Studio range 16..235. The native SDR decode/encode format.
+    case nv12
 
-    /// Bytes in one packed NV12 frame: a full-size luma plane plus one interleaved
-    /// chroma plane at quarter size.
-    public static func byteSize(width: Int, height: Int) -> Int {
-        width * height * 3 / 2
+    /// 10-bit, `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` ("x420").
+    /// Studio range 64..940. The HDR path — measured correct to 0.00/1023 at every
+    /// phase, and accepted by the processor at 3840×1632 as well as 1080p.
+    case p010
+
+    public var pixelFormat: OSType {
+        switch self {
+        case .nv12: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        case .p010: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        }
     }
 
-    /// Copy one packed NV12 frame into a `CVPixelBuffer`.
+    /// Bytes per sample. 1 for 8-bit, 2 for 10-bit (stored in the high 10 bits of
+    /// a 16-bit little-endian word).
+    public var bytesPerSample: Int {
+        switch self {
+        case .nv12: 1
+        case .p010: 2
+        }
+    }
+
+    public var bitDepth: Int {
+        switch self {
+        case .nv12: 8
+        case .p010: 10
+        }
+    }
+
+    /// Bytes in one packed frame: luma at full size plus interleaved chroma at
+    /// quarter size, all scaled by the sample width.
+    ///
+    /// `width * height * 3 / 2 * bytesPerSample` — 1.5 bytes/pixel for NV12, 3 for
+    /// P010.
+    public func packedByteSize(width: Int, height: Int) -> Int {
+        width * height * 3 / 2 * bytesPerSample
+    }
+
+    /// Copy one packed frame into a `CVPixelBuffer`.
     ///
     /// ## The trap this exists to avoid
     ///
     /// For a 420 biplanar buffer, `CVPixelBufferGetWidthOfPlane(buffer, 1)` returns
     /// the **chroma sample width** (`width / 2`), *not* the row length. The
-    /// interleaved CbCr row is `width` bytes, and the plane's stride is
-    /// `bytesPerRow`. Using the sample width as the copy length writes only half of
-    /// every chroma row, which tiles into exactly the first `height / 4` rows and
-    /// leaves the rest zeroed — a solid green lower half of the frame.
+    /// interleaved CbCr row is `width * bytesPerSample` bytes — there are `width/2`
+    /// pairs of two samples. Using the sample width as the copy length writes only
+    /// half of every chroma row, which tiles into exactly the first `height / 4`
+    /// rows and leaves the rest zeroed: a solid green lower half of the frame.
     ///
-    /// So: copy `width` bytes per chroma row, and advance by `bytesPerRow`.
-    public static func load(packed: UnsafeRawPointer,
-                            into buffer: CVPixelBuffer,
-                            width: Int,
-                            height: Int) {
+    /// So: copy `width * bytesPerSample` bytes per chroma row, and advance by
+    /// `bytesPerRow`.
+    public func load(packed: UnsafeRawPointer,
+                     into buffer: CVPixelBuffer,
+                     width: Int,
+                     height: Int) {
         CVPixelBufferLockBaseAddress(buffer, [])
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
 
-        if let yPlane = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) {
-            let destination = yPlane.assumingMemoryBound(to: UInt8.self)
+        let rowBytes = width * bytesPerSample
+
+        if let luma = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) {
             let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
             for row in 0..<height {
-                memcpy(destination + row * stride,
-                       packed + row * width,
-                       width)
+                memcpy(luma + row * stride, packed + row * rowBytes, rowBytes)
             }
         }
 
-        if let chromaPlane = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) {
-            let destination = chromaPlane.assumingMemoryBound(to: UInt8.self)
+        if let chroma = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) {
             let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
-            let chromaOffset = width * height
+            let lumaBytes = width * height * bytesPerSample
             for row in 0..<(height / 2) {
-                memcpy(destination + row * stride,
-                       packed + chromaOffset + row * width,
-                       width)
+                memcpy(chroma + row * stride,
+                       packed + lumaBytes + row * rowBytes,
+                       rowBytes)
             }
         }
     }
 
-    /// Copy a `CVPixelBuffer` back out as packed NV12.
-    public static func store(buffer: CVPixelBuffer,
-                             into destination: UnsafeMutableRawPointer,
-                             width: Int,
-                             height: Int) {
+    /// Copy a `CVPixelBuffer` back out as a packed frame.
+    public func store(buffer: CVPixelBuffer,
+                      into destination: UnsafeMutableRawPointer,
+                      width: Int,
+                      height: Int) {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
 
-        if let yPlane = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) {
-            let source = yPlane.assumingMemoryBound(to: UInt8.self)
+        let rowBytes = width * bytesPerSample
+
+        if let luma = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) {
             let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
             for row in 0..<height {
-                memcpy(destination + row * width,
-                       source + row * stride,
-                       width)
+                memcpy(destination + row * rowBytes, luma + row * stride, rowBytes)
             }
         }
 
-        if let chromaPlane = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) {
-            let source = chromaPlane.assumingMemoryBound(to: UInt8.self)
+        if let chroma = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) {
             let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
-            let chromaOffset = width * height
+            let lumaBytes = width * height * bytesPerSample
             for row in 0..<(height / 2) {
-                memcpy(destination + chromaOffset + row * width,
-                       source + row * stride,
-                       width)
+                memcpy(destination + lumaBytes + row * rowBytes,
+                       chroma + row * stride,
+                       rowBytes)
             }
         }
     }
 
-    /// Run `body` with a read-only view of the luma plane.
-    public static func withLuma<T>(of buffer: CVPixelBuffer,
-                                   _ body: (UnsafePointer<UInt8>, Int, Int) throws -> T) rethrows -> T {
+    /// Run `body` with a read-only view of the luma plane, as raw bytes.
+    ///
+    /// The pointer is `UInt8` for both formats; for `.p010` the caller must read it
+    /// as 16-bit little-endian words and shift right by 6 to get the 10-bit code.
+    /// `rowBytes` is the plane stride, which is **not** `width * bytesPerSample` —
+    /// buffers are padded.
+    public func withLuma<T>(of buffer: CVPixelBuffer,
+                            _ body: (UnsafePointer<UInt8>, Int, Int) throws -> T) rethrows -> T {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let plane = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)!
@@ -111,18 +150,20 @@ public final class PixelBufferPool {
     private let pool: CVPixelBufferPool
     public let width: Int
     public let height: Int
+    public let format: FrameFormat
 
     public init(width: Int, height: Int,
-                format: OSType = NV12.pixelFormat,
+                format: FrameFormat = .nv12,
                 capacity: Int) throws {
         self.width = width
         self.height = height
+        self.format = format
 
         let poolAttributes: [CFString: Any] = [
             kCVPixelBufferPoolMinimumBufferCountKey: capacity,
         ]
         let bufferAttributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: format,
+            kCVPixelBufferPixelFormatTypeKey: format.pixelFormat,
             kCVPixelBufferWidthKey: width,
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,

@@ -26,16 +26,18 @@ final class OutputWriter: @unchecked Sendable {
     private let descriptor: Int32
     private let width: Int
     private let height: Int
+    private let format: FrameFormat
     private let frameSize: Int
     private let lock = NSLock()
     private var writtenCount = 0
     private var problemList: [String] = []
 
-    init(descriptor: Int32, width: Int, height: Int) {
+    init(descriptor: Int32, width: Int, height: Int, format: FrameFormat = .nv12) {
         self.descriptor = descriptor
         self.width = width
         self.height = height
-        self.frameSize = NV12.byteSize(width: width, height: height)
+        self.format = format
+        self.frameSize = format.packedByteSize(width: width, height: height)
     }
 
     func write(_ buffer: CVPixelBuffer, at index: Int) {
@@ -43,8 +45,8 @@ final class OutputWriter: @unchecked Sendable {
         // shared between them.
         var packed = [UInt8](repeating: 0, count: frameSize)
         packed.withUnsafeMutableBytes { raw in
-            NV12.store(buffer: buffer, into: raw.baseAddress!,
-                       width: width, height: height)
+            format.store(buffer: buffer, into: raw.baseAddress!,
+                         width: width, height: height)
         }
         let wrote = packed.withUnsafeBytes {
             pwrite(descriptor, $0.baseAddress, frameSize, off_t(index * frameSize))
@@ -178,7 +180,13 @@ guard outputRate.doubleValue >= sourceRate.doubleValue else {
 
 let width = options.width
 let height = options.height
-let frameSize = NV12.byteSize(width: width, height: height)
+
+// The harness stays on 8-bit NV12 for now. `FrameFormat` carries 10-bit P010 as
+// well — measured correct to 0.00/1023 at every phase — but scene detection and
+// the packed-input reader both still assume one byte per luma sample, so switching
+// the harness over is part of the HDR work rather than a flag flip.
+let format = FrameFormat.nv12
+let frameSize = format.packedByteSize(width: width, height: height)
 
 let inputDescriptor = open(options.input, O_RDONLY)
 guard inputDescriptor >= 0 else { fail("cannot open \(options.input)") }
@@ -257,7 +265,8 @@ if options.sceneDetect, report.cutCount > 0 {
 
 let outputDescriptor = open(options.output, O_RDWR | O_CREAT | O_TRUNC, 0o644)
 guard outputDescriptor >= 0 else { fail("cannot create \(options.output)") }
-let writer = OutputWriter(descriptor: outputDescriptor, width: width, height: height)
+let writer = OutputWriter(descriptor: outputDescriptor, width: width, height: height,
+                          format: format)
 
 let engine = VTFrameProcessorEngine(source: sourceRate, output: outputRate,
                                     depth: options.depth)
@@ -333,7 +342,7 @@ for interval in effectivePlan.intervals {
                 loadFailure = "short read at source frame \(sourceIndex): \(got)"
                 return
             }
-            NV12.load(packed: base, into: buffer, width: width, height: height)
+            format.load(packed: base, into: buffer, width: width, height: height)
         }
     }
     if let loadFailure {
