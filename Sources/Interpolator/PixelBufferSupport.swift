@@ -46,6 +46,47 @@ public enum FrameFormat: Sendable {
         }
     }
 
+    /// The largest legal code value: 255 for 8-bit, 1023 for 10-bit.
+    ///
+    /// This is the right divisor for turning a sample into a 0...1 fraction, and
+    /// using it rather than the bit depth matters for a non-obvious reason. Both
+    /// formats are *studio range*, so the used portion is a fixed fraction of full
+    /// scale in both:
+    ///
+    /// - NV12: 16...235, i.e. 0.0627...0.9216 of 255
+    /// - P010: 64...940, i.e. 0.0626...0.9189 of 1023
+    ///
+    /// Dividing each by its own maximum therefore lands the two on the same scale
+    /// to within 0.3%. That is what lets the scene-change thresholds, which were
+    /// calibrated on 8-bit footage, carry over to 10-bit untouched — and why
+    /// normalising by bit depth (`>> 8`, say) would be wrong.
+    public var maxCodeValue: Int {
+        switch self {
+        case .nv12: 255
+        case .p010: 1023
+        }
+    }
+
+    /// Read one luma sample out of a row, as a raw code value.
+    ///
+    /// 8-bit: the byte *is* the code. 10-bit P010: the code occupies the **top ten
+    /// bits of a 16-bit little-endian word**, so the raw word is `code << 6` and
+    /// has to be shifted back down before it means anything. Comparing raw words
+    /// against 8-bit thresholds without shifting is the obvious way to get this
+    /// wrong; it produces a histogram that looks plausible and is off by 64×.
+    ///
+    /// `littleEndian` is stated explicitly rather than relying on the host, because
+    /// P010 is defined as little-endian regardless of the machine reading it.
+    @inline(__always)
+    public func lumaCode(_ row: UnsafeRawPointer, _ x: Int) -> Int {
+        switch self {
+        case .nv12:
+            Int(row.load(fromByteOffset: x, as: UInt8.self))
+        case .p010:
+            Int(UInt16(littleEndian: row.load(fromByteOffset: x * 2, as: UInt16.self)) >> 6)
+        }
+    }
+
     /// Bytes in one packed frame: luma at full size plus interleaved chroma at
     /// quarter size, all scaled by the sample width.
     ///

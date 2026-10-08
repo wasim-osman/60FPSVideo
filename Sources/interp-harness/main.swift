@@ -2,13 +2,14 @@ import CoreVideo
 import Foundation
 import Interpolator
 
-// A headless end-to-end pipeline: packed NV12 in, packed NV12 out.
+// A headless end-to-end pipeline: packed frames in, packed frames out.
 //
 // It exists to make the whole chain testable without a UI, and to keep the
 // measurement harnesses honest — the numbers in reports/ came from a script that
 // did this inline, and this is that logic made reusable.
 //
-// usage: interp-harness IN.nv12 W H SRC_RATE OUT_RATE OUT.nv12 [options]
+// usage: interp-harness IN W H SRC_RATE OUT_RATE OUT [options]
+//   --format nv12|p010   sample width of the packed input (default nv12)
 //   --depth N            requests in flight (default 2, minimum 2)
 //   --max-frames N       stop after N source frames
 //   --detect-only        report scene cuts and exit, no render
@@ -94,6 +95,7 @@ struct Options {
     var sourceRate = ""
     var outputRate = ""
     var output = ""
+    var format = FrameFormat.nv12
     var depth = 2
     var maxFrames: Int? = nil
     var detectOnly = false
@@ -117,7 +119,8 @@ func parseOptions() -> Options {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 6 else {
         FileHandle.standardError.write("""
-        usage: interp-harness IN.nv12 W H SRC_RATE OUT_RATE OUT.nv12 [options]
+        usage: interp-harness IN W H SRC_RATE OUT_RATE OUT [options]
+          --format nv12|p010   sample width of the packed input (default nv12)
           --depth N            requests in flight (default 2, minimum 2)
           --max-frames N       stop after N source frames
           --detect-only        report scene cuts and exit, no render
@@ -126,6 +129,10 @@ func parseOptions() -> Options {
         Rates accept an exact rational ("60000/1001") or the industry shorthand
         ("59.94"). The shorthand is mapped onto the exact NTSC rational, because
         "59.94" is a name for 60000/1001 and not a decimal value.
+
+        p010 is packed as 16-bit little-endian words with the 10-bit code in the
+        top ten bits — the same layout VideoToolbox and ffmpeg's p010le use, so
+        the input needs no repacking.
 
         """.data(using: .utf8)!)
         exit(2)
@@ -144,6 +151,14 @@ func parseOptions() -> Options {
     var i = 6
     while i < args.count {
         switch args[i] {
+        case "--format":
+            i += 1
+            guard i < args.count else { fail("--format needs a value") }
+            switch args[i] {
+            case "nv12": options.format = .nv12
+            case "p010": options.format = .p010
+            default: fail("unknown format '\(args[i])' — expected nv12 or p010")
+            }
         case "--depth":
             i += 1
             guard i < args.count, let value = Int(args[i]) else { fail("--depth needs a number") }
@@ -181,12 +196,17 @@ guard outputRate.doubleValue >= sourceRate.doubleValue else {
 let width = options.width
 let height = options.height
 
-// The harness stays on 8-bit NV12 for now. `FrameFormat` carries 10-bit P010 as
-// well — measured correct to 0.00/1023 at every phase — but scene detection and
-// the packed-input reader both still assume one byte per luma sample, so switching
-// the harness over is part of the HDR work rather than a flag flip.
-let format = FrameFormat.nv12
+// The sample width is a flag now, so the same binary drives the SDR and the HDR
+// path. What this does *not* do is change the pixel format of the engine's own
+// buffers — that comes from the same value, and the pool is built with it.
+let format = options.format
 let frameSize = format.packedByteSize(width: width, height: height)
+
+// Packed input has no padding, so the luma stride is exactly the row length:
+// `width` bytes at 8-bit, `width * 2` at 10-bit. That is *not* the same as the
+// stride of a CVPixelBuffer's plane, which the pool pads — the two only coincide
+// for 8-bit input.
+let packedLumaStride = width * format.bytesPerSample
 
 let inputDescriptor = open(options.input, O_RDONLY)
 guard inputDescriptor >= 0 else { fail("cannot open \(options.input)") }
@@ -197,7 +217,8 @@ guard sourceFrameCount >= 2 else {
     fail("need at least 2 source frames, found \(sourceFrameCount)")
 }
 
-log("input : \(sourceFrameCount) frames  \(width)x\(height)  \(frameSize) B/frame")
+log("input : \(sourceFrameCount) frames  \(width)x\(height)  \(frameSize) B/frame  "
+    + "\(format.bitDepth)-bit")
 log(String(format: "rates : %@ -> %@   (ratio %.6f)", "\(sourceRate)", "\(outputRate)",
            outputRate.doubleValue / sourceRate.doubleValue))
 
@@ -221,8 +242,10 @@ if options.sceneDetect {
         }
         guard got == frameSize else { shortRead(frame: frame, expected: frameSize, got: got) }
         signatures.append(staging.withUnsafeBytes {
-            FrameSignature.compute(luma: $0.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                                   width: width, height: height, bytesPerRow: width)
+            FrameSignature.compute(luma: $0.baseAddress!,
+                                   format: format,
+                                   width: width, height: height,
+                                   bytesPerRow: packedLumaStride)
         })
     }
     report = SceneChangeDetector.detect(signatures: signatures)
@@ -305,7 +328,8 @@ let pool: PixelBufferPool
 var slots: [Slot] = []
 do {
     let capacity = engine.depth * (2 + engine.maximumInterpolationsPerInterval)
-    pool = try PixelBufferPool(width: width, height: height, capacity: capacity)
+    pool = try PixelBufferPool(width: width, height: height, format: format,
+                               capacity: capacity)
     for _ in 0..<engine.depth {
         let destinations = try (0..<engine.maximumInterpolationsPerInterval).map { _ in
             try pool.makeBuffer()
@@ -437,9 +461,10 @@ let problems = writer.problems
 let written = writer.written
 
 log("")
-log(String(format: "RESULT %@ %dx%d %@->%@ depth=%d | %d out frames | "
+log(String(format: "RESULT %@ %dx%d %@ %@->%@ depth=%d | %d out frames | "
            + "%d interpolated | %d passthrough | %d cuts",
-           engine.name, width, height, "\(sourceRate)", "\(outputRate)", engine.depth,
+           engine.name, width, height, "\(format.bitDepth)-bit",
+           "\(sourceRate)", "\(outputRate)", engine.depth,
            effectivePlan.outputFrameCount, effectivePlan.interpolatedCount,
            effectivePlan.passthroughCount, report.cutCount))
 log(String(format: "wall  : %.2fs | OUTPUT %6.1f fps | %6.2f ms/interval",

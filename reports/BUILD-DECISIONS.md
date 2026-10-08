@@ -273,7 +273,8 @@ These are not choices. Each one is a measured failure mode, and violating any of
 2. **Recycle buffers from a `CVPixelBufferPool` ring.** Per-frame `CVPixelBufferCreate` crashes after
    65–90 frames.
 3. **Keep 2 requests in flight.** Depth 1 fails 23.976→60 (56.7 fps).
-4. **Use `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`.** Native decode/encode format; zero
+4. **Use `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange` for SDR and
+   `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` for HDR.** Native decode/encode formats; zero
    colour conversion. The API's `frameSupportedPixelFormats` misreports this — ignore it.
    *Now pinned down.* The property, and `sourcePixelBufferAttributes` / `destinationPixelBufferAttributes`
    with it, advertise **exactly one** format: `0x52476841` = `'RGhA'` = `kCVPixelFormatType_64RGBAHalf`,
@@ -282,6 +283,10 @@ These are not choices. Each one is a measured failure mode, and violating any of
    (both ranges), **10-bit P010** (both ranges) and BGRA. The only real failure is NV16 (4:2:2), which
    returns error `-19730`. So the advertised list is not merely incomplete — its single entry is wrong,
    and following it would put a 64-bit float round trip in the middle of an 8-bit pipeline.
+   *Both are now in use.* The engine takes a `FrameFormat` and the two formats differ only in sample
+   width, so one implementation covers both and the 10-bit path needed **no second code path** through
+   the engine. P010 is measured correct to **0.00/1023** at every phase and accepted at 3840×1632 as
+   well as 1080p; the full HDR chain is §17.
 5. **Always check the completion-handler error.** The low-latency path fails *silently* above
    1920×1080; `startSession` still reports success.
 6. **Leave `usePrecomputedFlow: false`.** Pre-computed flow measured 14% *slower*.
@@ -351,6 +356,42 @@ These are not choices. Each one is a measured failure mode, and violating any of
     from a base address without locking, got 0, and reported that **every** pixel format had failed
     when in fact **none of them had been measured**. Keep geometry and base-address access separate
     (`FrameFormat`/`PixelBufferSupport` does), and never derive a size from a base address.
+20. **Normalise a sample by its format's maximum code value — 255 or 1023 — never by bit depth.**
+    10-bit P010 stores its code in the **top ten bits of a 16-bit little-endian word**, so the raw word
+    is `code << 6` and has to be shifted back down before it means anything. Read it unshifted and every
+    number downstream is wrong by 64×, *plausibly*: the grid saturates toward 1.0, the histogram
+    collapses into the top bin, and nothing throws. Then divide by 1023, not 1024 and not by the bit
+    depth — because both formats are studio range, so the used portion is the same fraction of full
+    scale in both (NV12 16..235 = 0.0627..0.9216 of 255; P010 64..940 = 0.0626..0.9189 of 1023, agreeing
+    to within 0.3%). That is the whole reason one threshold set serves both formats, and it is measured,
+    not assumed: 8-bit and 10-bit encodings of the same synthetic content agree on the grid to within
+    **0.002**, where a missing shift would put them off by ~0.6 (`TenBitSignatureTests`). Confirmed on
+    real film too — the same five cuts are found at the same five source frames in the 8-bit SDR and
+    10-bit HDR versions of the reference clip.
+21. **HDR10 static metadata is never written unless you ask for it, and the two encoders that can write
+    it take different routes.** There is no default: an HEVC Main10 encode with the right colour tags
+    still produces an HDR *signal* with no mastering-display or content-light-level information, which
+    players fall back to guessing at. On the VideoToolbox path the route is
+    `kVTCompressionPropertyKey_MasteringDisplayColorVolume` and `..._ContentLightLevelInfo`, passed
+    through `AVVideoCompressionPropertiesKey`. Measured round trip on the reference disc's own values:
+    all four colour tags, the 24-byte mastering-display payload and the 4-byte light-level payload come
+    out **byte-identical** to the source (`analysis/probes/vt_hdr_encode.swift`). Two traps in the
+    payload: the luminances are in units of **0.0001 cd/m²**, so 1000 nits is `10000000` and 0.005 nits
+    is `50` — writing nits directly yields a display claiming a 0.1-nit peak, which decoders accept
+    without complaint; and the primaries are ordered **green, blue, red**, not RGB. Note also that
+    ffmpeg's `-master_display` is a **libx265-only** option and does not exist for
+    `hevc_videotoolbox`, so an ffmpeg-based check of the production path is not possible — it has to be
+    tested through AVFoundation.
+22. **Two extractions of "the same" timestamp are not guaranteed to start on the same frame.** `ffmpeg
+    -ss T -i SRC` seeks to a keyframe and decodes forward, and which frame it lands on depends on how the
+    timestamp rounds. An SDR and an HDR extraction of the same `-ss` value differed by exactly one frame
+    — which showed up as the scene detector reporting all five cuts one frame later in HDR than in SDR.
+    A *constant* offset across every detection is the signature of a misaligned pair of files, not of a
+    detection difference, but that has to be measured rather than reasoned about: correlating the two
+    luma planes over candidate offsets found the true alignment at **0.954** against **0.880** for the
+    neighbouring offsets (`analysis/align_probe.py`), and re-extracting one frame later made the cut
+    lists identical. **Verify alignment before concluding anything about two clips that are supposed to
+    match.**
 
 ---
 
@@ -737,18 +778,134 @@ translational shot. If a future title shows visible ghosting where VT struggles,
 
 ---
 
+## 17. HDR end to end — **working**, and what it costs
+
+You chose "do HDR properly", so the question was whether the pipeline can carry a genuine 10-bit HDR
+signal from the disc to a finished file without flattening it somewhere in the middle. It can. Here is
+the whole chain, measured at every link.
+
+**The source.** The same 191 frames as the night reference clip, but extracted as **native 10-bit**
+instead of tone-mapped to SDR — no colour work at all, `ffmpeg -pix_fmt p010le`, 18,800,640 bytes per
+frame, exactly `3840 × 1632 × 3`. The disc's own HDR10 metadata:
+
+| | Value |
+| --- | --- |
+| Mastering display | R(0.680, 0.320) G(0.265, 0.690) B(0.150, 0.060) WP(0.3127, 0.3290) |
+| Peak / minimum luminance | **1000 nits** / 0.005 nits |
+| MaxCLL / MaxFALL | **1000** / **221** |
+| Tags | `bt2020nc` / `smpte2084` (PQ) / `bt2020`, tv range |
+
+**Is the input really 10-bit?** Worth checking rather than assuming, because an 8-bit pipeline
+dressed up as 10-bit looks completely normal. Two independent tells (`analysis/p010_stats.py`):
+
+```
+frame  distinct    %x4   min    p01     p50    p99  p99.9   max  lowbits
+    0       587  25.0%    83     99     206    580    621   679        0
+  120       638  25.0%    81     99     171    525    702   721        0
+```
+
+Zero non-zero low bits (so the code really is in the top ten bits), **543–650 distinct codes** of 1024
+possible, and 25.0% of codes on multiples of 4 — which is exactly chance. All three say genuine 10-bit.
+This content spans **~650 code levels where an 8-bit pipeline could represent only 256**, which is the
+concrete benefit: that is where banding lives, and the segment is a night scene with practical lights,
+the case where 8-bit is worst.
+
+**Cuts, cross-checked against the 8-bit version.** The same five cuts at the same five source frames in
+both formats:
+
+```
+10-bit HDR : 6-7, 69-70, 101-102, 108-109, 168-169
+ 8-bit SDR : 6-7, 69-70, 101-102, 108-109, 168-169
+```
+
+This is real-film proof of invariant 20 — one threshold set, two formats, no retuning. It also cost
+some effort to establish: the first attempt reported the HDR cuts all **one frame later**, which looked
+like a format-dependent detection difference. It was not. The two files were misaligned by one frame,
+because `-ss` lands where the timestamp rounds (invariant 22). Correlating the luma planes found the
+true offset at **0.954** against **0.880** for its neighbours; re-extracting one frame later made the
+lists identical.
+
+**The render.**
+
+```
+input : 191 frames  3840x1632  18800640 B/frame  10-bit
+scenes: 5 cut(s) in 191 frames
+plan  : 475 out frames = 370 interpolated + 105 passthrough
+        10 of those interpolations were turned into passthroughs by scene detection
+wall  : 25.4s | OUTPUT 18.7 fps | 137.12 ms/interval
+[PASS] passthrough frames byte-identical to source
+[PASS] wrote 475/475 frames
+```
+
+**The output is still genuinely 10-bit** — 444–587 distinct codes, 25.0% on multiples of 4, zero
+low-bit violations. Output frame 0 matches input frame 0 exactly (p50 206, range 83..679 in both),
+which is right, because it is a passthrough.
+
+**Every passthrough verified, not sampled.** The harness spot-checks every 37th frame; this checks all
+of them, with the mapping derived from the frame rates rather than assumed — output frame `k` lands on
+source frame `2k/5`, so the exact coincidences are at `k` a multiple of 5:
+
+- **95/95 exact-rate passthroughs byte-identical.**
+- **10/10 cut-forced passthroughs** match the nearest-source rule, phases `0.2, 0.4 → outgoing` and
+  `0.6, 0.8 → incoming`, exactly as the plan specifies.
+
+**The encode.** This is where "properly" is won or lost, because an HEVC Main10 encode with correct
+colour tags still carries **no** HDR10 static metadata unless it is asked for. On the production path —
+AVAssetWriter / VideoToolbox, which is what the batch converter will use — the metadata is set with
+`kVTCompressionPropertyKey_MasteringDisplayColorVolume` and `..._ContentLightLevelInfo`. Measured round
+trip (`analysis/probes/vt_hdr_encode.swift`):
+
+| | Source disc | After VideoToolbox encode |
+| --- | --- | --- |
+| Profile | — | **Main 10** |
+| Colour tags | bt2020nc / smpte2084 / bt2020 / tv | **identical** |
+| Mastering display | 34000,16000 / 13250,34500 / 7500,3000 / 15635,16450, max 10000000, min 50 | **byte-identical** |
+| Content light level | 1000 / 221 | **byte-identical** |
+
+And the samples survive too: decoding the encode back to P010 and comparing against what went in gives
+**mean 1.303/1023 (0.33/255)** luma error over 48 frames — the codec is doing its job, not the pipeline
+quietly rounding to 8-bit. A libx265 encode of the same stream produces identical metadata, as a
+cross-check.
+
+Two traps worth recording, both now invariant 21: the luminances are in units of **0.0001 cd/m²** (so
+1000 nits is `10000000`, and writing nits directly yields a display claiming a 0.1-nit peak that
+decoders accept silently), and the primaries are ordered **green, blue, red**. Also worth knowing:
+ffmpeg's `-master_display` is a **libx265-only** option with no `hevc_videotoolbox` equivalent, so the
+production path cannot be verified through ffmpeg at all — it has to go through AVFoundation.
+
+**What HDR costs.** Same content, same machine, same frame count, measured back to back:
+
+| | 8-bit NV12 | 10-bit P010 |
+| --- | --- | --- |
+| wall | 19.98 s | 25.37 s |
+| output fps | 23.8 | 18.7 |
+| **ms/interval** | **107.99** | **137.12** |
+
+**+27% per interval.** That is the price of the 10-bit path and it is the number to use when planning:
+a 2-hour film goes from roughly 2.5 hours to 3.2 hours at 4K. Output structure is identical in both
+cases — same 475 frames, same 370/105 split, same 5 cuts — so this is purely the cost of carrying wider
+samples through the engine.
+
+**One API note for the batch converter.** On macOS 27 `AVAssetWriterInputPixelBufferAdaptor` and
+`AVAssetWriter.add(_:)` are deprecated in favour of `inputPixelBufferReceiver(for:pixelBufferAttributes:)`
+and `inputReceiver(for:)`. The probe uses the old calls and they work, but new code should use the
+receivers.
+
+---
+
 ## What I need from you
 
 **All three answers are in — 2026-10-08.**
 
 1. ✅ **Drop the RIFE tier.** Confirmed. §16 is closed; decisions #2 and #3 are resolved and void.
 2. ✅ **Start Phase 1.** Confirmed, and the core is now built and validated. The `Interpolator`
-   package (exact-rational `FrameRate`, integer `PhasePlan`, `SceneChangeDetector`, `NV12` bridge,
-   `VTFrameProcessorEngine`) plus a headless `interp-harness`, with **34 tests in 5 suites passing**.
-   It carries three deliverables out of testing: **scene-change detection** (invariant 15),
-   **exact-rational rate handling** (invariant 14), and **range-correct buffers end-to-end**
-   (invariant 16). Two further invariants were earned during the build: **slot ownership across the
-   pipeline** (17) and the fact that **VT is not bit-exact run to run** (18).
+   package (exact-rational `FrameRate`, integer `PhasePlan`, `SceneChangeDetector`, the `FrameFormat`
+   bridge for 8-bit and 10-bit, `VTFrameProcessorEngine`) plus a headless `interp-harness`, with
+   **49 tests in 7 suites passing**. It carries three deliverables out of testing: **scene-change
+   detection** (invariant 15), **exact-rational rate handling** (invariant 14), and **range-correct
+   buffers end-to-end** (invariant 16). Four further invariants were earned during the build: **slot
+   ownership across the pipeline** (17), the fact that **VT is not bit-exact run to run** (18), the
+   **locked-buffer base-address trap** (19) and **how to read a 10-bit sample** (20).
 
    Validated end to end on the reference clip — `FNF_60FPS.nv12`, 191 frames at 3840×1632,
    24000/1001 → 60000/1001:
@@ -797,5 +954,9 @@ translational shot. If a future title shows visible ghosting where VT struggles,
    recorded choice costs **48% dropped frames in playback** and **2.4–3.7× in batch time** (§13.4).
    With the quality argument now gone, this is a pure speed decision.
 
-Still genuinely open, and not blocking: **HDR output policy** — tone map to SDR, or stay HDR
-end-to-end (§15).
+4. ✅ **Do HDR properly.** Confirmed, and it is now **working end to end** — §17. The short version:
+   the same 191 frames at 3840×1632, taken from your disc as native 10-bit rather than tone-mapped,
+   interpolate correctly, and the HDR10 metadata survives the encode byte-exact. The cost is a measured
+   **+27% per interval** over 8-bit. Nothing is blocked on you here.
+
+Nothing is blocking. The remaining open item is the **4K policy**, which you deliberately parked.

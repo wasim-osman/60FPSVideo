@@ -32,10 +32,15 @@ public struct FrameSignature: Sendable, Equatable {
     /// Build a signature from a luma plane.
     ///
     /// - Parameters:
-    ///   - luma: base address of the luma plane. Studio range (16...235) is fine;
-    ///     the measures below are all relative, and normalising is the caller's job.
-    ///   - bytesPerRow: the plane's stride, which is not `width` on a CVPixelBuffer.
-    public static func compute(luma: UnsafePointer<UInt8>,
+    ///   - luma: base address of the luma plane.
+    ///   - format: sample width of that plane. Both formats are normalised by their
+    ///     own maximum code value, which puts them on the same 0...1 scale — see
+    ///     `FrameFormat.maxCodeValue`. That is what makes one set of thresholds
+    ///     valid for SDR and HDR alike.
+    ///   - bytesPerRow: the plane's stride, which is not `width` on a CVPixelBuffer
+    ///     and is not `width * bytesPerSample` for packed input either.
+    public static func compute(luma: UnsafeRawPointer,
+                               format: FrameFormat,
                                width: Int,
                                height: Int,
                                bytesPerRow: Int,
@@ -44,6 +49,12 @@ public struct FrameSignature: Sendable, Equatable {
                                histogramBins: Int = 64) -> FrameSignature {
         let gw = max(1, min(gridWidth, width))
         let gh = max(1, min(gridHeight, height))
+
+        // Hoisted so the inner loops stay branch-free: this is called once per
+        // source frame against a ~105 ms engine call, so it is nowhere near the
+        // critical path, but a predictable branch costs nothing anyway.
+        let fullScale = Float(format.maxCodeValue)
+        let binCount = format.maxCodeValue + 1
 
         // ---- grid: box-average each cell, capped at 4x4 samples per cell so the
         // cost stays flat as resolution rises.
@@ -65,13 +76,13 @@ public struct FrameSignature: Sendable, Equatable {
                     let row = luma + y * bytesPerRow
                     var x = x0
                     while x < x1 {
-                        sum += Int(row[x])
+                        sum += format.lumaCode(row, x)
                         count += 1
                         x += stepX
                     }
                     y += stepY
                 }
-                grid[gy * gw + gx] = count > 0 ? Float(sum) / Float(count) / 255.0 : 0
+                grid[gy * gw + gx] = count > 0 ? Float(sum) / Float(count) / fullScale : 0
             }
         }
 
@@ -85,7 +96,8 @@ public struct FrameSignature: Sendable, Equatable {
             let row = luma + y * bytesPerRow
             var x = 0
             while x < width {
-                let bin = min(histogramBins - 1, Int(row[x]) * histogramBins / 256)
+                let bin = min(histogramBins - 1,
+                              format.lumaCode(row, x) * histogramBins / binCount)
                 bins[bin] += 1
                 total += 1
                 x += stride
@@ -99,6 +111,21 @@ public struct FrameSignature: Sendable, Equatable {
 
         return FrameSignature(histogram: histogram, grid: grid,
                               gridWidth: gw, gridHeight: gh)
+    }
+
+    /// Build a signature from an 8-bit luma plane. Kept because most callers have
+    /// exactly that, and because it is the shape the tests were written against.
+    public static func compute(luma: UnsafePointer<UInt8>,
+                               width: Int,
+                               height: Int,
+                               bytesPerRow: Int,
+                               gridWidth: Int = 64,
+                               gridHeight: Int = 36,
+                               histogramBins: Int = 64) -> FrameSignature {
+        compute(luma: UnsafeRawPointer(luma), format: .nv12,
+                width: width, height: height, bytesPerRow: bytesPerRow,
+                gridWidth: gridWidth, gridHeight: gridHeight,
+                histogramBins: histogramBins)
     }
 
     /// Total-variation distance between two histograms, in 0...1.
@@ -307,11 +334,17 @@ public enum SceneChangeDetector {
     }
 
     /// Convenience: compute signatures and detect in one pass.
-    public static func detect(lumaPlanes: [(base: UnsafePointer<UInt8>, width: Int,
+    ///
+    /// `base` is raw rather than `UnsafePointer<UInt8>` because the plane may be
+    /// 10-bit, in which case the samples are 16-bit words and a `UInt8` view would
+    /// silently describe half as many, wrong, samples.
+    public static func detect(lumaPlanes: [(base: UnsafeRawPointer, width: Int,
                                             height: Int, bytesPerRow: Int)],
+                              format: FrameFormat = .nv12,
                               config: Config = Config()) -> SceneChangeReport {
         let signatures = lumaPlanes.map {
-            FrameSignature.compute(luma: $0.base, width: $0.width, height: $0.height,
+            FrameSignature.compute(luma: $0.base, format: format,
+                                   width: $0.width, height: $0.height,
                                    bytesPerRow: $0.bytesPerRow)
         }
         return detect(signatures: signatures, config: config)
