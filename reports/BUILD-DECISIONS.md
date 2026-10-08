@@ -297,12 +297,34 @@ These are not choices. Each one is a measured failure mode, and violating any of
     a visible double-exposure when interpolating across a cut — verified on real film, both engines,
     the same frame. A 2 h action film has roughly 2000 cuts; without detection every one becomes a
     ghost frame. See `REAL-CONTENT-AB.md` §6.
+    *A histogram-only rule is not enough on dark footage.* Measured on the reference clip: the cut at
+    source frames **168→169** moves the spatial grid by 0.105 but the histogram by only 0.074, because
+    both shots sit near black and their tonal distributions are genuinely similar — a histogram
+    threshold that catches the other four cuts misses this one. The detector therefore needs a second
+    path: a hard grid spike counts as a cut provided the histogram is at least *clearly not flat*
+    (several times the recent median, with an absolute floor). Both paths are required; neither
+    catches all five on its own.
 16. **Never mix colour ranges inside the pipeline.** `VTFrameProcessor` works in
     `420YpCbCr8BiPlanarVideoRange` — luma 16..235. Any path that leaves NV12 for RGB comes back
     full-range 0..255. Comparing or blending the two invents a **16/255** offset on every pixel, which
     in a dark film is larger than any real difference being measured. This is the bug that made the
     first engine comparison wrong by **96%** (`ENGINE-EQUIVALENCE.md` §1). Stay in NV12 end to end;
     if a conversion is unavoidable, make it explicit and one-directional, and assert the range.
+17. **A slot's buffers belong to the request that borrowed them until it completes.** Do not rely on
+    the depth throttle to make a slot safe to reuse: that throttle lives *inside* `submit()`, which
+    runs *after* the source frames have already been loaded into the slot. The result is that
+    `VTFrameProcessor` reads a mix of old and new frame data, and the damage is disguised as success —
+    a slow shot comes out barely wrong, a fast shot comes out very wrong, and the final interval is
+    perfectly correct because nothing follows it to clobber the buffers. Measured on the reference
+    clip: **378 of 475 output frames wrong, up to 40/255 MAE**, with every passthrough frame still
+    byte-exact (they are copied synchronously, before the overwrite). Fixed by guarding each slot with
+    its own semaphore, acquired before the load and released in the completion. After the fix the
+    harness agrees with the standalone probe to within VT's own run-to-run noise.
+18. **`VTFrameProcessor` is not bit-exact run to run.** Two renders of the same input with the same
+    configuration differ by roughly **48 bytes of ±1/255** across a 475-frame 4K output (~1.5 bytes per
+    affected frame). This is floating-point reduction order inside VT's kernels, not a bug. So
+    *byte-equality* is the wrong acceptance test for this pipeline — it will report failure on a
+    correct render. Compare with a 1-LSB tolerance and treat anything larger as real.
 
 ---
 
@@ -694,10 +716,32 @@ translational shot. If a future title shows visible ghosting where VT struggles,
 **All three answers are in — 2026-10-08.**
 
 1. ✅ **Drop the RIFE tier.** Confirmed. §16 is closed; decisions #2 and #3 are resolved and void.
-2. ✅ **Start Phase 1.** Confirmed. Under way: `git init`, then the shared `Interpolator` core and a
-   headless harness, single-tier on VTFrameProcessor. It carries three deliverables out of testing:
-   **scene-change detection** (invariant 15), **exact-rational rate handling** (invariant 14), and
-   **range-correct buffers end-to-end** (invariant 16).
+2. ✅ **Start Phase 1.** Confirmed, and the core is now built and validated. The `Interpolator`
+   package (exact-rational `FrameRate`, integer `PhasePlan`, `SceneChangeDetector`, `NV12` bridge,
+   `VTFrameProcessorEngine`) plus a headless `interp-harness`, with **34 tests in 5 suites passing**.
+   It carries three deliverables out of testing: **scene-change detection** (invariant 15),
+   **exact-rational rate handling** (invariant 14), and **range-correct buffers end-to-end**
+   (invariant 16). Two further invariants were earned during the build: **slot ownership across the
+   pipeline** (17) and the fact that **VT is not bit-exact run to run** (18).
+
+   Validated end to end on the reference clip — `FNF_60FPS.nv12`, 191 frames at 3840×1632,
+   24000/1001 → 60000/1001:
+
+   ```
+   scenes: 5 cut(s) in 191 frames
+           between source frames: 6-7, 69-70, 101-102, 108-109, 168-169
+   plan  : 475 out frames = 370 interpolated + 105 passthrough
+           10 of those interpolations were turned into passthroughs by scene detection
+   wall  : 19.4s | OUTPUT 24.5 fps | 104.7 ms/interval
+   [PASS] passthrough frames byte-identical to source
+   [PASS] wrote 475/475 frames
+   ```
+
+   The 105 passthroughs decompose exactly as predicted: **95 exact-rate** (every 5th frame, the free
+   20% from invariant 14) plus **10 cut-forced** (2 per cut, each resolved to the nearest source frame
+   — phase < 0.5 takes the outgoing shot, ≥ 0.5 the incoming). Verified by hashing every output frame
+   against the source: `16→6, 17→7, 173→69, 174→70, 253→101, 254→102, 271→108, 272→109, 421→168,
+   422→169`.
 3. ⏸ **4K — parked at your request.** Not needed until Phase 2. The numbers when you want them: your
    recorded choice costs **48% dropped frames in playback** and **2.4–3.7× in batch time** (§13.4).
    With the quality argument now gone, this is a pure speed decision.
