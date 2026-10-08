@@ -248,6 +248,77 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--probe" {
     }
 }
 
+// ---------------------------------------------------------------- decode mode
+//
+// `interp-harness --decode FILE OUT [--start T] [--max-frames N]` decodes through
+// the shipping input path — probe, then ffmpeg on a pipe — and writes the frames
+// out packed. It exists so that path can be checked against a known-good
+// extraction: if the bytes match what ffmpeg produced directly, the source is
+// faithful, and everything downstream is working on the frames it thinks it is.
+
+if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--decode" {
+    let inputURL = URL(fileURLWithPath: CommandLine.arguments[2])
+    let outputPath = CommandLine.arguments[3]
+    var start: Double? = nil
+    var limit: Int? = nil
+    var rest = Array(CommandLine.arguments.dropFirst(4))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--start":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else { fail("--start needs a number") }
+            start = value
+        case "--max-frames":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]) else { fail("--max-frames needs a number") }
+            limit = value
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+    _ = rest
+
+    do {
+        let info = try MediaProbe.probe(inputURL)
+        log("probe : \(info.width)x\(info.height)  \(info.frameRate)  "
+            + "\(info.pixelFormat) -> \(info.format.bitDepth)-bit  "
+            + "HDR \(info.isHDR ? "yes" : "no")")
+        let source = try FFmpegFrameSource(url: inputURL, info: info,
+                                           startSeconds: start, frameLimit: limit)
+        let descriptor = open(outputPath, O_RDWR | O_CREAT | O_TRUNC, 0o644)
+        guard descriptor >= 0 else { fail("cannot create \(outputPath)") }
+        var staging = [UInt8](repeating: 0, count: source.frameByteSize)
+        var written = 0
+        let began = DispatchTime.now().uptimeNanoseconds
+        while true {
+            let more = try staging.withUnsafeMutableBytes { raw -> Bool in
+                try source.read(into: raw.baseAddress!)
+            }
+            if !more { break }
+            let wrote = staging.withUnsafeBytes {
+                pwrite(descriptor, $0.baseAddress, source.frameByteSize,
+                       off_t(written * source.frameByteSize))
+            }
+            guard wrote == source.frameByteSize else {
+                fail("short write at frame \(written): \(wrote)")
+            }
+            written += 1
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - began) / 1e9
+        source.close()
+        ftruncate(descriptor, off_t(written * source.frameByteSize))
+        fsync(descriptor)
+        close(descriptor)
+        log("decoded: \(written) frames  \(source.frameByteSize) B/frame  "
+            + String(format: "%.2fs  %.1f frames/s", elapsed, Double(written) / elapsed))
+        exit(0)
+    } catch {
+        fail("\(error)")
+    }
+}
+
 // ---------------------------------------------------------------- setup
 
 let options = parseOptions()
