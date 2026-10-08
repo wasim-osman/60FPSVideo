@@ -275,6 +275,13 @@ These are not choices. Each one is a measured failure mode, and violating any of
 3. **Keep 2 requests in flight.** Depth 1 fails 23.976→60 (56.7 fps).
 4. **Use `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`.** Native decode/encode format; zero
    colour conversion. The API's `frameSupportedPixelFormats` misreports this — ignore it.
+   *Now pinned down.* The property, and `sourcePixelBufferAttributes` / `destinationPixelBufferAttributes`
+   with it, advertise **exactly one** format: `0x52476841` = `'RGhA'` = `kCVPixelFormatType_64RGBAHalf`,
+   a 64-bit half-float format no video pipeline uses. Measured directly at both 1920×1080 and
+   3840×1632 (`analysis/probes/vt_hdr_probe.swift`), the formats that genuinely work are **8-bit NV12**
+   (both ranges), **10-bit P010** (both ranges) and BGRA. The only real failure is NV16 (4:2:2), which
+   returns error `-19730`. So the advertised list is not merely incomplete — its single entry is wrong,
+   and following it would put a 64-bit float round trip in the middle of an 8-bit pipeline.
 5. **Always check the completion-handler error.** The low-latency path fails *silently* above
    1920×1080; `startSession` still reports success.
 6. **Leave `usePrecomputedFlow: false`.** Pre-computed flow measured 14% *slower*.
@@ -304,6 +311,17 @@ These are not choices. Each one is a measured failure mode, and violating any of
     path: a hard grid spike counts as a cut provided the histogram is at least *clearly not flat*
     (several times the recent median, with an absolute floor). Both paths are required; neither
     catches all five on its own.
+    *And the grid test has to be a real one.* Testing a bright desert daylight scene — the opposite of
+    the dark chase — produced **two false positives** (intervals 115→116 and 117→118) on a continuous
+    shot, confirmed by looking at the frames. Both were **histogram-only spikes with no spatial
+    change**: a flare or exposure shift sweeping the blown-out sky moved the histogram to 0.121 and
+    0.163, clear of the 0.12 floor, while moving the grid by only 0.036 and 0.040. The cause was that
+    `gridFloor` was set to **0.02**, which is *below ordinary motion* and so constrained nothing.
+    Measured across both clips: motion never exceeds a grid distance of **0.037**, and the smallest
+    genuine cut is **0.105**. Raising `gridFloor` to **0.07** sits between them with ~1.9× margin below
+    and ~1.5× above, and takes the bright clip from 6 detections to the correct 4 without losing any of
+    the night clip's 5. **The two failure modes are opposites — dark content needs the histogram
+    relaxed, bright content needs the grid tightened — so both clips have to be in the test set.**
 16. **Never mix colour ranges inside the pipeline.** `VTFrameProcessor` works in
     `420YpCbCr8BiPlanarVideoRange` — luma 16..235. Any path that leaves NV12 for RGB comes back
     full-range 0..255. Comparing or blending the two invents a **16/255** offset on every pixel, which
@@ -325,6 +343,14 @@ These are not choices. Each one is a measured failure mode, and violating any of
     affected frame). This is floating-point reduction order inside VT's kernels, not a bug. So
     *byte-equality* is the wrong acceptance test for this pipeline — it will report failure on a
     correct render. Compare with a 1-LSB tolerance and treat anything larger as real.
+19. **A `CVPixelBuffer`'s base address is only valid *while the buffer is locked*.** Geometry —
+    `CVPixelBufferGetBytesPerRowOfPlane`, `CVPixelBufferGetHeightOfPlane` — stays readable either way,
+    but `CVPixelBufferGetBaseAddressOfPlane` returns **nil**, silently and with no error, once the lock
+    is released. Mixing the two makes a size computation return 0 and any "was it written?" check pass
+    vacuously. This is not hypothetical: the first version of `vt_hdr_probe` computed its byte count
+    from a base address without locking, got 0, and reported that **every** pixel format had failed
+    when in fact **none of them had been measured**. Keep geometry and base-address access separate
+    (`FrameFormat`/`PixelBufferSupport` does), and never derive a size from a base address.
 
 ---
 
@@ -742,6 +768,31 @@ translational shot. If a future title shows visible ghosting where VT struggles,
    — phase < 0.5 takes the outgoing shot, ≥ 0.5 the incoming). Verified by hashing every output frame
    against the source: `16→6, 17→7, 173→69, 174→70, 253→101, 254→102, 271→108, 272→109, 421→168,
    422→169`.
+
+   **Then a second clip, deliberately unlike the first** — a bright desert daylight scene at 4436.0 s
+   (film clock 73:56), extracted with identical tone-mapping parameters:
+
+   ```
+   input : 192 frames  3840x1632
+   scenes: 4 cut(s)  ->  22-23, 61-62, 151-152, 190-191
+   plan  : 478 out frames = 374 interpolated + 104 passthrough
+           8 of those interpolations were turned into passthroughs by scene detection
+   wall  : 20.0s | OUTPUT 23.9 fps | 106.8 ms/interval
+   [PASS] passthrough frames byte-identical to source
+   [PASS] wrote 478/478 frames
+   ```
+
+   104 passthroughs = **96 exact-rate + 8 cut-forced**, all eight again matching the nearest-source
+   rule (`56→22, 57→23, 153→61, 154→62, 378→151, 379→152, 476→190, 477→191`). Throughput is
+   **106.8 ms/interval against the night clip's 104.7** — within run-to-run noise, so bright content
+   costs nothing extra.
+
+   This clip found a **real bug** that the dark clip could not have found (two false-positive cuts,
+   see invariant 15). It also corrects a claim in this report: a whole-film brightness profile shows
+   the night clip sits at the **median brightness** of the film (49th percentile, mean luma 44.8 vs
+   50.0 film-wide) with motion in the **top 25%**. It was selected for *motion*, and brightness was
+   never a criterion — so it was never the dark outlier it was described as. It is a busy, typical
+   clip; the bright clip is the genuinely different one.
 3. ⏸ **4K — parked at your request.** Not needed until Phase 2. The numbers when you want them: your
    recorded choice costs **48% dropped frames in playback** and **2.4–3.7× in batch time** (§13.4).
    With the quality argument now gone, this is a pure speed decision.

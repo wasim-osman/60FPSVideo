@@ -171,9 +171,23 @@ public enum SceneChangeDetector {
         public var sigmaMultiplier: Float = 8.0
         /// Never call a cut on the histogram below this, however quiet the sequence.
         public var histogramFloor: Float = 0.12
-        /// Never call a cut on the grid below this. Guards against a global
-        /// luminance shift (a fade, an exposure ramp) reading as a cut.
-        public var gridFloor: Float = 0.02
+        /// Never call a cut on the grid below this.
+        ///
+        /// This is the constraint that actually separates a shot change from
+        /// everything else, and it was originally set to 0.02 — which is *below*
+        /// ordinary motion, so it constrained nothing. Measured across two real
+        /// clips (a dark night chase and a bright desert daylight scene), ordinary
+        /// motion never exceeds a grid distance of **0.037**, while the smallest
+        /// genuine cut in either clip is **0.105**. 0.07 sits between them with
+        /// roughly 1.9× margin below and 1.5× above.
+        ///
+        /// What this catches, concretely: on the bright clip a flare or exposure
+        /// shift swept the blown-out sky and moved the histogram to 0.121 and
+        /// 0.163 — clear of the 0.12 histogram floor — while moving the spatial
+        /// grid by only 0.036 and 0.040, i.e. no more than ordinary motion. Those
+        /// are lighting changes, not cuts, and the histogram alone cannot tell them
+        /// apart. The grid can.
+        public var gridFloor: Float = 0.07
         /// The grid spike path also requires the histogram to be at least this many
         /// times the recent median. It does not have to be *high* — see the note on
         /// dark footage below — only clearly not flat.

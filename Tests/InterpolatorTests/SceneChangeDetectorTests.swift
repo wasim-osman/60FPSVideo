@@ -125,6 +125,37 @@ struct SceneChangeDetectorTests {
         #expect(report.cutCount == 1, "and it must not invent cuts elsewhere")
     }
 
+    /// The regression that came out of testing bright content. On the bright clip a
+    /// flare or exposure shift swept the blown-out sky and moved the tonal
+    /// distribution to 0.121 and 0.163 — clear of the 0.12 histogram floor — while
+    /// moving the spatial grid by only 0.036 and 0.040, which is no more than
+    /// ordinary motion. Those were flagged as cuts and are not.
+    @Test("a lighting change is not a cut")
+    func lightingChangeIsNotACut() {
+        var frames: [FrameSignature] = []
+        for i in 0..<30 {
+            frames.append(darkShot(centerBin: 20, gridPhase: Float(i) * 0.01))
+        }
+        let changeAt = frames.count - 1
+        // Same spatial layout throughout — only the tonal distribution moves.
+        for i in 0..<30 {
+            frames.append(darkShot(centerBin: 24, gridPhase: 0.29 + Float(i) * 0.01))
+        }
+
+        let report = SceneChangeDetector.detect(signatures: frames)
+        let config = SceneChangeDetector.Config()
+
+        // The premise, asserted so the test fails loudly if it stops exercising the
+        // case: the histogram moved enough to tempt a histogram-only rule, while the
+        // picture did not move at all.
+        #expect(report.histogramDistance[changeAt] > config.histogramFloor,
+                "the tonal shift must be large enough to clear the histogram floor")
+        #expect(report.gridDistance[changeAt] < config.gridFloor,
+                "but the spatial layout must not have moved")
+
+        #expect(report.cutCount == 0, "a lighting change is not a shot change")
+    }
+
     /// A flash — a camera flash, an explosion, a one-frame insert — moves both the
     /// histogram and the grid, so it looks exactly like a cut. What distinguishes it
     /// is that the content comes straight back. Cutting there would insert a held
