@@ -89,6 +89,15 @@ private struct BufferSet: @unchecked Sendable {
 // ---------------------------------------------------------------- options
 
 struct Options {
+    enum SceneMode: String {
+        /// Decide cuts from the whole clip up front. What batch conversion does.
+        case offline
+        /// Decide cuts as frames arrive, with a two-frame lookahead. What playback
+        /// must do. Both are run and compared regardless; this picks which one
+        /// drives the render.
+        case online
+    }
+
     var input = ""
     var width = 0
     var height = 0
@@ -96,6 +105,7 @@ struct Options {
     var outputRate = ""
     var output = ""
     var format = FrameFormat.nv12
+    var sceneMode = SceneMode.offline
     var depth = 2
     var maxFrames: Int? = nil
     var detectOnly = false
@@ -121,6 +131,9 @@ func parseOptions() -> Options {
         FileHandle.standardError.write("""
         usage: interp-harness IN W H SRC_RATE OUT_RATE OUT [options]
           --format nv12|p010   sample width of the packed input (default nv12)
+          --scene-mode MODE    offline (whole clip up front, default) or online
+                               (two-frame lookahead, as playback must). Both are
+                               always run and compared; this picks the driver.
           --depth N            requests in flight (default 2, minimum 2)
           --max-frames N       stop after N source frames
           --detect-only        report scene cuts and exit, no render
@@ -159,6 +172,12 @@ func parseOptions() -> Options {
             case "p010": options.format = .p010
             default: fail("unknown format '\(args[i])' — expected nv12 or p010")
             }
+        case "--scene-mode":
+            i += 1
+            guard i < args.count, let mode = Options.SceneMode(rawValue: args[i]) else {
+                fail("--scene-mode needs 'offline' or 'online'")
+            }
+            options.sceneMode = mode
         case "--depth":
             i += 1
             guard i < args.count, let value = Int(args[i]) else { fail("--depth needs a number") }
@@ -232,8 +251,17 @@ guard let plan = PhasePlan(sourceFrameCount: sourceFrameCount,
 var staging = [UInt8](repeating: 0, count: frameSize)
 var report = SceneChangeReport(isCut: [], histogramDistance: [], gridDistance: [],
                                threshold: [])
+/// Problems found before the writer exists, folded into the failure report later.
+var detectionProblems: [String] = []
 
 if options.sceneDetect {
+    // Signatures are fed to the online tracker *as they are computed*, so every run
+    // over real footage doubles as an equivalence check. The two paths have to agree
+    // exactly: batch uses the offline detector and playback uses the tracker, and a
+    // disagreement would mean a cut handled one way when converting and another way
+    // when watching. A synthetic test can only cover the shapes we thought of; real
+    // film is where the ones we did not think of live.
+    let tracker = SceneChangeTracker()
     var signatures: [FrameSignature] = []
     signatures.reserveCapacity(sourceFrameCount)
     for frame in 0..<sourceFrameCount {
@@ -241,16 +269,37 @@ if options.sceneDetect {
             pread(inputDescriptor, $0.baseAddress, frameSize, off_t(frame * frameSize))
         }
         guard got == frameSize else { shortRead(frame: frame, expected: frameSize, got: got) }
-        signatures.append(staging.withUnsafeBytes {
+        let signature = staging.withUnsafeBytes {
             FrameSignature.compute(luma: $0.baseAddress!,
                                    format: format,
                                    width: width, height: height,
                                    bytesPerRow: packedLumaStride)
-        })
+        }
+        signatures.append(signature)
+        tracker.push(signature)
     }
-    report = SceneChangeDetector.detect(signatures: signatures)
+    tracker.finish()
 
-    log("scenes: \(report.cutCount) cut(s) in \(sourceFrameCount) frames")
+    report = options.sceneMode == .offline
+        ? SceneChangeDetector.detect(signatures: signatures)
+        : tracker.report
+
+    let online = tracker.report
+    if online.isCut == report.isCut {
+        log("scenes: \(report.cutCount) cut(s) in \(sourceFrameCount) frames"
+            + (options.sceneMode == .offline
+               ? "   [offline and online agree]" : "   [online tracker]"))
+    } else {
+        let differing = zip(online.isCut, report.isCut).enumerated()
+            .filter { $0.element.0 != $0.element.1 }
+            .map { "\($0.offset)" }
+            .prefix(12)
+            .joined(separator: ", ")
+        log("scenes: \(report.cutCount) cut(s) in \(sourceFrameCount) frames")
+        log("        [MISMATCH] the two detection paths disagree at intervals \(differing)")
+        detectionProblems.append("scene detection mismatch between offline and online "
+                                 + "at intervals \(differing)")
+    }
     if !report.cutIntervals.isEmpty {
         let preview = report.cutIntervals.prefix(24).map { "\($0)-\($0 + 1)" }
         log("        between source frames: \(preview.joined(separator: ", "))"
@@ -457,7 +506,7 @@ if sourceDescriptor >= 0 { close(sourceDescriptor) }
 
 // ---------------------------------------------------------------- report
 
-let problems = writer.problems
+let problems = writer.problems + detectionProblems
 let written = writer.written
 
 log("")

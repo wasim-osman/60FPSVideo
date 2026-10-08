@@ -167,6 +167,93 @@ public struct SceneChangeReport: Sendable {
     public var cutIntervals: [Int] { isCut.indices.filter { isCut[$0] } }
 }
 
+/// Everything the cut rule needs to judge one interval.
+///
+/// The rule itself is separate from how the distances were obtained, because there
+/// are two ways to obtain them and they must not disagree. Batch conversion sees
+/// the whole clip up front and can look both ways; playback sees frames arrive one
+/// at a time and has to decide with a fixed lookahead. If those two paths each had
+/// their own copy of the rule, the same film would get different cut handling
+/// depending on whether you converted it or watched it — and the difference would
+/// show up as a ghost frame, on one path only, on some cuts, sometimes.
+public struct IntervalEvidence: Sendable {
+    /// Total-variation distance between the two histograms.
+    public let histogramDistance: Float
+    /// Mean absolute grid distance between the two frames.
+    public let gridDistance: Float
+    /// Recent histogram distances, oldest first, *excluding* this interval. Used
+    /// to derive the adaptive threshold.
+    public let historyHistogram: [Float]
+    /// The same for the grid.
+    public let historyGrid: [Float]
+    /// `grid(i, i+2)` — how far the frame after next is. `nil` when it is not
+    /// known, which is what happens for the final interval of a stream.
+    public let forwardGrid: Float?
+    /// `grid(i-1, i+1)` — how far the frames either side of this interval are.
+    /// `nil` for the first interval, which has no previous frame.
+    public let backwardGrid: Float?
+
+    public init(histogramDistance: Float, gridDistance: Float,
+                historyHistogram: [Float], historyGrid: [Float],
+                forwardGrid: Float?, backwardGrid: Float?) {
+        self.histogramDistance = histogramDistance
+        self.gridDistance = gridDistance
+        self.historyHistogram = historyHistogram
+        self.historyGrid = historyGrid
+        self.forwardGrid = forwardGrid
+        self.backwardGrid = backwardGrid
+    }
+}
+
+/// The cut rule, in one place.
+public enum CutRule {
+
+    /// Judge one interval.
+    ///
+    /// - Returns: whether it is a cut, and the histogram threshold that was in
+    ///   force — returned rather than recomputed so reports show the number the
+    ///   decision actually used.
+    public static func evaluate(_ evidence: IntervalEvidence,
+                                config: SceneChangeDetector.Config)
+        -> (isCut: Bool, threshold: Float) {
+        let histThreshold = SceneChangeDetector.robustThreshold(
+            evidence.historyHistogram[...], sigmaMultiplier: config.sigmaMultiplier,
+            floor: config.histogramFloor)
+        let gridThreshold = SceneChangeDetector.robustThreshold(
+            evidence.historyGrid[...], sigmaMultiplier: config.sigmaMultiplier,
+            floor: config.gridFloor)
+
+        // A. The classic: both measures jump. A pan moves the grid but leaves the
+        //    histogram alone, so requiring both is what keeps fast motion from
+        //    being mistaken for a shot change.
+        let strongOnBoth = evidence.histogramDistance > histThreshold
+            && evidence.gridDistance > config.gridFloor
+
+        // B. The grid jumps hard and the histogram is at least *not flat*. This
+        //    path exists because of measured failure on real film: the reference
+        //    clip's cut at 168→169 moves the grid by 0.105 but the histogram by
+        //    only 0.074, because both shots sit near black. Path A misses it.
+        let sortedHistory = evidence.historyHistogram.sorted()
+        let median = sortedHistory.isEmpty ? 0 : sortedHistory[sortedHistory.count / 2]
+        let mildHistogram = max(config.mildHistogramFloor,
+                                config.mildHistogramFactor * median)
+        let gridSpike = evidence.gridDistance > gridThreshold
+            && evidence.histogramDistance > mildHistogram
+
+        guard strongOnBoth || gridSpike else { return (false, histThreshold) }
+
+        // Flash guard. A flash, a strobe or a one-frame insert moves both measures
+        // exactly like a cut does; what marks it out is that the content either
+        // side of it is the same. Both directions are checked, or a one-frame
+        // insert is caught on the way in and missed on the way out.
+        let limit = config.flashReturnRatio * evidence.gridDistance
+        if let forward = evidence.forwardGrid, forward < limit { return (false, histThreshold) }
+        if let backward = evidence.backwardGrid, backward < limit { return (false, histThreshold) }
+
+        return (true, histThreshold)
+    }
+}
+
 /// Finds scene cuts so the interpolator can refuse to interpolate across them
 /// (invariant 15).
 ///
@@ -267,49 +354,21 @@ public enum SceneChangeDetector {
 
         for i in 0..<(n - 1) {
             let windowStart = max(0, i - config.historyLength)
-            let histWindow = histD[windowStart..<i]
-            let gridWindow = gridD[windowStart..<i]
+            // The forward/backward probes are only meaningful where the frames they
+            // need exist. Returning nil outside that range is what reproduces the
+            // original end-of-clip behaviour exactly: the final interval has no
+            // frame after next, so its flash guard cannot fire forwards.
+            let evidence = IntervalEvidence(
+                histogramDistance: histD[i],
+                gridDistance: gridD[i],
+                historyHistogram: Array(histD[windowStart..<i]),
+                historyGrid: Array(gridD[windowStart..<i]),
+                forwardGrid: i + 2 < n ? forwardGridD[i] : nil,
+                backwardGrid: i >= 1 ? backwardGridD[i] : nil)
 
-            let histThreshold = SceneChangeDetector.robustThreshold(
-                histWindow, sigmaMultiplier: config.sigmaMultiplier,
-                floor: config.histogramFloor)
-            let gridThreshold = SceneChangeDetector.robustThreshold(
-                gridWindow, sigmaMultiplier: config.sigmaMultiplier,
-                floor: config.gridFloor)
-            thresholds[i] = histThreshold
-
-            // Two ways to be a cut.
-            //
-            // A. The classic: both measures jump. A pan moves the grid but leaves
-            //    the histogram alone, so requiring both is what keeps fast motion
-            //    from being mistaken for a shot change.
-            let strongOnBoth = histD[i] > histThreshold && gridD[i] > config.gridFloor
-
-            // B. The grid jumps hard and the histogram is at least *not flat*.
-            //
-            //    This path exists because of measured failure on real film. The
-            //    reference clip is a night scene, and one of its cuts — source
-            //    frames 168 to 169 — moves the grid by 0.105 while moving the
-            //    histogram by only 0.074, because both shots sit near black and
-            //    their tonal distributions are genuinely similar. Path A misses it.
-            //    The histogram is still required to move clearly (several times the
-            //    recent median), which is what separates this from a pan.
-            let median = histWindow.isEmpty ? 0 : histWindow.sorted()[histWindow.count / 2]
-            let mildHistogram = max(config.mildHistogramFloor,
-                                    config.mildHistogramFactor * median)
-            let gridSpike = gridD[i] > gridThreshold && histD[i] > mildHistogram
-
-            guard strongOnBoth || gridSpike else { continue }
-
-            // Flash guard. A flash, a camera strobe or a one-frame insert moves both
-            // measures exactly like a cut does; what marks it out is that the content
-            // either side of it is the same. Check both sides, or a one-frame insert
-            // is caught on the way in and missed on the way out.
-            let limit = config.flashReturnRatio * gridD[i]
-            if i + 2 < n, forwardGridD[i] < limit { continue }
-            if i >= 1, backwardGridD[i] < limit { continue }
-
-            isCut[i] = true
+            let verdict = CutRule.evaluate(evidence, config: config)
+            thresholds[i] = verdict.threshold
+            isCut[i] = verdict.isCut
         }
 
         return SceneChangeReport(isCut: isCut, histogramDistance: histD,
@@ -322,9 +381,12 @@ public enum SceneChangeDetector {
     /// contains cuts, and a cut is exactly the kind of outlier a standard deviation
     /// handles badly — one cut in thirty frames would inflate sigma enough to hide
     /// the next one. 1.4826 converts a MAD into a sigma estimate for normal data.
-    private static func robustThreshold(_ values: ArraySlice<Float>,
-                                        sigmaMultiplier: Float,
-                                        floor: Float) -> Float {
+    ///
+    /// Internal rather than private so ``CutRule`` can share it; the rule is the
+    /// only caller that matters.
+    static func robustThreshold(_ values: ArraySlice<Float>,
+                               sigmaMultiplier: Float,
+                               floor: Float) -> Float {
         guard values.count >= 4 else { return floor }
         let sorted = values.sorted()
         let median = sorted[sorted.count / 2]
