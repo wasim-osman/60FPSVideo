@@ -198,6 +198,56 @@ func parseOptions() -> Options {
     return options
 }
 
+// ---------------------------------------------------------------- probe mode
+//
+// `interp-harness --probe FILE` reports what a media file is, and exits. It exists
+// because the answer decides how the file gets processed — the frame rate must be
+// the exact rational, the depth picks the pixel format, and the HDR10 metadata has
+// to be carried through to the encode — and because it is the quickest way to see
+// whether a given container can be opened at all. Notably it answers for Matroska,
+// which AVFoundation cannot open and therefore cannot answer for.
+
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--probe" {
+    let url = URL(fileURLWithPath: CommandLine.arguments[2])
+    do {
+        let info = try MediaProbe.probe(url)
+        log("file    : \(url.lastPathComponent)")
+        log("size    : \(info.width)x\(info.height)")
+        log("rate    : \(info.frameRate)  (\(info.frameRate.doubleValue) fps)")
+        log("frames  : \(info.frameCount.map(String.init) ?? "not stated")"
+            + "   duration \(String(format: "%.2f", info.duration))s")
+        log("pixel   : \(info.pixelFormat)  ->  pipeline \(info.format.bitDepth)-bit "
+            + "(\(info.format == .p010 ? "P010" : "NV12"))")
+        log("colour  : primaries \(info.colorPrimaries ?? "-")"
+            + "  transfer \(info.transferFunction ?? "-")"
+            + "  matrix \(info.colorSpace ?? "-")"
+            + "  range \(info.colorRange ?? "-")")
+        log("HDR     : \(info.isHDR ? "yes" : "no")")
+        if let display = info.masteringDisplay {
+            log(String(format: "  mastering display: R(%d,%d) G(%d,%d) B(%d,%d) WP(%d,%d)"
+                       + "  %.4f..%.1f nits",
+                       display.redX, display.redY, display.greenX, display.greenY,
+                       display.blueX, display.blueY, display.whiteX, display.whiteY,
+                       display.minNits, display.maxNits))
+            log("  mastering SEI payload: \(display.seiPayload.count) bytes")
+        } else {
+            log("  mastering display: absent")
+        }
+        if let level = info.contentLightLevel {
+            log("  content light level: MaxCLL \(level.maxContent), "
+                + "MaxFALL \(level.maxAverage) nits")
+            log("  content light SEI payload: \(level.seiPayload.count) bytes")
+        } else {
+            log("  content light level: absent")
+        }
+        log("audio   : \(info.audioCodec ?? "none")"
+            + (info.audioCanPassThroughToMP4 ? "" : "  (cannot be copied into MP4)"))
+        exit(0)
+    } catch {
+        fail("\(error)")
+    }
+}
+
 // ---------------------------------------------------------------- setup
 
 let options = parseOptions()
