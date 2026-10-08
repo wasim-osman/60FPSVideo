@@ -24,6 +24,11 @@ public protocol InterpolationEngine: AnyObject, Sendable {
     /// caller sizes its destination list from this.
     var maximumInterpolationsPerInterval: Int { get }
 
+    /// Requests the engine keeps in flight. The caller sizes its buffer ring from
+    /// this, and it is the number of slots that have to be independently guarded
+    /// (invariant 17) — so it is part of the contract, not an implementation detail.
+    var depth: Int { get }
+
     /// Prepare for a given frame size. Must be called once before any `submit`.
     func prepare(width: Int, height: Int) throws
 

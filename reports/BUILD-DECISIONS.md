@@ -150,13 +150,29 @@ You said "60 fps". Worth knowing what that costs, because for NTSC-family source
 | **C. Auto per source** | 59.94 for NTSC-family sources (23.976/29.97/59.94), 60.000 otherwise. Gets every benefit above. Cost: two output cadences to test, and the user sees "59.94" in the UI which needs explaining. |
 
 **Why the gap exists:** `23.976 × 2.5 = 59.94` exactly, so every second source frame lands on an
-output position and needs no work. `23.976 × 2.5 = 60.000` is not exact, so **every** output frame
-must be interpolated.
+output position and needs no work. `23.976 × 2.5 = 60.000` is not exact, so **almost every** output
+frame must be interpolated.
+
+**Refined while building `IntervalPlanner`, and it is starker than "0%".** A passthrough needs
+`k * pnum` to be a multiple of `pden`, and how often that can happen is a property of the rate pair
+alone. For 23.976 → 59.94 the two rates are `24000/1001` and `60000/1001`, an exact 2.5×, so
+alignment recurs every 2 source frames: **1 output frame in 5 is free, 20%**. For 23.976 → 60 they are
+`24000/1001` and `60/1`, and `1001` and `400` are **coprime**, so alignment recurs once every **1001
+output frames — 0.1%**, about one passthrough every 16.7 seconds. Measured over 2,000 intervals the
+counts are 5000 in 25,000 against 25 in 25,025. So the 0.06 fps difference in output rate costs
+roughly **25% more inference** on film content, and it also means 59.94 keeps one frame in five as the
+*original picture* rather than a reconstruction. This is pinned in `IntervalPlannerTests`.
 
 **Effect on the app:** this is the single biggest performance lever in the whole design, and it costs
 nothing to implement — it's a decision, not a feature.
 
 **Recommendation: C**, defaulting to 60.000 when the source rate is a clean 24/25/30/50.
+
+> ⚠️ **The standing instruction is "60 FPS-only output", which is option A and conflicts with C.** The
+> measurements above are the cost of that: on a 23.976 source, going to exactly 60.000 rather than
+> 59.94 does about 25% more inference for 0.06 fps more output. Worth confirming which was meant
+> before the batch converter's rate policy is fixed — the difference is a couple of hours on a
+> feature-length job. It does not block the pipeline work either way: the rate is a parameter.
 
 ---
 
@@ -348,6 +364,21 @@ These are not choices. Each one is a measured failure mode, and violating any of
     affected frame). This is floating-point reduction order inside VT's kernels, not a bug. So
     *byte-equality* is the wrong acceptance test for this pipeline — it will report failure on a
     correct render. Compare with a 1-LSB tolerance and treat anything larger as real.
+
+    **Broadened after 16 full-length repeat runs.** A 1-code-step tolerance is the *usual* case, not a
+    bound. Six inline and ten pipeline renders of the same 192-frame 4K clip were compared frame by
+    frame: fifteen agreed to within 1 code step, and **one** differed on a **single interval** — two
+    output frames of 478, up to **45 code steps** on **1% of their samples**, with both frames still
+    sitting the same small distance from their source (mean 0.61 and 0.63 against source frame 177).
+    The neighbouring output frames were byte-identical, the excursion did not reproduce, and it was
+    confined to one interval's own computation — which is the signature of a different reduction order
+    inside that one call, not of different inputs. Different inputs would have moved the frames by up
+    to 200 steps, and would have moved more than two of them.
+
+    So a verification pass must be **per-frame with an allowance for a few outliers**, not a global
+    tolerance: "no frame differs by more than N, except at most k frames differ by up to M". A global
+    ±1 check will fail on a correct render roughly one run in ten, and a global ±45 check would hide a
+    real error on every frame but two.
 19. **A `CVPixelBuffer`'s base address is only valid *while the buffer is locked*.** Geometry —
     `CVPixelBufferGetBytesPerRowOfPlane`, `CVPixelBufferGetHeightOfPlane` — stays readable either way,
     but `CVPixelBufferGetBaseAddressOfPlane` returns **nil**, silently and with no error, once the lock
@@ -392,6 +423,24 @@ These are not choices. Each one is a measured failure mode, and violating any of
     neighbouring offsets (`analysis/align_probe.py`), and re-extracting one frame later made the cut
     lists identical. **Verify alignment before concluding anything about two clips that are supposed to
     match.**
+23. **`drain()` must not return until the caller's completion has run.** The engine retired a request
+    from its depth accounting and *then* invoked the completion, and `drain()` waits on that depth
+    semaphore — so it woke in the gap and returned while the last completion was still running. Nothing
+    in the engine was wrong on its own terms: the frames were produced and the completion did run, just
+    later. What broke was everything downstream that treats `drain()` as a barrier. The batch converter
+    finalises its output file there, and `PackedFileSink` sets the file length from what it has written;
+    a completion arriving after that point is a frame written past the end of the file, which the
+    truncate then discards. It cost exactly the last two output frames of every run, silently, as black.
+    It stayed invisible because the harness sized its output from the plan rather than from what had
+    been written, and only sampled **one passthrough frame in thirty-seven**. Fixed by invoking the
+    completion before retiring the request (`EngineDrainTests`). **A "wait for everything" method is
+    only a barrier if it waits for the last thing to finish, not the second-to-last.**
+24. **A `pwrite` past the end of a file reports success and leaves a hole.** A frame that was never
+    written is byte-identical to a frame written black, so a gap in the output is invisible to any
+    check that counts successful writes. `PackedFileSink` now records which indices actually landed and
+    reports both gaps and indices past the end of the plan. Both are silent otherwise — and the second
+    is worse than the first, because the file length is derived from the plan, so a frame written past
+    the end is written and then thrown away.
 
 ---
 
@@ -581,7 +630,7 @@ extrapolation — but the choice is recorded and I will build Option C unless yo
 | **Is CoreML RIFE's quality actually better than VTFP?** | **The instrument now exists.** A real 4K HDR clip from your disc has been run through both engines — `~/Desktop/FNF-60FPS-A-B/`. Still needs your eyes: PSNR proves faithfulness to PyTorch (68 dB), not beauty. |
 | ~~In-process thread concurrency~~ | **Deleted** — no sandbox, so separate processes work (§13.1). Also moot: RIFE shows *no* concurrency scaling at all (GPU-saturated). |
 | ~~Scene cuts~~ | **Found, and it is now a build requirement rather than a risk.** Both engines double-expose across a cut. Invariant 15. |
-| HDR handling | **Partly answered.** The source is HDR10/PQ/BT.2020, and this machine's ffmpeg cannot tone map it (`zscale` absent, `scale_vt` ENOSYS). Hand-rolled numpy tone mapping works (`analysis/hdr_tonemap.py`). **Whether the app tone maps or stays HDR end-to-end is still undecided.** |
+| ~~HDR handling~~ | ✅ **DECIDED AND WORKING — stays HDR end to end, no tone mapping.** The whole chain is 10-bit P010 from decode to encode, and the HDR10 static metadata survives byte-exact (§17). The tone-mapping question is now only a *preview* concern: `analysis/hdr_tonemap.py` and `analysis/p010_preview.py` exist so an HDR frame can be looked at on an SDR display. Costs **+27% per interval** against 8-bit. |
 | A/V drift over long playback | Unverified. |
 | Gatekeeper friction without notarization | Known, mitigated by Homebrew Cask + install script (§13.1). |
 
@@ -890,6 +939,103 @@ samples through the engine.
 `AVAssetWriter.add(_:)` are deprecated in favour of `inputPixelBufferReceiver(for:pixelBufferAttributes:)`
 and `inputReceiver(for:)`. The probe uses the old calls and they work, but new code should use the
 receivers.
+
+---
+
+## 18. One loop, three consumers — and the bug that was hiding in it
+
+The batch converter, the player and the measurement harness all do the same thing: pull source frames,
+group them by interval, hand each interval to the engine, put the result somewhere. The harness had
+that logic inline, and the two real consumers were about to grow their own copies. Three copies of a
+loop this easy to get subtly wrong is two copies too many — and it is *exactly* where invariant 17
+lives, the bug that produced 378 wrong frames out of 475 while reporting success.
+
+So the loop moved into the library as **`InterpolationPipeline`**, and the harness kept its inline
+version as the reference. `--pipeline` runs the extracted one on the same input, and the two outputs
+are compared frame by frame. That is the same discipline that proved the decode path: extract, then
+prove the extraction reproduces what it was extracted from.
+
+### The frame count that does not exist
+
+The first thing the extraction ran into is that `PhasePlan` needs the **total source frame count**
+before it can produce anything, because it derives its stopping bound from `lastSourceIndex`. Neither
+real consumer has that number:
+
+- a Matroska file reports `nb_frames=N/A`, so the batch converter does not know the count until it has
+  decoded the whole film — the wrong end of the job;
+- playback has no total at all. It is a stream, and the user can stop it whenever they like.
+
+The count is only ever used to decide *where to stop*. What kind of output frame `k` is depends on
+nothing but `k` and the two rates, so the plan can be generated interval by interval and stopped when
+the source runs out. **`IntervalPlanner`** does that, with the identical integers `PhasePlan` uses —
+`pnum = srcNum * outDen`, `pden = srcDen * outNum` — and interval `j` owns exactly the `k` with
+`j * pden <= k * pnum < (j + 1) * pden`, which is a closed integer range. No floating point anywhere.
+
+Two implementations of one piece of arithmetic is one too many unless something proves they agree, so
+`IntervalPlannerTests` requires `IntervalPlanner` to reproduce `PhasePlan` **frame for frame** across
+ten rate pairs and ten lengths, and to reproduce `PhasePlan.resolvingCuts` exactly — the same check
+that keeps the two scene detectors honest. The cut rule itself was pulled out into `CutResolution` for
+the same reason: two call sites for one decision is how a cut ends up handled one way when converting
+and another way when watching.
+
+### Three frames of lookahead, because a pipe cannot be rewound
+
+The harness could `pread` any frame it liked, as often as it liked, because a packed file is seekable.
+A real source is not: ffmpeg writes to a pipe, and a pipe cannot be rewound. Three separate needs have
+to be met from one sequential stream:
+
+- interval `j` needs frames `j` and `j + 1` — a one-frame lookbehind;
+- the cut decision for interval `j` needs signature `j + 2` — a two-frame lookahead (see §17's sibling,
+  `SceneChangeTracker`);
+- and the decision has to be known *before* interval `j` is resolved, because resolving it is what
+  turns its interpolations into held frames.
+
+So the pipeline reads through a ring of exactly **three** packed frames, covering `[j, j + 2]`, one
+frame per interval, each source frame read exactly once. Two would cover the pixels and be one short
+for the decision; four would be a frame of lookahead nobody uses.
+
+### What the comparison found
+
+Run on both real clips, at 4K, full length:
+
+| clip | frames | samples | worst difference | outliers |
+| --- | --- | --- | --- | --- |
+| `bright.nv12`, 8-bit SDR | 478 | 4.49 bn | **1 code step** | 0 |
+| `hdr_night.p010`, 10-bit HDR | 475 | 4.47 bn | **1 code step** | 0 |
+
+Identical plans both times — same output frame count, same 370/105 and 374/104 split, same cut
+positions — and the pipeline's online tracker agreed with the offline detector on **all 190 and all
+191 intervals**. 1 code step is VT's own run-to-run reduction order (invariant 18), so this is
+equality.
+
+### Two bugs the comparison found, both silent, both now invariant
+
+Neither was in the new code's logic. Both had been sitting in the engine and the harness.
+
+**`drain()` returned before the last completion ran** (invariant 23). The engine retired a request from
+its depth accounting and *then* invoked the completion, and `drain()` waits on that depth semaphore —
+so it woke in the gap. Everything downstream that treats `drain()` as a barrier broke: the packed sink
+sets the file length from what it has written, so a completion arriving after that point is a frame
+written past the end of the file, which the truncate then discards. **It cost the last two output
+frames of every run, silently, as black.** It stayed invisible because the harness sized its output
+from the plan rather than from what had been written, and sampled one passthrough frame in
+thirty-seven. The first `--pipeline` run reported `[PASS] wrote 58/58 frames` with two of them black.
+
+**A `pwrite` past the end of a file reports success and leaves a hole** (invariant 24). A frame that
+was never written is byte-identical to a frame written black, so a gap is invisible to any check that
+counts successful writes. `PackedFileSink` now records which indices actually landed and reports both
+gaps and indices past the end. This is the check that turned "58 of 58 frames written, all good" into
+"output frames never written: 53, 54" and led straight to the drain bug.
+
+**Invariant 18 also had to be broadened.** Sixteen full-length repeat runs were compared frame by
+frame. Fifteen agreed to within 1 code step; one differed on a *single interval* — two frames of 478,
+up to **45 code steps**, on 1% of their samples, with both frames still sitting the same small distance
+from their source. The neighbouring frames were byte-identical and the excursion did not reproduce,
+which is the signature of a different reduction order inside that one call rather than of different
+inputs. So a verification pass must be **per-frame with an allowance for a few outliers**, not a global
+tolerance: a global ±1 check fails a correct render about one run in ten, and a global ±45 check hides
+a real error on every frame but two. `analysis/compare_packed.py` now implements that policy, and
+prints the outliers it forgives.
 
 ---
 

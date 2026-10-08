@@ -37,6 +37,51 @@ public struct SourceInterval: Sendable {
     }
 }
 
+/// What a scene cut does to the output frames of one interval (invariant 15).
+///
+/// ## One rule, two paths again
+///
+/// There are two ways to build a plan: `PhasePlan` makes the whole thing at once
+/// and then resolves cuts over it, and ``IntervalPlanner`` makes it one interval at
+/// a time, so each interval has to be resolved as it is produced. Those are two
+/// call sites for the same decision, which is the shape that produced the
+/// offline/online detector split. So the decision lives here, once, and both call
+/// it — the same arrangement as ``CutRule``.
+///
+/// ## What happens at a cut
+///
+/// The frames in a cut interval are not blended — blending them is precisely the
+/// double-exposure this exists to prevent. Instead each one is replaced by the
+/// **nearest source frame**: phases below 0.5 show the outgoing shot, phases at or
+/// above 0.5 show the incoming one.
+///
+/// This does duplicate one frame at the cut, because the last output frame of the
+/// outgoing shot and the first of the incoming shot are the same source picture.
+/// At 59.94 fps that is a 16.7 ms hold — which is what a cut looks like anyway.
+/// A held frame is not an artefact; a ghost is.
+public enum CutResolution {
+
+    /// Resolve one interval's output frames against that interval's verdict.
+    ///
+    /// `isCut` is the decision for the *interval*, not for a frame: a cut between
+    /// source frames `j` and `j + 1` affects every frame in interval `j`.
+    public static func resolve(_ frames: [OutputFrame], isCut: Bool) -> [OutputFrame] {
+        guard isCut else { return frames }
+        var resolved: [OutputFrame] = []
+        resolved.reserveCapacity(frames.count)
+        for frame in frames {
+            guard case .interpolate(let before, let after, let phase) = frame.kind else {
+                resolved.append(frame)
+                continue
+            }
+            let source = phase < 0.5 ? before : after
+            resolved.append(OutputFrame(index: frame.index,
+                                        kind: .passthrough(sourceIndex: source)))
+        }
+        return resolved
+    }
+}
+
 /// Which output frames to produce, and how.
 ///
 /// ## The arithmetic is exact, and that is the point (invariant 14)
@@ -127,17 +172,9 @@ public struct PhasePlan: Sendable {
     /// Return a plan in which no output frame interpolates across a scene cut
     /// (invariant 15).
     ///
-    /// ## What happens at a cut
-    ///
-    /// The frames in a cut interval are not blended — blending them is precisely the
-    /// double-exposure this exists to prevent. Instead each one is replaced by the
-    /// **nearest source frame**: phases below 0.5 show the outgoing shot, phases at
-    /// or above 0.5 show the incoming one.
-    ///
-    /// This does duplicate one frame at the cut, because the last output frame of the
-    /// outgoing shot and the first of the incoming shot are the same source picture.
-    /// At 59.94 fps that is a 16.7 ms hold — which is what a cut looks like anyway.
-    /// A held frame is not an artefact; a ghost is.
+    /// The rule itself is ``CutResolution/resolve(_:isCut:)``; this only walks the
+    /// intervals and applies it. Keeping it that way is what lets the incremental
+    /// pipeline reach the same answer without a second copy of the rule.
     public func resolvingCuts(_ report: SceneChangeReport) -> PhasePlan {
         var resolvedFrames: [OutputFrame] = []
         resolvedFrames.reserveCapacity(frames.count)
@@ -149,24 +186,9 @@ public struct PhasePlan: Sendable {
         for interval in intervals {
             let isCut = interval.sourceIndex < report.isCut.count
                 && report.isCut[interval.sourceIndex]
-
-            var output: [OutputFrame] = []
-            output.reserveCapacity(interval.output.count)
-            for frame in interval.output {
-                guard case .interpolate(let before, let after, let phase) = frame.kind else {
-                    output.append(frame)
-                    passthroughs += 1
-                    continue
-                }
-                if isCut {
-                    let source = phase < 0.5 ? before : after
-                    output.append(OutputFrame(index: frame.index,
-                                              kind: .passthrough(sourceIndex: source)))
-                    passthroughs += 1
-                } else {
-                    output.append(frame)
-                    interpolations += 1
-                }
+            let output = CutResolution.resolve(interval.output, isCut: isCut)
+            for frame in output {
+                if frame.isPassthrough { passthroughs += 1 } else { interpolations += 1 }
             }
             resolvedIntervals.append(SourceInterval(sourceIndex: interval.sourceIndex,
                                                     output: output))

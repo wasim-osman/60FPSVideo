@@ -147,8 +147,17 @@ public final class VTFrameProcessorEngine: InterpolationEngine, @unchecked Senda
             // Invariant 5: always check the error. The low-latency path fails
             // *silently* above 1920x1080 — `startSession` still reports success and
             // the completion arrives with no error and no frames.
-            self?.leavePipeline(error: error)
+            //
+            // Invariant 23: the caller's completion runs *before* this request is
+            // retired from the pipeline. `leavePipeline` is what releases the
+            // depth semaphore, and `drain()` returns as soon as `inFlight` reaches
+            // zero — so retiring first let `drain()` return while the last
+            // completion was still running. The caller would then truncate its
+            // output file, or hand it to an encoder, before the final frames had
+            // been written. That is not theoretical: it cost the last two output
+            // frames of every run, silently, as black.
             request.completion(error.map { .failure($0) } ?? .success(()))
+            self?.leavePipeline(error: error)
         }
     }
 

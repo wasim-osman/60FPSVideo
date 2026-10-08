@@ -17,66 +17,10 @@ import Interpolator
 
 // ---------------------------------------------------------------- output
 
-/// Writes packed frames at their own file offsets.
-///
-/// `pwrite` at an explicit offset means completions may land in any order without
-/// corrupting the stream, which matters because the engine's completions arrive on
-/// its own threads. `@unchecked Sendable` is accurate: everything mutable is behind
-/// `lock`.
-final class OutputWriter: @unchecked Sendable {
-    private let descriptor: Int32
-    private let width: Int
-    private let height: Int
-    private let format: FrameFormat
-    private let frameSize: Int
-    private let lock = NSLock()
-    private var writtenCount = 0
-    private var problemList: [String] = []
-
-    init(descriptor: Int32, width: Int, height: Int, format: FrameFormat = .nv12) {
-        self.descriptor = descriptor
-        self.width = width
-        self.height = height
-        self.format = format
-        self.frameSize = format.packedByteSize(width: width, height: height)
-    }
-
-    func write(_ buffer: CVPixelBuffer, at index: Int) {
-        // Own staging buffer: completions can run concurrently, so this must not be
-        // shared between them.
-        var packed = [UInt8](repeating: 0, count: frameSize)
-        packed.withUnsafeMutableBytes { raw in
-            format.store(buffer: buffer, into: raw.baseAddress!,
-                         width: width, height: height)
-        }
-        let wrote = packed.withUnsafeBytes {
-            pwrite(descriptor, $0.baseAddress, frameSize, off_t(index * frameSize))
-        }
-        lock.lock()
-        if wrote == frameSize {
-            writtenCount += 1
-        } else {
-            problemList.append("short write at output frame \(index): \(wrote)")
-        }
-        lock.unlock()
-    }
-
-    func record(_ problem: String) {
-        lock.lock()
-        problemList.append(problem)
-        lock.unlock()
-    }
-
-    var written: Int {
-        lock.lock(); defer { lock.unlock() }
-        return writtenCount
-    }
-
-    var problems: [String] {
-        lock.lock(); defer { lock.unlock() }
-        return problemList
-    }
-}
+// The packed-frame writer now lives in the library as `PackedFileSink`, so the
+// harness, the batch converter and the tests share one implementation. It was
+// `OutputWriter` here; the body is unchanged, including the `pwrite` at an explicit
+// offset that lets completions land in any order without corrupting the stream.
 
 /// Destination buffers travelling into an engine completion.
 ///
@@ -110,6 +54,11 @@ struct Options {
     var maxFrames: Int? = nil
     var detectOnly = false
     var sceneDetect = true
+    /// Drive the render through the extracted `InterpolationPipeline` instead of the
+    /// inline loop. The two must produce the same frames, which is the whole point:
+    /// the pipeline is what the app ships, and the inline loop is the reference it
+    /// was extracted from.
+    var pipeline = false
 }
 
 func fail(_ message: String) -> Never {
@@ -138,6 +87,10 @@ func parseOptions() -> Options {
           --max-frames N       stop after N source frames
           --detect-only        report scene cuts and exit, no render
           --no-scene-detect    interpolate across cuts (the old, wrong behaviour)
+          --pipeline           drive the render through the extracted
+                               InterpolationPipeline instead of the inline loop.
+                               The two have to produce the same frames; this is how
+                               that is checked on real footage.
 
         Rates accept an exact rational ("60000/1001") or the industry shorthand
         ("59.94"). The shorthand is mapped onto the exact NTSC rational, because
@@ -190,6 +143,8 @@ func parseOptions() -> Options {
             options.detectOnly = true
         case "--no-scene-detect":
             options.sceneDetect = false
+        case "--pipeline":
+            options.pipeline = true
         default:
             fail("unknown option '\(args[i])'")
         }
@@ -261,7 +216,7 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--decode" {
     let outputPath = CommandLine.arguments[3]
     var start: Double? = nil
     var limit: Int? = nil
-    var rest = Array(CommandLine.arguments.dropFirst(4))
+    let rest = Array(CommandLine.arguments.dropFirst(4))
     var k = 0
     while k < rest.count {
         switch rest[k] {
@@ -278,7 +233,6 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--decode" {
         }
         k += 1
     }
-    _ = rest
 
     do {
         let info = try MediaProbe.probe(inputURL)
@@ -456,33 +410,21 @@ if options.sceneDetect, report.cutCount > 0 {
 
 // ---------------------------------------------------------------- engine
 
-let outputDescriptor = open(options.output, O_RDWR | O_CREAT | O_TRUNC, 0o644)
-guard outputDescriptor >= 0 else { fail("cannot create \(options.output)") }
-let writer = OutputWriter(descriptor: outputDescriptor, width: width, height: height,
-                          format: format)
-
-let engine = VTFrameProcessorEngine(source: sourceRate, output: outputRate,
-                                    depth: options.depth)
-do {
-    try engine.prepare(width: width, height: height)
-} catch {
-    fail("could not start the engine: \(error)")
-}
-
-log("engine: \(engine.name), depth \(engine.depth), up to "
-    + "\(engine.maximumInterpolationsPerInterval) interpolations per interval")
-
-// One slot per in-flight request. A slot owns its buffers until the request that
-// borrowed them completes, and the next request to want that slot must wait.
-//
-// It is NOT enough to rely on the engine's depth throttle. That throttle lives
-// inside submit(), which runs *after* the source frames have been loaded into the
-// slot, so slot (n % depth) can be refilled while request n - depth is still
-// reading it. VTFrameProcessor reads the source buffers asynchronously, so the
-// in-flight call then interpolates a mix of old and new frame data. The symptom
-// is subtle rather than obvious: a slow shot is barely wrong, a fast one is very
-// wrong, and the final interval is perfectly correct because nothing follows it
-// to clobber the buffers. Guard the slot explicitly instead.
+/// One slot per in-flight request. A slot owns its buffers until the request that
+/// borrowed them completes, and the next request to want that slot must wait.
+///
+/// It is NOT enough to rely on the engine's depth throttle. That throttle lives
+/// inside submit(), which runs *after* the source frames have been loaded into the
+/// slot, so slot (n % depth) can be refilled while request n - depth is still
+/// reading it. VTFrameProcessor reads the source buffers asynchronously, so the
+/// in-flight call then interpolates a mix of old and new frame data. The symptom
+/// is subtle rather than obvious: a slow shot is barely wrong, a fast one is very
+/// wrong, and the final interval is perfectly correct because nothing follows it
+/// to clobber the buffers. Guard the slot explicitly instead.
+///
+/// The extracted `InterpolationPipeline` carries this same guard; it is duplicated
+/// here only so the inline path can remain the reference the extraction is checked
+/// against, byte for byte.
 final class Slot {
     let a: CVPixelBuffer
     let b: CVPixelBuffer
@@ -494,104 +436,190 @@ final class Slot {
     }
 }
 
-let pool: PixelBufferPool
-var slots: [Slot] = []
-do {
-    let capacity = engine.depth * (2 + engine.maximumInterpolationsPerInterval)
-    pool = try PixelBufferPool(width: width, height: height, format: format,
-                               capacity: capacity)
-    for _ in 0..<engine.depth {
-        let destinations = try (0..<engine.maximumInterpolationsPerInterval).map { _ in
-            try pool.makeBuffer()
-        }
-        slots.append(Slot(a: try pool.makeBuffer(), b: try pool.makeBuffer(),
-                          destinations: destinations))
-    }
-} catch {
-    fail("could not allocate pipeline buffers: \(error)")
-}
+let outputDescriptor = open(options.output, O_RDWR | O_CREAT | O_TRUNC, 0o644)
+guard outputDescriptor >= 0 else { fail("cannot create \(options.output)") }
+let sink = PackedFileSink(descriptor: outputDescriptor, width: width, height: height,
+                          format: format)
 
-// ---------------------------------------------------------------- run
-
-let started = DispatchTime.now().uptimeNanoseconds
 var submitted = 0
+var wall = 0.0
+// Hoisted out of the two paths so the report below reads the same either way.
+var engineName = "InterpolationPipeline"
+var engineDepth = options.depth
 
-// One semaphore per slot: acquired before a slot's buffers are touched, released
-// when the request that owns them completes.
-let slotFree = (0..<engine.depth).map { _ in DispatchSemaphore(value: 1) }
+if options.pipeline {
+    // ------------------------------------------------------------ extracted path
+    //
+    // The whole point of the extraction is that this is the code the app ships, so
+    // running it here is not a test of the harness — it is a test of the shipping
+    // loop, against the inline loop below, on real footage.
+    do {
+        let source = try PackedFileFrameSource(url: URL(fileURLWithPath: options.input),
+                                               width: width, height: height,
+                                               format: format, frameRate: sourceRate)
+        let pipeline = InterpolationPipeline(
+            source: source,
+            sourceRate: sourceRate,
+            outputRate: outputRate,
+            configuration: .init(depth: options.depth,
+                                 sceneDetection: options.sceneDetect,
+                                 maximumSourceFrames: options.maxFrames,
+                                 expectedOutputFrameCount: effectivePlan.outputFrameCount))
+        let result = try pipeline.run(into: sink)
+        submitted = result.engineCalls
+        wall = result.wallSeconds
+        log("source: \(result.sourceFrames) frames read, "
+            + "\(result.engineCalls) engine calls, "
+            + "\(result.outputFrames) output frames")
 
-for interval in effectivePlan.intervals {
-    let slotIndex = submitted % engine.depth
-    slotFree[slotIndex].wait()
-    let slot = slots[slotIndex]
+        for problem in result.problems { sink.record(problem) }
 
-    var loadFailure: String?
-    staging.withUnsafeMutableBytes { raw in
-        let base = raw.baseAddress!
-        for (offset, buffer) in [(0, slot.a), (1, slot.b)] {
-            let sourceIndex = interval.sourceIndex + offset
-            let got = pread(inputDescriptor, base, frameSize,
-                            off_t(sourceIndex * frameSize))
-            guard got == frameSize else {
-                loadFailure = "short read at source frame \(sourceIndex): \(got)"
-                return
+        // The pipeline detects cuts with the online tracker. The harness decided
+        // them offline, over the whole clip, before the render started. Those two
+        // have to agree — and this is the check that runs on real film rather than
+        // on the shapes a synthetic test thought of.
+        if options.sceneDetect {
+            let online = result.decisions.map(\.isCut)
+            if online == report.isCut {
+                log("cuts  : pipeline's online tracker agrees with the offline "
+                    + "detector on all \(online.count) intervals")
+            } else {
+                let differing = zip(online, report.isCut).enumerated()
+                    .filter { $0.element.0 != $0.element.1 }
+                    .map { "\($0.offset)" }
+                    .prefix(12)
+                    .joined(separator: ", ")
+                log("cuts  : [MISMATCH] pipeline and offline detector disagree at "
+                    + "intervals \(differing)")
+                sink.record("pipeline/offline scene detection mismatch at \(differing)")
             }
-            format.load(packed: base, into: buffer, width: width, height: height)
         }
+    } catch {
+        fail("pipeline: \(error)")
     }
-    if let loadFailure {
-        writer.record(loadFailure)
-        slotFree[slotIndex].signal()
-        break
-    }
-
-    // Passthrough frames cost nothing and need no engine call at all. On
-    // 23.976 -> 59.94 that is one output frame in five, free.
-    for frame in interval.passthroughs {
-        guard case .passthrough(let sourceIndex) = frame.kind else { continue }
-        writer.write(sourceIndex == interval.sourceIndex ? slot.a : slot.b, at: frame.index)
-    }
-
-    let interpolations = interval.interpolations
-    if interpolations.isEmpty {
-        // Nothing to submit, so no completion will arrive to release the slot.
-        slotFree[slotIndex].signal()
-        continue
+} else {
+    // ------------------------------------------------------------ inline path
+    //
+    // The original loop, kept as the reference. `--pipeline` on the same input has
+    // to reproduce this, which is what makes the extraction verifiable.
+    let engine = VTFrameProcessorEngine(source: sourceRate, output: outputRate,
+                                        depth: options.depth)
+    do {
+        try engine.prepare(width: width, height: height)
+    } catch {
+        fail("could not start the engine: \(error)")
     }
 
-    submitted += 1
-    let destinations = Array(slot.destinations.prefix(interpolations.count))
-    let destinationSet = BufferSet(buffers: destinations)
-    let intervalIndex = interval.sourceIndex
+    log("engine: \(engine.name), depth \(engine.depth), up to "
+        + "\(engine.maximumInterpolationsPerInterval) interpolations per interval")
+    engineName = engine.name
+    engineDepth = engine.depth
 
-    let request = InterpolationRequest(
-        interval: interval,
-        sourceA: slot.a,
-        sourceB: slot.b,
-        destinations: destinations
-    ) { result in
-        defer { slotFree[slotIndex].signal() }
-        switch result {
-        case .success:
-            for (n, frame) in interpolations.enumerated()
-            where n < destinationSet.buffers.count {
-                writer.write(destinationSet.buffers[n], at: frame.index)
+    let pool: PixelBufferPool
+    var slots: [Slot] = []
+    do {
+        let capacity = engine.depth * (2 + engine.maximumInterpolationsPerInterval)
+        pool = try PixelBufferPool(width: width, height: height, format: format,
+                                   capacity: capacity)
+        for _ in 0..<engine.depth {
+            let destinations = try (0..<engine.maximumInterpolationsPerInterval).map { _ in
+                try pool.makeBuffer()
             }
-        case .failure(let error):
-            writer.record("interval \(intervalIndex): \(error)")
+            slots.append(Slot(a: try pool.makeBuffer(), b: try pool.makeBuffer(),
+                              destinations: destinations))
         }
+    } catch {
+        fail("could not allocate pipeline buffers: \(error)")
     }
-    engine.submit(request)
+
+    let started = DispatchTime.now().uptimeNanoseconds
+
+    // The reference path gets the same bookkeeping as the pipeline, so a hole or a
+    // frame past the end is reported here too rather than only on the new path.
+    try? sink.begin(SinkGeometry(width: width, height: height, format: format,
+                                 sourceRate: sourceRate, outputRate: outputRate,
+                                 sourceFrameCount: sourceFrameCount,
+                                 outputFrameCount: effectivePlan.outputFrameCount))
+
+    // One semaphore per slot: acquired before a slot's buffers are touched, released
+    // when the request that owns them completes.
+    let slotFree = (0..<engine.depth).map { _ in DispatchSemaphore(value: 1) }
+
+    for interval in effectivePlan.intervals {
+        let slotIndex = submitted % engine.depth
+        slotFree[slotIndex].wait()
+        let slot = slots[slotIndex]
+
+        var loadFailure: String?
+        staging.withUnsafeMutableBytes { raw in
+            let base = raw.baseAddress!
+            for (offset, buffer) in [(0, slot.a), (1, slot.b)] {
+                let sourceIndex = interval.sourceIndex + offset
+                let got = pread(inputDescriptor, base, frameSize,
+                                off_t(sourceIndex * frameSize))
+                guard got == frameSize else {
+                    loadFailure = "short read at source frame \(sourceIndex): \(got)"
+                    return
+                }
+                format.load(packed: base, into: buffer, width: width, height: height)
+            }
+        }
+        if let loadFailure {
+            sink.record(loadFailure)
+            slotFree[slotIndex].signal()
+            break
+        }
+
+        // Passthrough frames cost nothing and need no engine call at all. On
+        // 23.976 -> 59.94 that is one output frame in five, free.
+        for frame in interval.passthroughs {
+            guard case .passthrough(let sourceIndex) = frame.kind else { continue }
+            sink.write(sourceIndex == interval.sourceIndex ? slot.a : slot.b, at: frame.index)
+        }
+
+        let interpolations = interval.interpolations
+        if interpolations.isEmpty {
+            // Nothing to submit, so no completion will arrive to release the slot.
+            slotFree[slotIndex].signal()
+            continue
+        }
+
+        submitted += 1
+        let destinations = Array(slot.destinations.prefix(interpolations.count))
+        let destinationSet = BufferSet(buffers: destinations)
+        let intervalIndex = interval.sourceIndex
+
+        let request = InterpolationRequest(
+            interval: interval,
+            sourceA: slot.a,
+            sourceB: slot.b,
+            destinations: destinations
+        ) { result in
+            defer { slotFree[slotIndex].signal() }
+            switch result {
+            case .success:
+                for (n, frame) in interpolations.enumerated()
+                where n < destinationSet.buffers.count {
+                    sink.write(destinationSet.buffers[n], at: frame.index)
+                }
+            case .failure(let error):
+                sink.record("interval \(intervalIndex): \(error)")
+            }
+        }
+        engine.submit(request)
+    }
+
+    do {
+        try engine.drain()
+    } catch {
+        sink.record("engine drain: \(error)")
+    }
+    engine.shutdown()
+    try? sink.finish()
+
+    wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
 }
 
-do {
-    try engine.drain()
-} catch {
-    writer.record("engine drain: \(error)")
-}
-engine.shutdown()
-
-let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
 ftruncate(outputDescriptor, off_t(effectivePlan.outputFrameCount * frameSize))
 fsync(outputDescriptor)
 close(outputDescriptor)
@@ -627,14 +655,14 @@ if sourceDescriptor >= 0 { close(sourceDescriptor) }
 
 // ---------------------------------------------------------------- report
 
-let problems = writer.problems + detectionProblems
-let written = writer.written
+let problems = sink.problems + detectionProblems
+let written = sink.written
 
 log("")
 log(String(format: "RESULT %@ %dx%d %@ %@->%@ depth=%d | %d out frames | "
            + "%d interpolated | %d passthrough | %d cuts",
-           engine.name, width, height, "\(format.bitDepth)-bit",
-           "\(sourceRate)", "\(outputRate)", engine.depth,
+           engineName, width, height, "\(format.bitDepth)-bit",
+           "\(sourceRate)", "\(outputRate)", engineDepth,
            effectivePlan.outputFrameCount, effectivePlan.interpolatedCount,
            effectivePlan.passthroughCount, report.cutCount))
 log(String(format: "wall  : %.2fs | OUTPUT %6.1f fps | %6.2f ms/interval",
