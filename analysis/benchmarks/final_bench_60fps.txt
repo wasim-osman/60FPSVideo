@@ -1,0 +1,66 @@
+===================================================================
+ 60 FPS output benchmark  --  2026-10-08 03:47:34
+ host: Apple M2 Max  |  27.0.1
+ NOTE: other work on this machine perturbs results. Absolute values
+       shift a few percent run to run; ratios are stable.
+===================================================================
+
+### A. SOURCE RATE SWEEP @ 1920x1080 (depth 1 = lock-step, depth 2 = pipelined)
+  -- round 1 --
+  23.976  d1   601 out frames = 600 interpolated + 1 passthrough RESULT 1920x1080 23.976->60 depth=1 | 601 out frames | wall 10.48s | OUTPUT 57.4 fps | 43.66 ms/call 
+  23.976  d2   601 out frames = 600 interpolated + 1 passthrough RESULT 1920x1080 23.976->60 depth=2 | 601 out frames | wall 7.85s | OUTPUT 76.5 fps | 32.73 ms/call 
+  24      d1   600 out frames = 480 interpolated + 120 passthrough RESULT 1920x1080 24->60 depth=1 | 600 out frames | wall 10.15s | OUTPUT 59.1 fps | 42.27 ms/call 
+  24      d2   600 out frames = 480 interpolated + 120 passthrough RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 7.52s | OUTPUT 79.7 fps | 31.35 ms/call 
+  25      d1   576 out frames = 528 interpolated + 48 passthrough RESULT 1920x1080 25->60 depth=1 | 576 out frames | wall 10.41s | OUTPUT 55.4 fps | 43.36 ms/call 
+  25      d2   576 out frames = 528 interpolated + 48 passthrough RESULT 1920x1080 25->60 depth=2 | 576 out frames | wall 7.67s | OUTPUT 75.1 fps | 31.97 ms/call 
+  29.97   d1   481 out frames = 480 interpolated + 1 passthrough RESULT 1920x1080 29.97->60 depth=1 | 481 out frames | wall 10.09s | OUTPUT 47.7 fps | 42.03 ms/call 
+  29.97   d2   481 out frames = 480 interpolated + 1 passthrough RESULT 1920x1080 29.97->60 depth=2 | 481 out frames | wall 7.36s | OUTPUT 65.3 fps | 30.68 ms/call 
+  50      d1   288 out frames = 240 interpolated + 48 passthrough RESULT 1920x1080 50->60 depth=1 | 288 out frames | wall 8.34s | OUTPUT 34.5 fps | 34.75 ms/call 
+  50      d2   288 out frames = 240 interpolated + 48 passthrough RESULT 1920x1080 50->60 depth=2 | 288 out frames | wall 6.40s | OUTPUT 45.0 fps | 26.67 ms/call 
+  59.94   d1   241 out frames = 240 interpolated + 1 passthrough RESULT 1920x1080 59.94->60 depth=1 | 241 out frames | wall 8.36s | OUTPUT 28.8 fps | 34.85 ms/call 
+  59.94   d2   241 out frames = 240 interpolated + 1 passthrough RESULT 1920x1080 59.94->60 depth=2 | 241 out frames | wall 6.44s | OUTPUT 37.4 fps | 26.85 ms/call 
+  -- round 2 --
+  23.976  d1   601 out frames = 600 interpolated + 1 passthrough RESULT 1920x1080 23.976->60 depth=1 | 601 out frames | wall 10.73s | OUTPUT 56.0 fps | 44.70 ms/call 
+  23.976  d2   601 out frames = 600 interpolated + 1 passthrough RESULT 1920x1080 23.976->60 depth=2 | 601 out frames | wall 7.80s | OUTPUT 77.0 fps | 32.52 ms/call 
+  24      d1   600 out frames = 480 interpolated + 120 passthrough RESULT 1920x1080 24->60 depth=1 | 600 out frames | wall 10.02s | OUTPUT 59.9 fps | 41.75 ms/call 
+  24      d2   600 out frames = 480 interpolated + 120 passthrough RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 7.41s | OUTPUT 80.9 fps | 30.90 ms/call 
+  25      d1   576 out frames = 528 interpolated + 48 passthrough RESULT 1920x1080 25->60 depth=1 | 576 out frames | wall 10.27s | OUTPUT 56.1 fps | 42.79 ms/call 
+  25      d2   576 out frames = 528 interpolated + 48 passthrough RESULT 1920x1080 25->60 depth=2 | 576 out frames | wall 7.54s | OUTPUT 76.4 fps | 31.40 ms/call 
+  29.97   d1   481 out frames = 480 interpolated + 1 passthrough RESULT 1920x1080 29.97->60 depth=1 | 481 out frames | wall 10.02s | OUTPUT 48.0 fps | 41.76 ms/call 
+  29.97   d2   481 out frames = 480 interpolated + 1 passthrough RESULT 1920x1080 29.97->60 depth=2 | 481 out frames | wall 7.52s | OUTPUT 64.0 fps | 31.34 ms/call 
+  50      d1   288 out frames = 240 interpolated + 48 passthrough RESULT 1920x1080 50->60 depth=1 | 288 out frames | wall 8.38s | OUTPUT 34.4 fps | 34.91 ms/call 
+  50      d2   288 out frames = 240 interpolated + 48 passthrough RESULT 1920x1080 50->60 depth=2 | 288 out frames | wall 6.46s | OUTPUT 44.6 fps | 26.91 ms/call 
+  59.94   d1   241 out frames = 240 interpolated + 1 passthrough RESULT 1920x1080 59.94->60 depth=1 | 241 out frames | wall 8.44s | OUTPUT 28.6 fps | 35.17 ms/call 
+  59.94   d2   241 out frames = 240 interpolated + 1 passthrough RESULT 1920x1080 59.94->60 depth=2 | 241 out frames | wall 6.44s | OUTPUT 37.4 fps | 26.83 ms/call 
+
+### B. RESOLUTION SWEEP, 24 -> 60 (depth 1 vs 2)
+  1280x720 d1   600 out frames = 480 interpolated + 120 passthrough RESULT 1280x720 24->60 depth=1 | 600 out frames | wall 8.47s | OUTPUT 70.8 fps | 35.31 ms/call 
+  1280x720 d2   600 out frames = 480 interpolated + 120 passthrough RESULT 1280x720 24->60 depth=2 | 600 out frames | wall 7.45s | OUTPUT 80.5 fps | 31.04 ms/call 
+  1920x1080 d1   600 out frames = 480 interpolated + 120 passthrough RESULT 1920x1080 24->60 depth=1 | 600 out frames | wall 9.94s | OUTPUT 60.4 fps | 41.42 ms/call 
+  1920x1080 d2   600 out frames = 480 interpolated + 120 passthrough RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 7.43s | OUTPUT 80.8 fps | 30.96 ms/call 
+  3840x2160 d1   300 out frames = 240 interpolated + 60 passthrough RESULT 3840x2160 24->60 depth=1 | 300 out frames | wall 12.54s | OUTPUT 23.9 fps | 104.53 ms/call 
+  3840x2160 d2   300 out frames = 240 interpolated + 60 passthrough RESULT 3840x2160 24->60 depth=2 | 300 out frames | wall 8.98s | OUTPUT 33.4 fps | 74.87 ms/call 
+
+### C. LOW-LATENCY PATH (30 -> 60, exact 2x)  [hard-capped at 1080p]
+  1280x720  RESULT low-latency 1280x720 30->60fps | calls 120 | avg 4.24 ms | OUTPUT 472.0 fps | ACHIEVED
+  1920x1080  RESULT low-latency 1920x1080 30->60fps | calls 120 | avg 14.43 ms | OUTPUT 138.6 fps | ACHIEVED
+
+### D. CONCURRENCY SCALING (separate processes, 1080p 24->60)
+  -- 1 concurrent process(es), depth 2 --
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 7.33s | OUTPUT   81.8 fps |  30.55 ms/call
+  -- 2 concurrent process(es), depth 2 --
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 6.34s | OUTPUT   94.7 fps |  26.41 ms/call
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 6.35s | OUTPUT   94.5 fps |  26.46 ms/call
+  -- 3 concurrent process(es), depth 2 --
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 7.95s | OUTPUT   75.5 fps |  33.11 ms/call
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 8.00s | OUTPUT   75.0 fps |  33.34 ms/call
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 7.97s | OUTPUT   75.3 fps |  33.21 ms/call
+  -- 4 concurrent process(es), depth 2 --
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 9.73s | OUTPUT   61.7 fps |  40.54 ms/call
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 9.74s | OUTPUT   61.6 fps |  40.56 ms/call
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 9.66s | OUTPUT   62.1 fps |  40.24 ms/call
+RESULT 1920x1080 24->60 depth=2 | 600 out frames | wall 9.70s | OUTPUT   61.9 fps |  40.40 ms/call
+
+===================================================================
+ done 03:52:45
+===================================================================

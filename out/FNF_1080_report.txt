@@ -1,0 +1,32 @@
+AB test: work/fnf_1080_lossless.mp4
+source 1920x816 23.976 fps (24000/1001) -> 59.94 fps (60000/1001)
+frames 191
+
+VTFrameProcessor
+input : 191 frames  1920x816  2350080 B/frame  src 24000/1001 -> out 60000/1001
+plan  : 475 out frames = 380 interpolated + 95 passthrough
+output: /Users/Wasim/Documents/Projects/60FPSVideo/work/FNF_1080_vt.nv12
+calls : completed 285 / 190 intervals + 95 passthrough  errors 0
+RESULT vtrender 1920x816 24000/1001->60000/1001 depth=2 | 475 out frames | wall 6.42s | OUTPUT   74.0 fps |  33.79 ms/call
+wall 7.14s
+
+CoreML RIFE
+input  : 191 frames  1920x816 rgb24  src 24000/1001 -> out 60000/1001
+model  : /Users/Wasim/Documents/Projects/60FPSVideo/analysis/coreml/build/rife425_1920x832_fp16.mlpackage
+interp : 1920x816  padded to 1920x832
+plan   : 475 out frames = 380 interpolated + 95 passthrough
+  ..interval 0/190  3/475 frames  0.3s
+  ..interval 25/190  65/475 frames  2.4s
+  ..interval 50/190  128/475 frames  4.6s
+  ..interval 75/190  190/475 frames  6.7s
+  ..interval 100/190  253/475 frames  8.8s
+  ..interval 125/190  315/475 frames  11.0s
+  ..interval 150/190  378/475 frames  13.1s
+  ..interval 175/190  440/475 frames  15.3s
+frames : wrote 475 / expected 475  errors 0
+RESULT rife_render 1920x816 (padded 1920x832) 24000/1001->60000/1001 | 475 out frames | wall 16.49s | OUTPUT   28.8 fps |  43.39 ms/call
+wall 20.84s
+
+[PASS] output frame counts match VT 475, RIFE 475
+[PASS] VT passthrough k=0 == source frame 0 
+[PASS] VT chroma fully populated 0 zero rows

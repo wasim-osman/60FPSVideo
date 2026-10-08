@@ -1,0 +1,38 @@
+===================================================================
+ RIFE vs VTFrameProcessor -- 24 -> 60 fps  |  2026-10-08 04:11
+ host: Apple M2 Max | macOS 27.0.1
+ RIFE plugin : SVP 4 Mac  Contents/Resources/rife/libRIFE.dylib (universal)
+ VapourSynth : VapourSynth Video Processing Library
+ Vulkan      : /opt/homebrew/lib/libvulkan.1.dylib
+present
+===================================================================
+
+--- model comparison @ 1920x1080 ---
+  rife-v4                1920x1080 24->60 model=rife-v4 | OUTPUT   27.8 fps |  11.1 src fps | realtime=0.46x
+  models/rife-v4.6       1920x1080 24->60 model=models/rife-v4.6 | OUTPUT   26.4 fps |  10.6 src fps | realtime=0.44x
+  models/rife-v4.16lite  1920x1080 24->60 model=models/rife-v4.16lite | OUTPUT   22.8 fps |   9.1 src fps | realtime=0.38x
+
+--- resolution scaling, rife-v4 ---
+  640x360    640x360 24->60 model=rife-v4 | OUTPUT   91.4 fps |  36.6 src fps | realtime=1.52x
+  1280x720   1280x720 24->60 model=rife-v4 | OUTPUT   56.2 fps |  22.5 src fps | realtime=0.94x
+  1920x1080  1920x1080 24->60 model=rife-v4 | OUTPUT   28.6 fps |  11.5 src fps | realtime=0.48x
+  3840x2160  3840x2160 24->60 model=rife-v4 | OUTPUT    7.8 fps |   3.1 src fps | realtime=0.13x
+
+--- gpu_thread scaling @ 1920x1080 (RIFE's own multi-queue) ---
+  gpu_thread=1  1920x1080 24->60 model=rife-v4 | OUTPUT   28.2 fps |  11.3 src fps | realtime=0.47x
+  gpu_thread=2  1920x1080 24->60 model=rife-v4 | OUTPUT   28.3 fps |  11.3 src fps | realtime=0.47x
+  gpu_thread=3  1920x1080 24->60 model=rife-v4 | OUTPUT   28.5 fps |  11.4 src fps | realtime=0.47x
+
+--- concurrency scaling @ 1920x1080 (separate processes, rife-v4) ---
+  -- 1 process(es) --
+1920x1080 24->60 model=rife-v4 | OUTPUT   28.2 fps |  11.3 src fps | realtime=0.47x
+  -- 2 process(es) --
+1920x1080 24->60 model=rife-v4 | OUTPUT   21.1 fps |   8.4 src fps | realtime=0.35x
+1920x1080 24->60 model=rife-v4 | OUTPUT   21.0 fps |   8.4 src fps | realtime=0.35x
+  -- 4 process(es) [60 source frames each] --
+1920x1080 24->60 model=rife-v4 | OUTPUT   10.0 fps |   4.0 src fps | realtime=0.17x
+1920x1080 24->60 model=rife-v4 | OUTPUT   10.0 fps |   4.0 src fps | realtime=0.17x
+1920x1080 24->60 model=rife-v4 | OUTPUT   10.0 fps |   4.0 src fps | realtime=0.17x
+1920x1080 24->60 model=rife-v4 | OUTPUT   10.0 fps |   4.0 src fps | realtime=0.17x
+
+===================================================================

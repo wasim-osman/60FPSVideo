@@ -1,0 +1,36 @@
+CoreML RIFE 4.25 - Phase 0 benchmark
+Apple M2 Max, macOS 27.0.1, coremltools 9.0, torch 2.7.0
+compute_units=CPU_AND_GPU (the default ALL is 8x slower - see notes)
+
+model                           size   ms/call   calls/s    MB
+----------------------------------------------------------------
+rife425 fp16             960x    576      13.3     75.13    14
+rife425 fp16             1280x    768      19.8     50.54    15
+rife425 fp16             1600x    960      29.3     34.13    18
+rife425 fp16             1920x   1088      38.5     25.94    20
+rife425 fp32             1920x   1088      42.0     23.82    40
+rife425.lite fp16        1920x   1088      41.2     24.25    20
+
+Requirement: 59.94 output fps needs this many RIFE calls/s
+  23.976->59.94 : 79.9% interpolated -> 47.9 calls/s
+  24.000->59.94 : 99.8% interpolated -> 59.8 calls/s
+  29.97 ->59.94 : 49.9% interpolated -> 29.9 calls/s
+
+Traceback (most recent call last):
+  File "<stdin>", line 35, in <module>
+  File "<stdin>", line 35, in <listcomp>
+TypeError: argument of type 'numpy.float64' is not iterable
+throughput scaling:
+     960x576  0.553 Mpx  ->   41.5 Mpx/s    75.13 calls/s
+    1280x768  0.983 Mpx  ->   49.7 Mpx/s    50.54 calls/s
+    1600x960  1.536 Mpx  ->   52.4 Mpx/s    34.13 calls/s
+   1920x1088  2.089 Mpx  ->   54.2 Mpx/s    25.94 calls/s
+
+max interpolation resolution that is real-time:
+  23.976->59.94: needs  47.9 calls/s -> 1.044 Mpx -> about 1362x766
+  24.000->59.94: needs  59.8 calls/s -> 0.836 Mpx -> about 1219x685
+  29.97->59.94: needs  29.9 calls/s -> 1.672 Mpx -> about 1724x969
+
+verdict:
+  1080p (1920x1088): 25.94 calls/s vs 47.9-59.8 needed  -> FAIL (0.43x-0.54x)
+  the RIFE quality tier CANNOT do real-time 1080p playback

@@ -1,0 +1,88 @@
+RELATIVE_PATH	ARCHS
+Contents/MacOS/SVPManager	x86_64
+Contents/PlugIns/platforms/libqcocoa.dylib	x86_64 arm64
+Contents/PlugIns/styles/libqmacstyle.dylib	x86_64 arm64
+Contents/PlugIns/tls/libqsecuretransportbackend.dylib	x86_64 arm64
+Contents/PlugIns/tls/libqopensslbackend.dylib	x86_64 arm64
+Contents/PlugIns/tls/libqcertonlybackend.dylib	x86_64 arm64
+Contents/PlugIns/iconengines/libqsvgicon.dylib	x86_64 arm64
+Contents/PlugIns/imageformats/libqgif.dylib	x86_64 arm64
+Contents/PlugIns/imageformats/libqico.dylib	x86_64 arm64
+Contents/PlugIns/imageformats/libqjpeg.dylib	x86_64 arm64
+Contents/PlugIns/imageformats/libqsvg.dylib	x86_64 arm64
+Contents/PlugIns/networkinformation/libqapplenetworkinformation.dylib	x86_64 arm64
+Contents/Resources/plugins/libvapoursynth_plugin.dylib.30	x86_64 arm64
+Contents/Resources/plugins/libsvpcontrol_plugin.dylib.30	x86_64 arm64
+Contents/Resources/plugins/libsvpflow1.dylib	x86_64 arm64
+Contents/Resources/plugins/libsvpflow2.dylib	x86_64 arm64
+Contents/Resources/utils/clinfo	x86_64
+Contents/Resources/utils/vulkaninfo	x86_64 arm64
+Contents/Resources/extensions/tube/deno	x86_64 arm64
+Contents/Resources/extensions/tube/libPythonQt.dylib	x86_64 arm64
+Contents/Resources/extensions/tube/libmain.dylib	x86_64
+Contents/Resources/extensions/code/mkvmerge	x86_64
+Contents/Resources/extensions/libsvpcast.dylib	x86_64
+Contents/Resources/extensions/libsvpcode.dylib	x86_64
+Contents/Resources/extensions/libsvplight.dylib	x86_64
+Contents/Resources/extensions/libsvptube.dylib	x86_64
+Contents/Resources/lib/python3.11/lib-dynload/_scproxy.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_md5.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_heapq.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_opcode.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_uuid.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_elementtree.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/cmath.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_crypt.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_contextvars.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_random.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_json.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/binascii.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_datetime.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_bz2.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_ctypes.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/math.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_curses.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_dbm.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_ctypes_test.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/unicodedata.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/termios.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/zlib.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_sha256.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_bisect.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_asyncio.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_sha512.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_posixsubprocess.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/pyexpat.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/select.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_lzma.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_blake2.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_queue.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/array.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_struct.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_posixshmem.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_sha1.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_decimal.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_socket.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_hashlib.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_curses_panel.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/grp.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_ssl.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/_sha3.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/lib/python3.11/lib-dynload/fcntl.cpython-311-darwin.so	x86_64 arm64
+Contents/Resources/rife/libRIFE.dylib	x86_64 arm64
+Contents/Resources/rife/libmiscfilters.dylib	x86_64 arm64
+Contents/Library/LoginItems/SVPManagerLauncher.app/Contents/MacOS/SVPManagerLauncher	arm64
+Contents/Frameworks/libQtWebApp.1.dylib	x86_64
+Contents/Frameworks/libmediainfo.0.dylib	x86_64 arm64
+Contents/Frameworks/QtGui.framework/Versions/A/QtGui	x86_64 arm64
+Contents/Frameworks/libpython3.11.dylib	x86_64 arm64
+Contents/Frameworks/QtDBus.framework/Versions/A/QtDBus	x86_64 arm64
+Contents/Frameworks/libssl.3.dylib	x86_64 arm64
+Contents/Frameworks/libcrypto.3.dylib	x86_64 arm64
+Contents/Frameworks/QtCore.framework/Versions/A/QtCore	x86_64 arm64
+Contents/Frameworks/QtQml.framework/Versions/A/QtQml	x86_64 arm64
+Contents/Frameworks/QtSvgWidgets.framework/Versions/A/QtSvgWidgets	x86_64 arm64
+Contents/Frameworks/QtWidgets.framework/Versions/A/QtWidgets	x86_64 arm64
+Contents/Frameworks/QtNetwork.framework/Versions/A/QtNetwork	x86_64 arm64
+Contents/Frameworks/QtSvg.framework/Versions/A/QtSvg	x86_64 arm64
+Contents/Frameworks/QtConcurrent.framework/Versions/A/QtConcurrent	x86_64 arm64

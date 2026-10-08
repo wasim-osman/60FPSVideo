@@ -1,0 +1,29 @@
+AB test: samples/test24.mp4
+source 1920x1080 24 fps -> 59.94 fps
+frames 72
+
+VTFrameProcessor
+input : 72 frames  1920x1080  3110400 B/frame  src 24.0 -> out 59.94
+plan  : 178 out frames = 177 interpolated + 1 passthrough
+output: /Users/Wasim/Documents/Projects/60FPSVideo/work/selftest_vt.nv12
+calls : completed 72 / 71 intervals + 1 passthrough  errors 0
+RESULT vtrender 1920x1080 24->59.94 depth=2 | 178 out frames | wall 2.75s | OUTPUT   64.8 fps |  38.68 ms/call
+wall 3.23s
+
+CoreML RIFE
+input  : 72 frames  1920x1080 rgb24  src 24.0 -> out 59.94
+model  : /Users/Wasim/Documents/Projects/60FPSVideo/analysis/coreml/build/rife425_1920x1088_fp16.mlpackage
+interp : 1920x1080  padded to 1920x1088
+plan   : 178 out frames = 177 interpolated + 1 passthrough
+  ..interval 0/71  3/178 frames  0.2s
+  ..interval 25/71  65/178 frames  3.5s
+  ..interval 50/71  128/178 frames  6.8s
+frames : wrote 178 / expected 178  errors 0
+RESULT rife_render 1920x1080 (padded 1920x1088) 24.0->59.94 | 178 out frames | wall 9.42s | OUTPUT   18.9 fps |  53.24 ms/call
+wall 13.33s
+
+stills in /Users/Wasim/Documents/Projects/60FPSVideo/out/selftest_frames
+
+[PASS] output frame counts match VT 178, RIFE 178
+[PASS] VT passthrough k=0 == source frame 0 
+[PASS] VT chroma fully populated 0 zero rows
