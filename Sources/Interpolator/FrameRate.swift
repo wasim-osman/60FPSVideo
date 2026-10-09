@@ -36,7 +36,7 @@ public struct FrameRate: Hashable, Sendable, Comparable, CustomStringConvertible
     /// Fails on non-positive values. The fraction is reduced to lowest terms.
     public init?(numerator: Int, denominator: Int) {
         guard numerator > 0, denominator > 0 else { return nil }
-        let g = FrameRate.greatestCommonDivisor(numerator, denominator)
+        let g = IntegerMath.greatestCommonDivisor(numerator, denominator)
         self.numerator = numerator / g
         self.denominator = denominator / g
     }
@@ -172,13 +172,7 @@ public struct FrameRate: Hashable, Sendable, Comparable, CustomStringConvertible
     public func ratio(to other: FrameRate) -> (numerator: Int, denominator: Int) {
         let n = numerator * other.denominator
         let d = denominator * other.numerator
-        let g = FrameRate.greatestCommonDivisor(n, d)
+        let g = IntegerMath.greatestCommonDivisor(n, d)
         return (n / g, d / g)
-    }
-
-    private static func greatestCommonDivisor(_ a: Int, _ b: Int) -> Int {
-        var x = abs(a), y = abs(b)
-        while y != 0 { (x, y) = (y, x % y) }
-        return x == 0 ? 1 : x
     }
 }

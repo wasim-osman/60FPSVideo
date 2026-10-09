@@ -145,18 +145,12 @@ public struct OutputRatePolicy: Sendable, Hashable, CustomStringConvertible {
         public var passthroughFraction: Double {
             let pnum = source.numerator * output.denominator
             let pden = source.denominator * output.numerator
-            let divisor = OutputRatePolicy.gcd(pnum, pden)
+            let divisor = IntegerMath.greatestCommonDivisor(pnum, pden)
             let period = pden / divisor
             guard period > 0 else { return 0 }
             var free = 0
             for k in 0..<period where (k * pnum) % pden == 0 { free += 1 }
             return Double(free) / Double(period)
         }
-    }
-
-    private static func gcd(_ a: Int, _ b: Int) -> Int {
-        var x = abs(a), y = abs(b)
-        while y != 0 { (x, y) = (y, x % y) }
-        return x == 0 ? 1 : x
     }
 }

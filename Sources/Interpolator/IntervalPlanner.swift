@@ -134,4 +134,54 @@ public struct IntervalPlanner: Sendable {
         guard isUsable, k >= 0 else { return false }
         return (k * pnum) % pden == 0
     }
+
+    // MARK: - Segmenting
+
+    /// The number of source intervals after which the phase pattern repeats exactly.
+    ///
+    /// Output frame `k` carries phase `(k * pnum mod pden) / pden`, so the pattern of
+    /// phases repeats every `pden / gcd(pnum, pden)` output frames — which, at
+    /// `pden / pnum` output frames per interval, is `pnum / gcd(pnum, pden)` intervals.
+    ///
+    /// This matters because a segment rendered on its own numbers its output frames from
+    /// zero, so its phase is computed from a local index. That reproduces the film's phase
+    /// only when the segment begins where the pattern begins. Anywhere else, the segment's
+    /// passthrough frames land on the wrong output indices and the join shows it as a
+    /// duplicated or dropped picture at every boundary — a defect that would look like a
+    /// stutter at regular intervals and be blamed on the engine.
+    ///
+    /// Measured: 23.976 → 59.94 gives 2 intervals, so the constraint is free there;
+    /// 23.976 → 60 gives 400, which is 16.7 s of film and still smaller than any sensible
+    /// segment.
+    public var phasePeriod: Int {
+        guard isUsable else { return 0 }
+        return pnum / IntegerMath.greatestCommonDivisor(pnum, pden)
+    }
+
+    /// The output frame that source interval `j` begins at, when `j` sits on a phase
+    /// boundary. `nil` otherwise.
+    ///
+    /// `j * pden` is divisible by `pnum` exactly when `j` is a multiple of
+    /// ``phasePeriod`` — because with `g = gcd(pnum, pden)`, `pnum = gA` and `pden = gB`,
+    /// the quotient `j * B / A` is an integer exactly when `A` divides `j`, and `A` and
+    /// `B` share no factor.
+    public func outputIndexAtPhaseBoundary(interval j: Int) -> Int? {
+        guard isUsable, j >= 0, (j * pden) % pnum == 0 else { return nil }
+        return j * pden / pnum
+    }
+
+    /// How many output frames the intervals `[j, j + count)` produce in total.
+    ///
+    /// The same arithmetic as ``output(forInterval:)``, without building the frames.
+    /// A plan for a feature-length job needs counts for every segment; materialising the
+    /// frames to count them would make planning cost as much as rendering.
+    public func outputFrameCount(fromInterval j: Int, count: Int) -> Int {
+        guard isUsable, j >= 0, count > 0 else { return 0 }
+        // The first k at or after the first interval's lower edge, and the first k at or
+        // after the last interval's upper edge — which is one past the last frame owned,
+        // because `kMax + 1 == ceil(((j + count) * pden) / pnum)` for positive integers.
+        let first = (j * pden + pnum - 1) / pnum
+        let end = ((j + count) * pden + pnum - 1) / pnum
+        return max(0, end - first)
+    }
 }
