@@ -139,7 +139,7 @@ target is finite and known.
 
 ---
 
-## 5. 🔴 GATE — Target output rate policy
+## 5. ✅ SETTLED — Target output rate policy (59.94)
 
 You said "60 fps". Worth knowing what that costs, because for NTSC-family sources it is not free.
 
@@ -166,13 +166,43 @@ roughly **25% more inference** on film content, and it also means 59.94 keeps on
 **Effect on the app:** this is the single biggest performance lever in the whole design, and it costs
 nothing to implement — it's a decision, not a feature.
 
-**Recommendation: C**, defaulting to 60.000 when the source rate is a clean 24/25/30/50.
+### ✅ SETTLED — 59.94, as the default, with 60.000 available
 
-> ⚠️ **The standing instruction is "60 FPS-only output", which is option A and conflicts with C.** The
-> measurements above are the cost of that: on a 23.976 source, going to exactly 60.000 rather than
-> 59.94 does about 25% more inference for 0.06 fps more output. Worth confirming which was meant
-> before the batch converter's rate policy is fixed — the difference is a couple of hours on a
-> feature-length job. It does not block the pipeline work either way: the rate is a parameter.
+**Decision: `OutputRatePolicy.standard` = 59.94 (`60000/1001`).** The user chose it when asked directly
+whether "60 fps" meant literally 60.000 or the 60-family rate matching the source. It is the default
+in code, not a comment: both consumers take an `OutputRatePolicy` value, so the batch converter and
+the player cannot pick different cadences — if they did, the passthrough frames would land in
+different places and the same film would show different pictures converted and played back.
+
+`OutputRatePolicy.exactSixty` (60.000) is the override, for the case §13.2 predicted: an **integer**
+source rate has no `/1001` denominator to share, so 59.94 has nothing to align with and 60.000 is the
+faster choice (24.000: 80.3 fps against 74.8, −7%).
+
+`resolve(source:)` adds one rule beyond the target: **the output rate is never below the source.**
+Going the other way is a downconversion, and this app drops pictures rather than inventing them. The
+case that actually occurs is a 60.000 source under the 59.94 default, and there the honest answer is
+that the file is already at target.
+
+**Reproduced on the real clip** (`work/bright.nv12`, 3840×1632, 23.976 source, 24 frames), so the
+justification is checkable rather than asserted:
+
+| policy | output rate | passthrough | interpolated | predicted free fraction |
+| --- | --- | --- | --- | --- |
+| **standard** | `60000/1001` | **14 / 58** | **44** | 20.0% |
+| `exactSixty` | `60/1` | 3 / 58 | 55 | 0.0999% |
+
+Both runs report the same 58 output frames and the same single cut, so the difference is entirely the
+cadence: **11 fewer interpolations in a 58-frame window**, and the 3 passthroughs at 60.000 are
+cut-forced, not rate-aligned. Note the ratio itself is what breaks — `24000/1001 -> 60000/1001`
+reduces to exactly `5/2`, while `24000/1001 -> 60/1` reduces to `1001/400`, and 1001 and 400 are
+coprime. Pinned in `OutputRatePolicyTests`, including a test that the closed-form fraction matches
+what `IntervalPlanner` actually emits over 3,000 intervals.
+
+> **Option C (auto per source) was considered and declined.** It was the earlier recommendation, and it
+> is strictly better on paper — 59.94 for the NTSC family, 60.000 for integer rates. It was dropped
+> because it means two output cadences to test and two different frame counts from the same source
+> depending on a hidden rule, which is a worse thing to explain than a setting. The override covers
+> the 24.000 case for anyone who wants it.
 
 ---
 
@@ -459,7 +489,7 @@ its first row is now answered. Kept only so the record shows what was unknown be
 | 2 | Quality tier scope | A batch only · B batch + playback if measured | B | **DROPPED** — gate measured at 1080p (`PHASE0-COREML-RIFE.md`), then §16 measured the tier against ground truth and found it **statistically indistinguishable** from VTFrameProcessor at **4.06×** the cost. ✅ confirmed 2026-10-08 |
 | 3 | RIFE variant | A v4.x · B 4.18+ · C v4.6 · D none | A, then B | **VOID** — no tier to put a variant in. The CoreML conversion used 4.25 as the instrument. |
 | 4 | Timestep | A baked per phase · B input tensor | A | *(default applied)* |
-| 5 | Target rate | A 60.000 · B 59.94 · C auto | C | **Always 59.94** |
+| 5 | Target rate | A 60.000 · B 59.94 · C auto | C | **Always 59.94** ✅ settled 2026-10-08 — `OutputRatePolicy.standard`, with 60.000 as an override |
 | 6 | 4K | A refuse · B downscale · C all | B | **Keep true 4K, accept the drops** — recorded, with a downscale toggle built in |
 | 7 | Playback depth | A 1 · B 2 · C 3+ | B | *(default applied — non-negotiable)* |
 | 8 | Batch workers | 1 · 2 · 3 · 4 | 4 | *(default applied — no sandbox, so directly valid)* |
@@ -528,8 +558,9 @@ so its copyright notice must ship** in an About/Licences screen — I'll wire th
 passthrough, but 74.8 fps is still comfortably real-time.
 
 **Every value stays well above the 60 fps requirement**, so this is an efficiency choice, not a
-feasibility one. I'll implement 59.94 as you asked. **One addition I'd suggest:** make it a setting
-with 59.94 as the default, so a 24.000 source can be switched to 60.000 to recover its passthrough.
+feasibility one. **59.94 is implemented as the default** (`OutputRatePolicy.standard`), with 60.000
+as a setting (`OutputRatePolicy.exactSixty`) so a 24.000 source can recover its passthrough — see §5
+for the settled decision and the reproduction on real footage.
 
 Two implementation notes: **30 and 29.97 sources must be routed to the low-latency path** (138.6 fps)
 rather than the FRC path (63.4 / 72.7 fps) — that routing is now load-bearing, not an optimisation.

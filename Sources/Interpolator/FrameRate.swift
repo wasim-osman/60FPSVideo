@@ -28,7 +28,7 @@ import Foundation
 /// forms, and only falls back to a literal decimal for values that are not part of
 /// that family. Use ``parseLiteral(_:)`` to get the raw decimal when that is
 /// genuinely what you mean.
-public struct FrameRate: Hashable, Sendable, CustomStringConvertible {
+public struct FrameRate: Hashable, Sendable, Comparable, CustomStringConvertible {
 
     public let numerator: Int
     public let denominator: Int
@@ -130,6 +130,37 @@ public struct FrameRate: Hashable, Sendable, CustomStringConvertible {
             }
         }
         return nil
+    }
+
+    // MARK: - Well-known rates
+    //
+    // Spelled out rather than parsed, because `parse` maps the shorthand onto these
+    // and a round trip through a string is a chance to get it wrong. The NTSC ones are
+    // the `/1001` family; the integral ones are exactly what they say.
+
+    /// `60000/1001` — what "59.94" means. The app's default output rate.
+    public static let sixtyNTSC = FrameRate(numerator: 60000, denominator: 1001)!
+    /// `60/1` exactly. Not the same rate as ``sixtyNTSC``, and the difference decides
+    /// whether one output frame in five is free.
+    public static let sixty = FrameRate(numerator: 60, denominator: 1)!
+    /// `30000/1001` — 29.97.
+    public static let thirtyNTSC = FrameRate(numerator: 30000, denominator: 1001)!
+    /// `24000/1001` — 23.976, the common film rate on NTSC disc.
+    public static let twentyFourNTSC = FrameRate(numerator: 24000, denominator: 1001)!
+    /// `24/1` — cinema film, no `/1001`.
+    public static let twentyFour = FrameRate(numerator: 24, denominator: 1)!
+
+    // MARK: - Ordering
+
+    /// Exact comparison, by cross-multiplication.
+    ///
+    /// `doubleValue` is not usable here: `60000/1001` and `60/1` differ by 0.06, and
+    /// the whole point of this type is that a 0.06 difference is not a rounding
+    /// detail. `Int64` products because the widest plausible rates are ~120000 and
+    /// ~1001, so both sides stay far inside range.
+    public static func < (lhs: FrameRate, rhs: FrameRate) -> Bool {
+        Int64(lhs.numerator) * Int64(rhs.denominator)
+            < Int64(rhs.numerator) * Int64(lhs.denominator)
     }
 
     // MARK: - Ratio

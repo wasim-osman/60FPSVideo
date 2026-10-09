@@ -167,6 +167,10 @@ public final class SceneChangeTracker {
 
     private func evidence(for i: Int,
                           forwardAvailableThrough: Int) -> IntervalEvidence? {
+        // Both frames must exist for interval `i` to be a real interval: the plan only
+        // produces it because it has pixels for `i` and `i + 1`, so a decision for an
+        // interval without them would be a decision about a frame nobody shows. `b` is
+        // the same signature the backward guard wants, so it is bound once and reused.
         guard let a = signature(at: i), let b = signature(at: i + 1) else { return nil }
         guard i >= distanceBase, i - distanceBase < histDistances.count else { return nil }
 
@@ -181,8 +185,8 @@ public final class SceneChangeTracker {
         }
 
         var backward: Float?
-        if i >= 1, let before = signature(at: i - 1), let after = signature(at: i + 1) {
-            backward = before.gridDistance(to: after)
+        if i >= 1, let before = signature(at: i - 1) {
+            backward = before.gridDistance(to: b)
         }
 
         return IntervalEvidence(

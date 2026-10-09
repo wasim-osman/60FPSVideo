@@ -214,10 +214,12 @@ public final class PackedFileFrameSource: FrameSource, @unchecked Sendable {
     public init(url: URL, width: Int, height: Int, format: FrameFormat,
                 frameRate: FrameRate) throws {
         self.handle = try FileHandle(forReadingFrom: url)
+        // `try?` flattens, so this is already an `Int`: a missing or non-numeric size
+        // becomes 0 rather than an optional the caller has to think about.
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]
                     as? Int) ?? 0
         self.frameByteSize = format.packedByteSize(width: width, height: height)
-        self.totalFrames = (size ?? 0) / frameByteSize
+        self.totalFrames = size / frameByteSize
         self.info = MediaInfo(
             url: url, width: width, height: height, frameRate: frameRate,
             frameCount: totalFrames, duration: Double(totalFrames) / frameRate.doubleValue,

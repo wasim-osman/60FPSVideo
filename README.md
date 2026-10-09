@@ -1,7 +1,8 @@
 # 60FPSVideo
 
 Feasibility study and stack design for a **native Apple Silicon** video frame-interpolation
-application — real-time playback **and** batch conversion, with output pinned to **60 fps**.
+application — real-time playback **and** batch conversion, with output pinned to the 60-family
+frame rate (**59.94 by default** — see `reports/BUILD-DECISIONS.md` §5).
 
 The reference product analysed is **SVP 4 Mac** (`/Applications/SVP 4 Mac.app`), using
 [`morluto/rea`](https://github.com/morluto/rea) as the reverse-engineering toolchain.
@@ -23,6 +24,12 @@ Both playback and batch conversion are achievable from one shared interpolation 
 | 50 | 44.8 | no — batch only |
 | 59.94 | 37.4 | no — batch only |
 | 4K, 24 → 60 | 33.4 | no — batch only |
+
+Measured at **60.000**. The shipped default is **59.94**, which for NTSC-family sources is the cheaper
+target because the rates share a denominator: 23.976 → 59.94 runs at **79.1 fps** with **20% of output
+frames needing no interpolation at all**, against 76.8 fps and 0% at 60.000. Integer rates (24.000, 25,
+30, 50) are the other way round and keep their passthrough at 60.000, which is why the policy is a
+setting with 59.94 as its default rather than a constant.
 
 Batch throughput scales to **~247 output fps aggregate with 4 concurrent workers** — a 2 h film in
 about 29 minutes at 1080p.

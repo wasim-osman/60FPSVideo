@@ -48,6 +48,10 @@ struct Options {
     var sourceRate = ""
     var outputRate = ""
     var output = ""
+    /// Set by `--rate-policy`. Used when OUT_RATE is the word `auto`, which is how the
+    /// harness exercises the shipping rate decision instead of keeping a second copy of
+    /// it. See `OutputRatePolicy`.
+    var ratePolicy: OutputRatePolicy? = nil
     var format = FrameFormat.nv12
     var sceneMode = SceneMode.offline
     var depth = 2
@@ -91,10 +95,18 @@ func parseOptions() -> Options {
                                InterpolationPipeline instead of the inline loop.
                                The two have to produce the same frames; this is how
                                that is checked on real footage.
+          --rate-policy NAME   which policy OUT_RATE=auto resolves through:
+                               standard (59.94, the default) or sixty (60.000).
 
         Rates accept an exact rational ("60000/1001") or the industry shorthand
         ("59.94"). The shorthand is mapped onto the exact NTSC rational, because
         "59.94" is a name for 60000/1001 and not a decimal value.
+
+        OUT_RATE may also be the word "auto", which asks the rate policy instead —
+        the same type the batch converter and the player use, so this runs the
+        shipping decision rather than a second copy of it. A policy never produces
+        a rate below the source, so a 60.000 source under the default is reported
+        as already at target instead of being quietly downconverted.
 
         p010 is packed as 16-bit little-endian words with the 10-bit code in the
         top ten bits — the same layout VideoToolbox and ffmpeg's p010le use, so
@@ -145,6 +157,16 @@ func parseOptions() -> Options {
             options.sceneDetect = false
         case "--pipeline":
             options.pipeline = true
+        case "--rate-policy":
+            i += 1
+            guard i < args.count else {
+                fail("--rate-policy needs 'standard' (59.94) or 'sixty' (60.000)")
+            }
+            guard let policy = OutputRatePolicy.named(args[i]) else {
+                fail("unknown rate policy '\(args[i])' — expected 'standard' (59.94) "
+                     + "or 'sixty' (60.000)")
+            }
+            options.ratePolicy = policy
         default:
             fail("unknown option '\(args[i])'")
         }
@@ -280,10 +302,36 @@ let options = parseOptions()
 guard let sourceRate = FrameRate.parse(options.sourceRate) else {
     fail("bad source rate '\(options.sourceRate)'")
 }
-guard let outputRate = FrameRate.parse(options.outputRate) else {
-    fail("bad output rate '\(options.outputRate)'")
+
+// OUT_RATE is either a rate or the word `auto`. `auto` resolves through
+// `OutputRatePolicy` — the same type the batch converter and the player will take —
+// so the harness measures the decision that ships rather than a copy of it.
+let outputRate: FrameRate
+if options.outputRate.lowercased() == "auto" {
+    let policy = options.ratePolicy ?? .default
+    let resolution = policy.resolve(source: sourceRate)
+    outputRate = resolution.output
+    log("rate  : policy \(policy.label) -> \(resolution.output)"
+        + (resolution.isPassthrough ? "  (already at target)" : ""))
+    if let note = resolution.note { log("        \(note)") }
+    log(String(format: "        %.4f%% of output frames are passthrough",
+               resolution.passthroughFraction * 100))
+} else {
+    // A policy alongside an explicit rate would be silently ignored, which is the
+    // kind of thing that produces a measurement nobody can account for later.
+    if let policy = options.ratePolicy {
+        fail("--rate-policy \(policy.label) was given with an explicit OUT_RATE "
+             + "('\(options.outputRate)'); pass OUT_RATE=auto to let the policy decide")
+    }
+    guard let parsed = FrameRate.parse(options.outputRate) else {
+        fail("bad output rate '\(options.outputRate)'")
+    }
+    outputRate = parsed
 }
-guard outputRate.doubleValue >= sourceRate.doubleValue else {
+
+// Exact comparison, not `doubleValue`: 60000/1001 and 60/1 differ by 0.06 and the
+// whole point of `FrameRate` is that this is not a rounding detail.
+guard outputRate >= sourceRate else {
     fail("output rate \(outputRate) is below source rate \(sourceRate)")
 }
 
