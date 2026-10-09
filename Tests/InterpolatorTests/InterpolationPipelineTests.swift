@@ -171,13 +171,26 @@ final class RecordingEngine: InterpolationEngine, @unchecked Sendable {
             let aBytes = self.snapshot(borrowed.a)
             let bBytes = self.snapshot(borrowed.b)
 
+            // **Invariant 23, in the double as well as in the engine.** The caller's
+            // completion runs *before* this request is retired from the depth
+            // accounting. `drain()` returns as soon as `inFlight` reaches zero, so a
+            // double that retired first would let the pipeline finalise its output
+            // while a completion — the one that writes the last frames — was still
+            // running. The real engine gets this right (`VTFrameProcessorEngine` runs
+            // the completion at line 159 and retires afterwards); this double used to
+            // signal first, which is the same bug wearing a test's clothes.
+            //
+            // It hid for a long time because the gap between the two statements is
+            // normally microseconds. Under a full parallel suite the thread gets
+            // descheduled in that gap, the pipeline returns early, and a handful of
+            // frames never reach the sink — which is exactly the flake it produced.
+            request.completion(.success(()))
+
             self.lock.lock()
             self.observations.append((interval, aBytes, bBytes))
             self.inFlight -= 1
             self.lock.unlock()
             self.semaphore.signal()
-
-            request.completion(.success(()))
         }
     }
 
