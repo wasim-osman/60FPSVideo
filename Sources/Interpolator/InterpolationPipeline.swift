@@ -52,7 +52,14 @@ import Foundation
 /// see ``IntervalPlanner``. It stops when the source stops. That is what makes the
 /// same code correct for a Matroska file whose `nb_frames` is `N/A` and for a live
 /// playback stream that has no end at all.
-public final class InterpolationPipeline {
+///
+/// ## Sendable
+///
+/// `@unchecked`, and it is a claim with a reason rather than a shrug: a pipeline is
+/// **single-use and single-threaded**. It is built on one thread, `run` is called once on
+/// another, and `hasRun` exists to make a second call a programming error rather than a
+/// silent second render. There is nothing to race with, because there is no second accessor.
+public final class InterpolationPipeline: @unchecked Sendable {
 
     // MARK: - Configuration
 

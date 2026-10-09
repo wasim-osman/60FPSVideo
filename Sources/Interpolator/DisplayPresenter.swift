@@ -93,6 +93,21 @@ public final class DisplayPresenter: @unchecked Sendable {
     private let lock = NSLock()
     private var format: CMVideoFormatDescription?
     private var problemList: [String] = []
+    private var shownCount = 0
+    private var droppedCount = 0
+    private var signalledReady = false
+
+    /// Called once, as soon as the presenter has its first frame in hand.
+    ///
+    /// This is what a player waits for before starting its clock. Without it, pressing play
+    /// starts the clock immediately and the film's first second passes while the decoder is
+    /// still opening the file, the engine is still preparing its session and the buffer pool
+    /// is still being created — measured at **1.3 s** on the real 4K film, which is a second
+    /// and a third of the film lost before the first frame appears.
+    ///
+    /// It fires on the first frame *popped*, not the first frame shown: the first frame
+    /// cannot be shown until the clock is running, so waiting for that would deadlock.
+    public var onReady: (@Sendable () -> Void)?
 
     public init(queue: PlaybackBuffer,
                 display: VideoDisplay,
@@ -109,8 +124,6 @@ public final class DisplayPresenter: @unchecked Sendable {
     /// Present until the queue is drained or abandoned. **Blocks**, so it belongs on its own
     /// thread.
     public func run() -> Report {
-        var shown = 0
-        var dropped = 0
         var paced = 0.0
         var lastShown = -1
 
@@ -118,15 +131,22 @@ public final class DisplayPresenter: @unchecked Sendable {
             guard let entry = queue.pop() else { break }
             if queue.wasAbandoned { break }
 
+            // The first frame is in hand. Nothing before this point was the film's fault —
+            // it was a decoder opening a file and an engine starting a session.
+            if !signalledReady {
+                signalledReady = true
+                onReady?()
+            }
+
             // Superseded, and there is something newer to show instead.
             if queue.count > 0, pacer.isSuperseded(entry.index, at: clock.mediaTime) {
-                dropped += 1
+                countDropped()
                 continue
             }
             // Behind what has already been shown: a seek backwards, or a completion that
             // arrived out of order.
             if entry.index <= lastShown {
-                dropped += 1
+                countDropped()
                 continue
             }
 
@@ -136,7 +156,7 @@ public final class DisplayPresenter: @unchecked Sendable {
             // A pause can land during the wait, and so can a seek. Re-check the frame
             // against the clock rather than showing one the pause made stale.
             if queue.count > 0, pacer.isSuperseded(entry.index, at: clock.mediaTime) {
-                dropped += 1
+                countDropped()
                 continue
             }
 
@@ -150,7 +170,9 @@ public final class DisplayPresenter: @unchecked Sendable {
                                                    index: entry.index,
                                                    rate: outputRate)
                 display.enqueue(sample)
-                shown += 1
+                lock.lock()
+                shownCount += 1
+                lock.unlock()
                 lastShown = entry.index
             } catch {
                 record("could not present output frame \(entry.index): \(error)")
@@ -159,9 +181,31 @@ public final class DisplayPresenter: @unchecked Sendable {
 
         lock.lock()
         let problems = problemList
+        let shown = shownCount
+        let dropped = droppedCount
         lock.unlock()
         return Report(shown: shown, dropped: dropped, pacedSeconds: paced,
                       endedByAbandon: queue.wasAbandoned, problems: problems)
+    }
+
+    /// Frames handed to the display so far. Readable *during* a run, which is the only way a
+    /// player can show a live drop rate — and the only way a measurement harness can report
+    /// one, since it stops the player rather than waiting for the film to end.
+    public var shown: Int {
+        lock.lock(); defer { lock.unlock() }
+        return shownCount
+    }
+
+    /// Frames thrown away so far. See ``shown``.
+    public var dropped: Int {
+        lock.lock(); defer { lock.unlock() }
+        return droppedCount
+    }
+
+    private func countDropped() {
+        lock.lock()
+        droppedCount += 1
+        lock.unlock()
     }
 
     // MARK: - Pacing

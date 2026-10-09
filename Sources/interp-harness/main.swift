@@ -1,3 +1,5 @@
+import AVFoundation
+import CoreMedia
 import CoreVideo
 import Foundation
 import Interpolator
@@ -14,6 +16,12 @@ import Interpolator
 //   --max-frames N       stop after N source frames
 //   --detect-only        report scene cuts and exit, no render
 //   --no-scene-detect    interpolate across cuts (the old, wrong behaviour)
+//
+// usage: interp-harness --play FILE [--seconds N] [--rate R] [--depth N] [--no-scene-detect]
+//   Plays the film for N seconds with a counting display instead of a window, and reports
+//   whether the picture kept up with the clock. Headless on purpose: the pacing, the drop
+//   policy and the skip policy are all arithmetic, and arithmetic is measurable without a
+//   screen — while a screen is not measurable at all from here.
 
 // ---------------------------------------------------------------- output
 
@@ -799,6 +807,168 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     } catch {
         fail("\(error)")
     }
+}
+
+// ---------------------------------------------------------------- playback
+
+/// A display that counts instead of drawing.
+///
+/// The player's pacing, its drop policy and its skip policy are all about *time*, and none
+/// of them needs a window to be measured. What this cannot check is that a pixel reached a
+/// screen; what it can check is that the film advanced at the rate the clock said, which is
+/// the part that is arithmetic and therefore the part that is silently wrong when it is
+/// wrong.
+private final class CountingDisplay: VideoDisplay, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var first: Double?
+    private var last: Double?
+
+    var isReadyForMoreMediaData: Bool { true }
+    var requiresFlushToResumeDecoding: Bool { false }
+    func flush() {}
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer) {
+        let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        lock.lock()
+        count += 1
+        if first == nil { first = seconds }
+        last = seconds
+        lock.unlock()
+    }
+
+    var stats: (shown: Int, first: Double?, last: Double?) {
+        lock.lock(); defer { lock.unlock() }
+        return (count, first, last)
+    }
+}
+
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
+    let inputPath = CommandLine.arguments[2]
+    let input = URL(fileURLWithPath: inputPath)
+    var seconds = Double.infinity
+    var outputRateText = "auto"
+    var sceneDetection = true
+    var depth = 2
+
+    let rest = Array(CommandLine.arguments.dropFirst(3))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--seconds":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else {
+                fail("--seconds needs a number")
+            }
+            seconds = value
+        case "--rate":
+            k += 1
+            guard k < rest.count else { fail("--rate needs a value") }
+            outputRateText = rest[k]
+        case "--depth":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]) else { fail("--depth needs a number") }
+            depth = value
+        case "--no-scene-detect":
+            sceneDetection = false
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+
+    guard let info = try? MediaProbe.probe(input) else {
+        fail("could not probe \(inputPath)")
+    }
+    let outputRate: FrameRate
+    if outputRateText.lowercased() == "auto" {
+        outputRate = OutputRatePolicy.default.resolve(source: info.frameRate).output
+    } else if let parsed = FrameRate.parse(outputRateText) {
+        outputRate = parsed
+    } else {
+        fail("bad rate '\(outputRateText)'")
+    }
+
+    log("input  : \(inputPath)")
+    log("format : \(info.width)x\(info.height) \(info.format.bitDepth)-bit \(info.pixelFormat)"
+        + " \(info.frameRate) -> \(outputRate)")
+    log("length : \(String(format: "%.1f", info.duration)) s")
+
+    let display = CountingDisplay()
+    let controller = PlaybackController(
+        url: input, display: display,
+        configuration: .init(outputRate: outputRate, depth: depth,
+                             sceneDetection: sceneDetection),
+        info: info)
+
+    do {
+        try controller.start()
+    } catch {
+        fail("\(error)")
+    }
+
+    let started = DispatchTime.now().uptimeNanoseconds
+    controller.play()
+
+    // Run until the requested film time has passed, or the film ends. The clock is the
+    // authority: this polls it rather than counting wall time, so what is measured is what
+    // the player thinks happened.
+    //
+    // The trace is the point of the mode. A single number at the end cannot tell a constant
+    // pipeline latency from a drift that accumulates, and those are different failures: the
+    // first is a player working at its limit, the second is a player that will be seconds
+    // out of sync by the end of a reel.
+    var nextTrace = 5.0
+    while controller.clock.state != .ended, controller.clock.mediaTime < seconds {
+        usleep(50_000)
+        let now = controller.clock.mediaTime
+        if now >= nextTrace {
+            let sample = display.stats
+            log(String(format: "  t=%6.1f s | picture %6.2f s | shown %4d | lag %5.0f ms",
+                       now, sample.last ?? 0, sample.shown,
+                       (now - (sample.last ?? 0)) * 1000))
+            nextTrace += 5
+        }
+    }
+
+    let status = controller.status
+    let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
+    let stats = display.stats
+    controller.stop()
+
+    let advanced = (stats.last ?? 0) - (stats.first ?? 0)
+    let shown = stats.shown
+    log("")
+    log(String(format: "shown  : %d frames | skipped %d intervals",
+               shown, status.skippedIntervals))
+    log(String(format: "clock  : %.2f s of film in %.2f s wall  -> %.2fx",
+               status.position, wall, wall > 0 ? status.position / wall : 0))
+    log(String(format: "picture: %.2f s covered by %d frames -> %.1f fps presented",
+               advanced, shown, wall > 0 ? Double(shown) / wall : 0))
+    log(String(format: "first  : the first frame carried film time %.2f s",
+               stats.first ?? 0))
+    if !controller.problems.isEmpty {
+        log("problems (\(controller.problems.count)):")
+        for problem in controller.problems.prefix(10) { log("  " + problem) }
+    }
+
+    // The verdict, and the only one worth stating: does the picture keep up with the clock?
+    //
+    // Not the instantaneous lag — that oscillates by design, between about 90 ms and 270 ms,
+    // because the renderer produces frames in bursts and the last frame handed over is
+    // whatever the burst ended with. A single sample of it says nothing.
+    //
+    // What says everything is whether the picture *advanced* as fast as the clock did. A
+    // constant latency is a player working at its limit; a rate below 1 is a player that
+    // will be seconds out of sync by the end of a reel, and the two are one subtraction
+    // apart.
+    let pictureRate = status.position > 0 ? advanced / status.position : 0
+    let lag = status.position - (stats.last ?? 0)
+    let verdict = pictureRate >= 0.99 ? "PASS" : "FAIL"
+    log(String(format: "[%@] the picture advanced %.3fx the clock's rate over %.1f s "
+               + "(lag %.0f ms at the end, and not growing)",
+               verdict, pictureRate, status.position, lag * 1000))
+    exit(verdict == "PASS" ? 0 : 1)
 }
 
 // ---------------------------------------------------------------- setup
