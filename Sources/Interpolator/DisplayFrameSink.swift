@@ -31,15 +31,30 @@ public final class DisplayFrameSink: FrameSink, @unchecked Sendable {
     private let width: Int
     private let height: Int
     private let format: FrameFormat
+    /// The **film's** output frame number of this run's first frame.
+    ///
+    /// A run that begins anywhere but the start of the film numbers its output from zero —
+    /// that is what a file wants, and `AssetWriterSink` is right to want it. The display is
+    /// not a file: its index becomes a presentation timestamp, and it is what the pacer
+    /// compares against the clock, and the clock is in film time. So the run-relative number
+    /// has to be shifted back to the film's.
+    ///
+    /// Measured, and it was invisible: a player started at 60 s presented its first frame at
+    /// film time **0.00 s** — sixty seconds of picture behind the sound — and the only thing
+    /// in the trace that said so was a lag of 60210 ms. Nothing else looked wrong, because
+    /// from the picture's own point of view it was playing perfectly.
+    private let outputOffset: Int
     private let lock = NSLock()
     private var pool: PixelBufferPool?
     private var problemList: [String] = []
 
-    public init(queue: PlaybackBuffer, width: Int, height: Int, format: FrameFormat) {
+    public init(queue: PlaybackBuffer, width: Int, height: Int, format: FrameFormat,
+                outputOffset: Int = 0) {
         self.queue = queue
         self.width = width
         self.height = height
         self.format = format
+        self.outputOffset = outputOffset
     }
 
     /// Creates the copy pool.
@@ -74,7 +89,10 @@ public final class DisplayFrameSink: FrameSink, @unchecked Sendable {
             // `false` means the queue was abandoned — a seek or a stop. The frame is
             // simply not wanted, which is not a problem to report: the pipeline is about
             // to be torn down anyway.
-            _ = queue.push(PlaybackBuffer.Entry(index: outputIndex, buffer: owned))
+            //
+            // The index queued is the film's, not this run's. See `outputOffset`.
+            _ = queue.push(PlaybackBuffer.Entry(index: outputIndex + outputOffset,
+                                                buffer: owned))
         } catch {
             record("could not copy output frame \(outputIndex): \(error)")
         }

@@ -18,10 +18,15 @@ import Interpolator
 //   --no-scene-detect    interpolate across cuts (the old, wrong behaviour)
 //
 // usage: interp-harness --play FILE [--seconds N] [--rate R] [--depth N] [--no-scene-detect]
+//                        [--sound] [--start S] [--prepare-only]
 //   Plays the film for N seconds with a counting display instead of a window, and reports
 //   whether the picture kept up with the clock. Headless on purpose: the pacing, the drop
 //   policy and the skip policy are all arithmetic, and arithmetic is measurable without a
 //   screen — while a screen is not measurable at all from here.
+//
+//   `--sound` prepares and attaches the soundtrack, which then *is* the clock. `--prepare-only`
+//   stops after preparing it, so the cost of a re-encode can be measured without watching a
+//   film to find out.
 
 // ---------------------------------------------------------------- output
 
@@ -850,6 +855,9 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     var outputRateText = "auto"
     var sceneDetection = true
     var depth = 2
+    var withSound = false
+    var startSeconds = 0.0
+    var prepareOnly = false
 
     let rest = Array(CommandLine.arguments.dropFirst(3))
     var k = 0
@@ -861,6 +869,16 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
                 fail("--seconds needs a number")
             }
             seconds = value
+        case "--start":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else {
+                fail("--start needs a number")
+            }
+            startSeconds = value
+        case "--sound":
+            withSound = true
+        case "--prepare-only":
+            prepareOnly = true
         case "--rate":
             k += 1
             guard k < rest.count else { fail("--rate needs a value") }
@@ -893,13 +911,58 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     log("format : \(info.width)x\(info.height) \(info.format.bitDepth)-bit \(info.pixelFormat)"
         + " \(info.frameRate) -> \(outputRate)")
     log("length : \(String(format: "%.1f", info.duration)) s")
+    if startSeconds > 0 {
+        log(String(format: "start  : %.1f s", startSeconds))
+    }
+
+    // The soundtrack, if it was asked for. Prepared *before* the session is built, because
+    // the clock is built over it — so there is nothing to attach it to afterwards.
+    var audio: PlaybackAudio?
+    if withSound {
+        log("audio  : tracks the film states")
+        for track in info.audioTracks {
+            log("         \(track)\(track.isDefault ? "  [default]" : "")")
+        }
+        let plan = AudioPlaybackPlan.choose(
+            for: info, containerIsPlayable: AudioPlaybackPlan.containerIsPlayable(input))
+        log("         plan: \(plan)")
+        if !plan.isLossless, plan.needsPreparation {
+            log("         note: this disc has nothing macOS can decode, so the sound is")
+            log("               re-encoded for playback — the batch converter's MKV output")
+            log("               keeps the original bit for bit")
+        }
+
+        do {
+            let extractor = AudioExtractor()
+            let seen = LineCounter()
+            let outcome = try extractor.prepare(from: input, info: info, progress: { value in
+                seen.report(value)
+            })
+            log(String(format: "         %@ in %.2f s   %.1f MB%@",
+                       outcome.fromCache ? "from cache" : "prepared",
+                       outcome.wallSeconds, Double(outcome.bytes) / 1e6,
+                       seen.summary))
+            if prepareOnly {
+                log("")
+                log("[OK] the soundtrack is ready; nothing was played")
+                exit(0)
+            }
+            audio = try waitForSound {
+                try await PlaybackAudio(url: outcome.url, plan: outcome.plan)
+            }
+        } catch {
+            fail("could not prepare the soundtrack: \(error)")
+        }
+    }
 
     let display = CountingDisplay()
     let controller = PlaybackController(
         url: input, display: display,
         configuration: .init(outputRate: outputRate, depth: depth,
-                             sceneDetection: sceneDetection),
-        info: info)
+                             sceneDetection: sceneDetection,
+                             startSeconds: startSeconds),
+        info: info,
+        audio: audio)
 
     do {
         try controller.start()
@@ -914,19 +977,31 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     // authority: this polls it rather than counting wall time, so what is measured is what
     // the player thinks happened.
     //
+    // **The run loop, not a sleep.** AVFoundation delivers its readiness and playback
+    // callbacks to the main queue, so a main thread that sleeps starves the very events that
+    // make an audio item ready — measured: an item stuck at `.unknown` for three seconds with
+    // `rate` reading 1.0 and the position pinned at zero. A SwiftUI app services the run loop
+    // for free; a command-line tool has to say so.
+    //
     // The trace is the point of the mode. A single number at the end cannot tell a constant
     // pipeline latency from a drift that accumulates, and those are different failures: the
     // first is a player working at its limit, the second is a player that will be seconds
     // out of sync by the end of a reel.
-    var nextTrace = 5.0
-    while controller.clock.state != .ended, controller.clock.mediaTime < seconds {
-        usleep(50_000)
+    // `--seconds` is a duration from wherever the run starts, not an absolute film time: with
+    // `--start 60 --seconds 12` the clock is *already* at 60 when the loop begins, so comparing
+    // against 12 ends the run before a frame is shown — measured, and it reported a film that
+    // played 60 s of itself in 0.00 s of wall time.
+    let stopAt = startSeconds + seconds
+    var nextTrace = startSeconds + 5.0
+    while controller.clock.state != .ended, controller.clock.mediaTime < stopAt {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         let now = controller.clock.mediaTime
         if now >= nextTrace {
             let sample = display.stats
-            log(String(format: "  t=%6.1f s | picture %6.2f s | shown %4d | lag %5.0f ms",
+            let extra = audio.map { String(format: " | sound %6.2f s", $0.mediaTime) } ?? ""
+            log(String(format: "  t=%6.1f s | picture %6.2f s | shown %4d | lag %5.0f ms%@",
                        now, sample.last ?? 0, sample.shown,
-                       (now - (sample.last ?? 0)) * 1000))
+                       (now - (sample.last ?? 0)) * 1000, extra))
             nextTrace += 5
         }
     }
@@ -934,19 +1009,34 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     let status = controller.status
     let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
     let stats = display.stats
+    let soundAtEnd = audio?.mediaTime
     controller.stop()
 
     let advanced = (stats.last ?? 0) - (stats.first ?? 0)
     let shown = stats.shown
+    // The span this run actually covered. With a non-zero start the film's absolute position
+    // is not the run's length, and dividing by it reports a player that covered 12 s of film
+    // as running at 0.166× — measured, and it looked like a catastrophic failure rather than
+    // the arithmetic of a seek.
+    let span = status.position - startSeconds
     log("")
     log(String(format: "shown  : %d frames | skipped %d intervals",
                shown, status.skippedIntervals))
     log(String(format: "clock  : %.2f s of film in %.2f s wall  -> %.2fx",
-               status.position, wall, wall > 0 ? status.position / wall : 0))
+               span, wall, wall > 0 ? span / wall : 0))
     log(String(format: "picture: %.2f s covered by %d frames -> %.1f fps presented",
                advanced, shown, wall > 0 ? Double(shown) / wall : 0))
     log(String(format: "first  : the first frame carried film time %.2f s",
                stats.first ?? 0))
+    if let soundAtEnd {
+        // With sound attached the clock *is* the sound, so this is the A/V relationship
+        // itself rather than a coincidence: whatever the picture's last frame carries, the
+        // sound is where the clock says the film is.
+        log(String(format: "sound  : ended at %.2f s of film (%.2fx real time)",
+                   soundAtEnd, wall > 0 ? soundAtEnd / wall : 0))
+        log(String(format: "A/V    : picture %.0f ms behind the sound at the end",
+                   (soundAtEnd - (stats.last ?? 0)) * 1000))
+    }
     if !controller.problems.isEmpty {
         log("problems (\(controller.problems.count)):")
         for problem in controller.problems.prefix(10) { log("  " + problem) }
@@ -962,13 +1052,80 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     // constant latency is a player working at its limit; a rate below 1 is a player that
     // will be seconds out of sync by the end of a reel, and the two are one subtraction
     // apart.
-    let pictureRate = status.position > 0 ? advanced / status.position : 0
+    let pictureRate = span > 0 ? advanced / span : 0
     let lag = status.position - (stats.last ?? 0)
-    let verdict = pictureRate >= 0.99 ? "PASS" : "FAIL"
+    var failures: [String] = []
+    if pictureRate < 0.99 {
+        failures.append(String(format: "the picture advanced only %.3fx the clock", pictureRate))
+    }
+    // The sound has to have actually played. A soundtrack that never started would leave the
+    // clock pinned at zero and the picture at its first frame, and the trace above would look
+    // like a film that simply did not run.
+    if withSound, let soundAtEnd, soundAtEnd < status.position * 0.9 {
+        failures.append(String(format: "the sound reached only %.2f s of %.2f",
+                               soundAtEnd, status.position))
+    }
+    // A run that starts anywhere but zero must not begin with the playhead behind the
+    // picture's own numbering — which is what a clock left at zero would do, and it shows as
+    // minutes of black rather than as an error. Two frames of slack, because the seek lands on
+    // the frame at or after the requested instant and the frame grid is not the second grid.
+    if startSeconds > 0, let first = stats.first,
+       abs(first - startSeconds) > 2 * (1 / info.frameRate.doubleValue) {
+        failures.append(String(format: "asked to start at %.1f s but the first frame was %.2f s",
+                               startSeconds, first))
+    }
+    let verdict = failures.isEmpty ? "PASS" : "FAIL"
     log(String(format: "[%@] the picture advanced %.3fx the clock's rate over %.1f s "
                + "(lag %.0f ms at the end, and not growing)",
-               verdict, pictureRate, status.position, lag * 1000))
+               verdict, pictureRate, span, lag * 1000))
+    for failure in failures { log("       \(failure)") }
     exit(verdict == "PASS" ? 0 : 1)
+}
+
+// ---------------------------------------------------------------- sound helpers
+
+/// Waits for an async operation **without starving the main run loop**.
+///
+/// A semaphore here would be the obvious thing and the wrong one: `PlaybackAudio`'s initialiser
+/// awaits `AVURLAsset.loadTracks`, whose continuation is delivered to the main queue — so
+/// blocking the main thread waiting for it is waiting for a thread that is doing the waiting.
+/// Measured in a standalone probe: `currentTime` pinned at 0.000 for three seconds.
+func waitForSound<T: Sendable>(_ work: @escaping @Sendable () async throws -> T) throws -> T {
+    let box = AsyncBox<T>()
+    Task { box.store(await Result { try await work() }) }
+    let deadline = Date().addingTimeInterval(30)
+    while !box.isReady, Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+    }
+    guard let result = box.result else {
+        throw InterpolatorError.writerFailed("the soundtrack did not open within 30 s")
+    }
+    return try result.get()
+}
+
+/// A result written by one task and read by another.
+final class AsyncBox<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Result<T, Error>?
+
+    func store(_ value: Result<T, Error>) { lock.lock(); stored = value; lock.unlock() }
+    var result: Result<T, Error>? { lock.lock(); defer { lock.unlock() }; return stored }
+    var isReady: Bool { result != nil }
+}
+
+/// Keeps the last progress value and how many there were, for one line of report.
+final class LineCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = 0.0
+    private var count = 0
+
+    func report(_ value: Double) { lock.lock(); last = value; count += 1; lock.unlock() }
+
+    var summary: String {
+        lock.lock(); defer { lock.unlock() }
+        return count == 0 ? "" : String(format: "   %d progress reports, last %.0f%%",
+                                        count, last * 100)
+    }
 }
 
 // ---------------------------------------------------------------- setup

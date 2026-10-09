@@ -338,4 +338,83 @@ struct DisplayPresenterTests {
                                               endedByAbandon: false, problems: [])
         #expect(nothing.droppedFraction == 0, "an empty run has no fraction, not a divide by zero")
     }
+
+    // MARK: - Where a run sits in the film
+
+    /// **The sink's index is the film's, not the run's.**
+    ///
+    /// A run that begins anywhere but the start of the film numbers its output from zero —
+    /// right for a file, wrong for a display, whose index becomes a presentation timestamp
+    /// and is what the pacer compares against a clock that is in film time.
+    ///
+    /// Measured on the real 4K film: a player started at 60 s presented its first frame at
+    /// film time **0.00 s**, sixty seconds behind the sound. Nothing else in the trace looked
+    /// wrong — from the picture's own point of view it was playing perfectly — and the only
+    /// symptom was a lag of 60210 ms that read like a rendering problem.
+    @Test("a run that starts part way through presents the film's timestamps")
+    func sinkCarriesTheFilmsNumbering() {
+        // A run whose first output frame is the film's frame 3595, which is what 60 s at
+        // 59.94 comes to.
+        let outputStart = 3595
+        let queue = PlaybackBuffer(capacity: 8)
+        let display = FakeDisplay()
+        let clock = PlaybackClock()
+        let pacer = PlaybackPacer(outputRate: rate, leadSeconds: 10)
+        let sink = DisplayFrameSink(queue: queue, width: 16, height: 16, format: .nv12,
+                                    outputOffset: outputStart)
+        try? sink.begin(SinkGeometry(width: 16, height: 16, format: .nv12,
+                                     sourceRate: FrameRate.parse("24000/1001")!,
+                                     outputRate: rate, sourceFrameCount: nil,
+                                     outputFrameCount: nil))
+        // The pipeline writes run-relative indices: 0, 1, 2.
+        for index in 0..<3 {
+            sink.write(makeBuffer().buffer, at: index)
+        }
+        try? sink.finish()
+
+        clock.play()
+        clock.seek(to: Double(outputStart) / rate.doubleValue)
+        let presenter = DisplayPresenter(queue: queue, display: display, clock: clock,
+                                         pacer: pacer, outputRate: rate)
+        let report = run { presenter.run() }
+        #expect(report.shown == 3, "\(report.problems)")
+
+        let presented = display.enqueued.map(index(of:))
+        #expect(presented == [outputStart, outputStart + 1, outputStart + 2],
+                "the display was handed run-relative frames: \(presented)")
+
+        // And the timestamp itself, so this is checked against the arithmetic rather than
+        // against another copy of the offset.
+        let first = try? #require(display.enqueued.first)
+        if let first {
+            let pts = CMSampleBufferGetPresentationTimeStamp(first)
+            #expect(pts.value == Int64(outputStart) * 1001, "\(pts)")
+            #expect(pts.timescale == 60000)
+            #expect(abs(CMTimeGetSeconds(pts) - 59.976) < 0.001,
+                    "\(CMTimeGetSeconds(pts)) should be about 60 s, not 0")
+        }
+    }
+
+    /// The default is zero, so every existing caller — and the file-writing sink's twin — is
+    /// unchanged.
+    @Test("with no offset a run numbers its frames from zero")
+    func defaultOffsetIsZero() throws {
+        let queue = PlaybackBuffer(capacity: 4)
+        let display = FakeDisplay()
+        let clock = PlaybackClock()
+        let pacer = PlaybackPacer(outputRate: rate, leadSeconds: 10)
+        let sink = DisplayFrameSink(queue: queue, width: 16, height: 16, format: .nv12)
+        try sink.begin(SinkGeometry(width: 16, height: 16, format: .nv12,
+                                    sourceRate: FrameRate.parse("24000/1001")!,
+                                    outputRate: rate, sourceFrameCount: nil,
+                                    outputFrameCount: nil))
+        sink.write(makeBuffer().buffer, at: 0)
+        try sink.finish()
+
+        clock.play()
+        let presenter = DisplayPresenter(queue: queue, display: display, clock: clock,
+                                         pacer: pacer, outputRate: rate)
+        _ = run { presenter.run() }
+        #expect(display.enqueued.map(index(of:)) == [0])
+    }
 }

@@ -27,10 +27,11 @@ import Foundation
 ///
 /// ## What it deliberately does not do
 ///
-/// There is no audio here. The clock is the film's own time and the picture is paced to it;
-/// attaching an `AVPlayer` for the sound and slaving this to *its* clock is the next step,
-/// and it is a change to where `PlaybackClock` gets its time from rather than a change to
-/// anything in this file.
+/// The clock is the film's own time and the picture is paced to it. When there is **sound**,
+/// the sound *is* the clock — see ``PlaybackAudio`` — because a compressed audio stream
+/// cannot be retimed, so the picture follows the sound rather than the other way round. That
+/// is a change to where ``PlaybackClock`` gets its time from and to three lines of ordering
+/// in this file, and to nothing else.
 public final class PlaybackController: @unchecked Sendable {
 
     public struct Configuration: Sendable {
@@ -108,6 +109,12 @@ public final class PlaybackController: @unchecked Sendable {
     private let url: URL
     private let info: MediaInfo
     private let display: VideoDisplay
+    /// The sound, when the film has any.
+    ///
+    /// `any AudioTransport` rather than `PlaybackAudio`, so this file needs no audio hardware
+    /// to be tested and so the ordering rules below — which are the part that is silently
+    /// wrong when it is wrong — can be checked against a fake that moves by hand.
+    private let audio: (any AudioTransport)?
 
     private let lock = NSLock()
     private var session: Session?
@@ -158,18 +165,34 @@ public final class PlaybackController: @unchecked Sendable {
     ///   - url: the film.
     ///   - display: where frames go. `AVSampleBufferDisplayLayer` in the app.
     ///   - configuration: the run's shape.
-    ///   - clock: injected so a test can drive the playhead by hand. The default reads the
-    ///     process uptime.
+    ///   - info: the probe. Its `duration` is the clock's end and its frame rate is the
+    ///     source rate; nothing here re-reads the file.
+    ///   - audio: the sound, if any. When one is given **and** no clock is, the clock is
+    ///     built over it — the sound becomes the definition of where the film is. Passing
+    ///     both is allowed and is what the tests do, where the clock is driven by hand.
+    ///   - clock: injected so a test can drive the playhead by hand. The default builds one
+    ///     over the sound, or over the process uptime when there is no sound.
     public init(url: URL,
                 display: VideoDisplay,
                 configuration: Configuration,
                 info: MediaInfo,
-                clock: PlaybackClock = PlaybackClock()) {
+                audio: (any AudioTransport)? = nil,
+                clock: PlaybackClock? = nil) {
         self.url = url
         self.display = display
         self.configuration = configuration
         self.info = info
-        self.clock = clock
+        self.audio = audio
+        if let clock {
+            self.clock = clock
+        } else if let audio {
+            // The sound is the clock. The closure captures the transport rather than the
+            // controller, so there is no cycle to break — the controller holds the sound, the
+            // sound holds nothing.
+            self.clock = PlaybackClock(timeSource: { audio.mediaTime })
+        } else {
+            self.clock = PlaybackClock()
+        }
     }
 
     deinit {
@@ -177,6 +200,7 @@ public final class PlaybackController: @unchecked Sendable {
         let current = session
         lock.unlock()
         if let current { tearDown(current, wait: false) }
+        audio?.pause()
     }
 
     // MARK: - Transport
@@ -203,18 +227,38 @@ public final class PlaybackController: @unchecked Sendable {
     ///
     /// So a play request is a *request*: it is honoured by the presenter, which knows when
     /// the first frame exists. If one already does, this starts immediately.
+    ///
+    /// **With sound this matters twice over**, because the sound *is* the clock: starting the
+    /// soundtrack on the press would put the picture a second and a third behind it with no
+    /// mechanism to ever catch up.
+    ///
+    /// Pressing play after the film has ended **restarts it**, and that is a seek rather than
+    /// a resume: the session's threads have finished and a pipeline is single-use, so there is
+    /// nothing left to resume from. It used to just start the clock, which left the playhead
+    /// running against no producer at all — a film that played and showed nothing.
     public func play() {
         lock.lock()
-        playRequested = true
+        let ended = clock.state == .ended
         let ready = firstFrameReady
         lock.unlock()
-        if ready { clock.play() }
+        if ended {
+            restart()
+            return
+        }
+        lock.lock()
+        playRequested = true
+        lock.unlock()
+        if ready { startPlaying() }
     }
 
     public func pause() {
         lock.lock()
         playRequested = false
         lock.unlock()
+        // The sound stops first. `clock.pause()` re-anchors against the sound's position, so
+        // pausing the clock while the sound was still moving would fold a few milliseconds of
+        // sound into the playhead — small, but in the direction that grows.
+        audio?.pause()
         clock.pause()
     }
 
@@ -228,12 +272,10 @@ public final class PlaybackController: @unchecked Sendable {
             throw Failure.pastEnd(seconds)
         }
         try beginSession(at: target, resetClock: false)
-        // The new session's frames start at the new position, so the playhead has to be
-        // there before the presenter starts waiting for their moments.
-        clock.seek(to: target)
         lock.lock()
         // A seek to a new position has to decode and re-prepare too, so resuming goes
         // through the same gate as a first play rather than starting the clock into a gap.
+        // `beginSession` has already moved the sound and the clock to `target`.
         playRequested = wasPlaying
         lock.unlock()
         if !wasPlaying { clock.pause() }
@@ -249,6 +291,7 @@ public final class PlaybackController: @unchecked Sendable {
         lock.unlock()
         guard let current else { return }
         tearDown(current, wait: true)
+        audio?.pause()
         clock.stop()
     }
 
@@ -330,7 +373,8 @@ public final class PlaybackController: @unchecked Sendable {
                                     leadSeconds: configuration.leadSeconds).leadFrames)
         let sink = DisplayFrameSink(queue: queue, width: presentation.width,
                                     height: presentation.height,
-                                    format: presentation.format)
+                                    format: presentation.format,
+                                    outputOffset: outputStart)
         let pacer = PlaybackPacer(outputRate: outputRate,
                                   leadSeconds: configuration.leadSeconds)
 
@@ -361,7 +405,19 @@ public final class PlaybackController: @unchecked Sendable {
                                  presenter: presenter, skipped: skipped)
         presenter.onReady = { [weak self] in self?.firstFrameArrived() }
 
+        // **The sound moves first, and it is waited on.** The clock's anchor records the
+        // sound's position, so an unarrived seek would leave the anchor pointing at the old
+        // position — and the playhead would then gain the whole distance seeked the moment the
+        // sound arrived, which reads as a stutter and is really arithmetic. This is why
+        // `AudioTransport.seek` is required to be synchronous.
+        audio?.seek(to: seconds)
         if resetClock { clock.stop() }
+        // Where this run begins. `stop()` puts the playhead at zero, so a run that starts
+        // anywhere else has to say so — otherwise the frames would be numbered from
+        // `startSeconds` while the clock sat at zero, and the presenter would consider every
+        // one of them superseded until the clock caught up: a film that begins with minutes
+        // of black.
+        clock.seek(to: seconds)
 
         let producer = Thread { [weak self, newSession, pipeline, sink] in
             defer { newSession.producerDone.signal() }
@@ -401,7 +457,31 @@ public final class PlaybackController: @unchecked Sendable {
         firstFrameReady = true
         let wanted = playRequested
         lock.unlock()
-        if wanted { clock.play() }
+        if wanted { startPlaying() }
+    }
+
+    /// Begin the run for real: the sound and the clock, in that order.
+    ///
+    /// The sound first for the same reason a seek moves it first — `clock.play()` anchors
+    /// media time against the sound's position, and anchoring a moment before the sound starts
+    /// is right; anchoring and then *moving* the sound would not be.
+    private func startPlaying() {
+        audio?.play()
+        clock.play()
+    }
+
+    /// Start the film again from the beginning, after it has ended.
+    ///
+    /// A new session, because the old one's threads are gone and a pipeline is single-use.
+    /// The play request is re-armed rather than honoured immediately: the first frame of the
+    /// new session does not exist yet, and starting the clock now is invariant 36 all over
+    /// again — with sound, a picture that starts a second and a third behind the soundtrack
+    /// and never catches up.
+    private func restart() {
+        try? beginSession(at: 0, resetClock: false)
+        lock.lock()
+        playRequested = true
+        lock.unlock()
     }
 
     private func finish(_ report: DisplayPresenter.Report, session: Session) {
