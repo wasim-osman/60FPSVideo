@@ -729,6 +729,238 @@ struct BatchConverterTests {
         #expect(result.bytes == 64)
         #expect(result.audio?.bytes == 64)
     }
+
+    // MARK: - A film in pieces
+
+    /// What the join was asked to concatenate, in order.
+    ///
+    /// The list is read while ffmpeg "runs", because the joiner deletes it afterwards —
+    /// which is the only moment it can be read from outside.
+    final class JoinLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored = ""
+        private var storedOutput = ""
+
+        func record(list: String, output: String) {
+            lock.lock(); stored = list; storedOutput = output; lock.unlock()
+        }
+        var list: String { lock.lock(); defer { lock.unlock() }; return stored }
+        var output: String { lock.lock(); defer { lock.unlock() }; return storedOutput }
+    }
+
+    /// A joiner that does not run ffmpeg.
+    ///
+    /// It creates the joined file so the converter's rename has something to move, and
+    /// it reads the concat list so a test can assert the segments were joined in the
+    /// film's order. Its frame check is deliberately left blind — that check is
+    /// `SegmentJoinerTests`' subject, and what this file is about is whether the
+    /// converter hands it the right pieces.
+    private func stubJoiner(_ log: JoinLog) -> SegmentJoiner {
+        SegmentJoiner(runFFmpeg: { arguments in
+            if let index = arguments.firstIndex(of: "-i"), index + 1 < arguments.count {
+                let path = arguments[index + 1]
+                log.record(list: (try? String(contentsOfFile: path, encoding: .utf8)) ?? "",
+                           output: arguments.last ?? "")
+            }
+            if let path = arguments.last {
+                FileManager.default.createFile(atPath: path, contents: Data([7]))
+            }
+            return ""
+        }, probeVideo: { _ in (frames: nil, rate: nil) }, ffmpegPath: { "/bin/sh" })
+    }
+
+    /// A converter whose source honours the window each segment asks for.
+    ///
+    /// The other fixtures ignore both the seek and the frame limit, which is right when
+    /// there is one render of the whole film. A segmented job asks for a different window
+    /// of the same file per segment, and a source that answered every request with the
+    /// whole film would produce five identical segments and make every test in this
+    /// section vacuous.
+    private func makeSegmentedConverter(input: URL,
+                                        info: MediaInfo,
+                                        outputFrameCount: Int?,
+                                        log: JoinLog) -> BatchConverter {
+        BatchConverter(
+            probe: { url in url == input ? info : info.statingFrameCount(outputFrameCount) },
+            makeSource: { _, media, start, limit in
+                // The seek is half a frame into the frame, so flooring recovers it.
+                let offset = start.map {
+                    Int(($0 * media.frameRate.doubleValue).rounded(.down))
+                } ?? 0
+                return SyntheticFrameSource(width: media.width, height: media.height,
+                                            format: media.format,
+                                            frameRate: media.frameRate,
+                                            totalFrames: limit ?? (media.frameCount ?? 0),
+                                            firstFrame: offset)
+            },
+            makeSink: { url, _ in
+                let descriptor = open(url.path, O_RDWR | O_CREAT | O_TRUNC, 0o644)
+                return PackedFileSink(descriptor: descriptor, width: info.width,
+                                      height: info.height, format: info.format)
+            },
+            makeEngine: { _, _, _ in NoopEngine() },
+            mux: BatchConverterTests.refusingMux,
+            makeJoiner: { self.stubJoiner(log) })
+    }
+
+    @Test("a segmented job produces the same film as one render of it")
+    func segmentedMatchesWhole() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let frames = 120
+        let info = makeInfo(frames: frames)
+
+        // One render, for the reference count.
+        let wholeBox = SinkBox()
+        defer { wholeBox.value?.closeFile() }
+        let whole = try makeConverter(input: input, info: info, outputFrameCount: nil,
+                                      box: wholeBox)
+            .run(.init(input: input, output: output, sceneDetection: false))
+
+        let log = JoinLog()
+        let segmented = try makeSegmentedConverter(input: input, info: info,
+                                                   outputFrameCount: nil, log: log)
+            .run(.init(input: input, output: output, sceneDetection: false,
+                       overwrite: true, segmentSeconds: 1.0))
+
+        #expect(segmented.written == whole.written,
+                "\(segmented.written) frames from segments against \(whole.written) whole")
+        #expect(segmented.isClean, "\(segmented.problems)")
+        let outcome = try #require(segmented.segments)
+        #expect(outcome.isComplete)
+        #expect(outcome.outputFrames == whole.written)
+
+        // The pieces were joined in the film's order. A list sorted by name is the film
+        // only because the names are zero-padded — which is the reason they are.
+        let names = log.list.split(separator: "\n").map(String.init)
+        #expect(names.count == outcome.plan.segments.count)
+        #expect(names == names.sorted(), "the concat list has to be in film order")
+        #expect(names.first == "file '000.mp4'")
+    }
+
+    @Test("a finished segment is skipped rather than rendered again")
+    func finishedSegmentsAreSkipped() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let info = makeInfo(frames: 120)
+
+        // The first run keeps its pieces, so the second one has something to find.
+        let firstLog = JoinLog()
+        let first = try makeSegmentedConverter(input: input, info: info,
+                                               outputFrameCount: nil, log: firstLog)
+            .run(.init(input: input, output: output, sceneDetection: false,
+                       segmentSeconds: 1.0, keepSegments: true))
+        let total = try #require(first.segments).plan.segments.count
+        #expect(total > 1, "a single-segment plan could not show a skip")
+        #expect(try #require(first.segments).resumed.isEmpty)
+
+        // A second run of the same job. Nothing was interrupted, so everything is
+        // already there.
+        let secondLog = JoinLog()
+        let second = try makeSegmentedConverter(input: input, info: info,
+                                                outputFrameCount: nil, log: secondLog)
+            .run(.init(input: input, output: output, sceneDetection: false,
+                       overwrite: true, segmentSeconds: 1.0, keepSegments: true))
+        let outcome = try #require(second.segments)
+        #expect(outcome.resumed.count == total, "\(outcome.summary)")
+        #expect(outcome.entries.count == total)
+        #expect(outcome.isComplete)
+        #expect(second.written == first.written, "\(outcome.summary)")
+
+        // The join still saw the whole film, because the skipped segments are on disk.
+        #expect(secondLog.list.split(separator: "\n").count == total)
+    }
+
+    @Test("segments from a different job are refused rather than joined")
+    func aDifferentJobIsRefused() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let info = makeInfo(frames: 120)
+
+        let firstLog = JoinLog()
+        _ = try makeSegmentedConverter(input: input, info: info, outputFrameCount: nil,
+                                       log: firstLog)
+            .run(.init(input: input, output: output, sceneDetection: false,
+                       segmentSeconds: 1.0, keepSegments: true))
+
+        // The same film, a different bit rate. Joining half of one to half of the other
+        // would produce a file that plays and is wrong.
+        let secondLog = JoinLog()
+        let converter = makeSegmentedConverter(input: input, info: info,
+                                               outputFrameCount: nil, log: secondLog)
+        let changed = BatchConverter.Request(input: input, output: output,
+                                             bitRate: 40_000_000,
+                                             sceneDetection: false,
+                                             overwrite: true,
+                                             segmentSeconds: 1.0)
+        #expect(throws: BatchConverter.Failure.self) {
+            try converter.run(changed)
+        }
+        // Saying "I know" is how the same job is started again over it.
+        var restarted = changed
+        restarted.restart = true
+        let recovered = try converter.run(restarted)
+        #expect(recovered.isClean, "\(recovered.problems.joined(separator: "; "))")
+    }
+
+    @Test("the pieces are taken away once the film has been delivered")
+    func segmentsAreRemovedOnSuccess() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let info = makeInfo(frames: 120)
+        let log = JoinLog()
+
+        _ = try makeSegmentedConverter(input: input, info: info, outputFrameCount: nil,
+                                       log: log)
+            .run(.init(input: input, output: output, sceneDetection: false,
+                       segmentSeconds: 1.0))
+
+        // The segments are a second copy of the whole film. Once there is nothing left to
+        // resume, keeping them costs the user the disk they wanted for the output.
+        let directory2 = JobManifest.directory(beside: output)
+        #expect(!FileManager.default.fileExists(atPath: directory2.path))
+        #expect(try leftovers(in: directory).isEmpty)
+
+        // Asked to keep them, they stay.
+        let kept = try makeSegmentedConverter(input: input, info: info,
+                                              outputFrameCount: nil, log: log)
+            .run(.init(input: input, output: output, sceneDetection: false,
+                       overwrite: true, segmentSeconds: 1.0, keepSegments: true))
+        #expect(FileManager.default.fileExists(atPath: directory2.path))
+        #expect(kept.segments?.isComplete == true)
+    }
+
+    @Test("a source that does not state its frame count is still planned")
+    func unstatedFrameCountIsEstimated() throws {
+        // Matroska reports `nb_frames=N/A`, and the real film is a Matroska. The plan
+        // falls back to the duration, rounded up — a plan that covers too much ends with
+        // a segment that comes up short and stops, while one that covers too little
+        // would truncate the film.
+        let rate = FrameRate.twentyFourNTSC
+        let info = MediaInfo(url: URL(fileURLWithPath: "/dev/null"),
+                             width: Self.width, height: Self.height, frameRate: rate,
+                             frameCount: nil, duration: 5.0,
+                             pixelFormat: "nv12", format: .nv12,
+                             colorPrimaries: nil, transferFunction: nil, colorSpace: nil,
+                             colorRange: nil, masteringDisplay: nil,
+                             contentLightLevel: nil, audioTracks: [], chapterCount: 0)
+        let counted = BatchConverter.estimatedSourceFrames(
+            request: .init(input: URL(fileURLWithPath: "/dev/null"),
+                           output: URL(fileURLWithPath: "/dev/null")),
+            info: info)
+        let expected = Int((5.0 * rate.doubleValue).rounded(.up)) + 1
+        #expect(counted == expected, "\(String(describing: counted)) against \(expected)")
+        // And it is not fewer than the frames the duration describes.
+        #expect(counted ?? 0 >= Int((5.0 * rate.doubleValue).rounded(.down)))
+    }
 }
 
 /// A one-shot flag two closures can share.

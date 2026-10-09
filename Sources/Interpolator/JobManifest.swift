@@ -284,7 +284,14 @@ public struct JobManifest: Codable, Sendable, Equatable {
         let manager = FileManager.default
         for segment in plan.segments {
             guard let entry = entry(for: segment.index), entry.matches(segment) else { continue }
-            guard entry.frames == segment.outputCount else { continue }
+            // The last segment may legitimately end short: the film can stop mid-segment,
+            // and on a source that does not state its own frame count the plan's length is
+            // derived from the duration rather than read. Every other segment has to
+            // produce exactly what the plan says, or a boundary has moved.
+            let isLast = segment.index == plan.segments.count - 1
+            guard entry.frames == segment.outputCount || (isLast && entry.frames > 0) else {
+                continue
+            }
             let url = directory.appendingPathComponent(entry.file)
             guard let attributes = try? manager.attributesOfItem(atPath: url.path),
                   let size = (attributes[.size] as? NSNumber)?.int64Value,

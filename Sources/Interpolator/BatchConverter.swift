@@ -79,6 +79,31 @@ public struct BatchConverter: Sendable {
         /// explicitly is how you ask for the other, or for the audio to be dropped.
         public var audio: AudioMuxPolicy?
 
+        /// Render the film in pieces of about this many seconds. `nil` renders it in
+        /// one go.
+        ///
+        /// This is not for speed — segments cost a little, in the frame decoded twice
+        /// at every boundary and in the join at the end. It is so that a crash, a power
+        /// cut or a quit costs one piece rather than three hours, and so the job can be
+        /// stopped and picked up again.
+        ///
+        /// The pieces are recorded in a manifest beside the output, so a second run
+        /// skips what is already finished. See ``JobManifest``.
+        public var segmentSeconds: Double?
+
+        /// Throw away the record of a previous run and render everything again.
+        ///
+        /// The normal answer to a manifest that disagrees with this request is to
+        /// refuse — see ``Failure/manifestMismatch(_:)`` — because joining half of one
+        /// job to half of another produces a file that plays and is wrong.
+        public var restart: Bool
+
+        /// Keep the finished segments and the manifest after a successful join.
+        ///
+        /// Off by default: the segments are a second copy of the whole film, and once
+        /// it has been delivered there is nothing left to resume.
+        public var keepSegments: Bool
+
         public init(input: URL,
                     output: URL,
                     policy: OutputRatePolicy = .default,
@@ -89,7 +114,10 @@ public struct BatchConverter: Sendable {
                     startSeconds: Double? = nil,
                     overwrite: Bool = false,
                     convertWhenAlreadyAtTarget: Bool = false,
-                    audio: AudioMuxPolicy? = nil) {
+                    audio: AudioMuxPolicy? = nil,
+                    segmentSeconds: Double? = nil,
+                    restart: Bool = false,
+                    keepSegments: Bool = false) {
             self.input = input
             self.output = output
             self.policy = policy
@@ -101,6 +129,9 @@ public struct BatchConverter: Sendable {
             self.overwrite = overwrite
             self.convertWhenAlreadyAtTarget = convertWhenAlreadyAtTarget
             self.audio = audio
+            self.segmentSeconds = segmentSeconds
+            self.restart = restart
+            self.keepSegments = keepSegments
         }
     }
 
@@ -128,8 +159,10 @@ public struct BatchConverter: Sendable {
         /// The audio policy that was actually applied — the request's, or the one the
         /// output's extension implied.
         public let audioPolicy: AudioMuxPolicy
+        /// What the segments did. `nil` when the film was rendered in one go.
+        public let segments: SegmentOutcome?
 
-        public var isClean: Bool { problems.isEmpty }
+        public var isClean: Bool { problems.isEmpty && (segments?.problems.isEmpty ?? true) }
         public var cutCount: Int { report.cutCount }
         public var outputFrames: Int { report.outputFrames }
 
@@ -173,6 +206,8 @@ public struct BatchConverter: Sendable {
         case alreadyAtTarget(String)
         /// The sink placed fewer frames than the pipeline produced.
         case shortOutput(expected: Int, written: Int)
+        /// There is a manifest beside the output, but it describes a different job.
+        case manifestMismatch(String)
 
         public var description: String {
             switch self {
@@ -183,7 +218,34 @@ public struct BatchConverter: Sendable {
             case .shortOutput(let expected, let written):
                 return "the pipeline produced \(expected) frames but the sink placed "
                     + "\(written); the output would be silently short"
+            case .manifestMismatch(let detail):
+                return "the finished segments beside the output are from a different job — "
+                    + "\(detail); pass restart to discard them and render everything again"
             }
+        }
+    }
+
+    // MARK: - Segments
+
+    /// What a segmented job did.
+    public struct SegmentOutcome: Sendable {
+        public let plan: SegmentPlan
+        public let entries: [JobManifest.Entry]
+        /// Segments that were already finished and were skipped.
+        public let resumed: Set<Int>
+        public let joined: SegmentJoiner.Outcome?
+        public let problems: [String]
+
+        /// Output frames the finished segments actually hold.
+        public var outputFrames: Int { entries.reduce(0) { $0 + $1.frames } }
+        /// Whether every segment the plan calls for was rendered.
+        public var isComplete: Bool { entries.count == plan.segments.count }
+
+        public var summary: String {
+            let rendered = entries.count - resumed.count
+            return "\(entries.count)/\(plan.segments.count) segments "
+                + "(\(rendered) rendered, \(resumed.count) resumed), "
+                + "\(outputFrames) output frames"
         }
     }
 
@@ -209,6 +271,14 @@ public struct BatchConverter: Sendable {
     /// through ffmpeg's argument list to infer it back is not.
     public var mux: @Sendable (MuxRequest) throws -> AudioMuxer.Outcome
 
+    /// The join, for a segmented job.
+    ///
+    /// A factory rather than a value, because `SegmentJoiner` carries its own seams and a
+    /// test wants to replace them — the joiner's checks are `SegmentJoinerTests`' subject,
+    /// and this file is about whether the converter renders the right pieces in the right
+    /// order and writes down what it did.
+    public var makeJoiner: @Sendable () -> SegmentJoiner
+
     /// The shipping configuration: ffprobe, ffmpeg, `VTFrameProcessor`, and an
     /// `AVAssetWriter`.
     public init() {
@@ -224,6 +294,7 @@ public struct BatchConverter: Sendable {
             VTFrameProcessorEngine(source: source, output: output, depth: depth)
         }
         self.mux = { try AudioMuxer().mux($0) }
+        self.makeJoiner = { SegmentJoiner() }
     }
 
     public init(probe: @escaping @Sendable (URL) throws -> MediaInfo,
@@ -232,12 +303,14 @@ public struct BatchConverter: Sendable {
                 makeEngine: @escaping @Sendable (FrameRate, FrameRate, Int) throws -> InterpolationEngine,
                 mux: @escaping @Sendable (MuxRequest) throws -> AudioMuxer.Outcome = {
                     try AudioMuxer().mux($0)
-                }) {
+                },
+                makeJoiner: @escaping @Sendable () -> SegmentJoiner = { SegmentJoiner() }) {
         self.probe = probe
         self.makeSource = makeSource
         self.makeSink = makeSink
         self.makeEngine = makeEngine
         self.mux = mux
+        self.makeJoiner = makeJoiner
     }
 
     // MARK: - Run
@@ -269,6 +342,27 @@ public struct BatchConverter: Sendable {
         // packet boundary, so a cut means a re-encode.
         let cutting = (request.startSeconds ?? 0) > 0 || request.maximumSourceFrames != nil
         let audioPlan = try audioPolicy.plan(for: info, cutting: cutting)
+
+        // Both paths converge on the mux, so the decision of which one to take is the
+        // first thing here and the last thing either of them knows about.
+        if let seconds = request.segmentSeconds, seconds > 0,
+           let plan = Self.segmentPlan(request: request, info: info,
+                                       resolution: resolution, segmentSeconds: seconds) {
+            return try runSegmented(request, info: info, resolution: resolution,
+                                    audioPolicy: audioPolicy, audioPlan: audioPlan,
+                                    plan: plan)
+        }
+        return try runWhole(request, info: info, resolution: resolution,
+                            audioPolicy: audioPolicy, audioPlan: audioPlan)
+    }
+
+    /// One film, one render.
+    private func runWhole(_ request: Request,
+                          info: MediaInfo,
+                          resolution: OutputRatePolicy.Resolution,
+                          audioPolicy: AudioMuxPolicy,
+                          audioPlan: AudioMuxPolicy.Plan) throws -> Result {
+        let manager = FileManager.default
 
         // Beside the destination, so the final move is a rename inside one volume — and
         // so that a crashed job leaves something obviously unfinished. It also keeps
@@ -396,7 +490,252 @@ public struct BatchConverter: Sendable {
                       wallSeconds: report.wallSeconds,
                       problems: problems,
                       audio: audio,
-                      audioPolicy: audioPolicy)
+                      audioPolicy: audioPolicy,
+                      segments: nil)
+    }
+
+    // MARK: - The segmented path
+
+    /// How many source frames the plan should cover.
+    ///
+    /// Matroska reports `nb_frames=N/A`, so the count is not there to be read. It is
+    /// derived from the duration instead, and rounded **up**: a plan that covers more
+    /// frames than the film has ends with a segment that comes up short and stops, which
+    /// is handled; a plan that covers *fewer* would truncate the film, which is not.
+    static func estimatedSourceFrames(request: Request,
+                                      info: MediaInfo) -> Int? {
+        if let limit = request.maximumSourceFrames { return limit }
+        if let stated = info.frameCount { return stated }
+        guard info.duration > 0, info.frameRate.doubleValue > 0 else { return nil }
+        return Int((info.duration * info.frameRate.doubleValue).rounded(.up)) + 1
+    }
+
+    static func segmentPlan(request: Request,
+                            info: MediaInfo,
+                            resolution: OutputRatePolicy.Resolution,
+                            segmentSeconds: Double) -> SegmentPlan? {
+        guard let frames = estimatedSourceFrames(request: request, info: info),
+              frames >= 2 else { return nil }
+        return SegmentPlan(sourceFrameCount: frames,
+                           source: info.frameRate,
+                           output: resolution.output,
+                           segmentSeconds: segmentSeconds)
+    }
+
+    /// A film in pieces, each rendered to its own file and recorded before the next one
+    /// starts.
+    private func runSegmented(_ request: Request,
+                              info: MediaInfo,
+                              resolution: OutputRatePolicy.Resolution,
+                              audioPolicy: AudioMuxPolicy,
+                              audioPlan: AudioMuxPolicy.Plan,
+                              plan: SegmentPlan) throws -> Result {
+        let manager = FileManager.default
+        let directory = JobManifest.directory(beside: request.output)
+        let staging = Self.stagingURL(beside: request.output)
+        let temporary = Self.temporaryURL(beside: request.output)
+        try? manager.removeItem(at: staging)
+        try? manager.removeItem(at: temporary)
+        // Before the first segment is rendered, not by the first manifest write: the
+        // segment's own file lives here, and an `open` into a directory that does not
+        // exist fails silently enough to look like a sink that wrote nothing.
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var placed = false
+        defer {
+            try? manager.removeItem(at: staging)
+            if !placed { try? manager.removeItem(at: temporary) }
+            if placed, !request.keepSegments { try? manager.removeItem(at: directory) }
+        }
+
+        // What this job is. Recorded so a second run can tell whether what is on disk is
+        // the same job, rather than assuming it is because the file names match.
+        let fingerprint = JobManifest.Fingerprint.of(
+            source: request.input, info: info,
+            outputRate: resolution.output, bitRate: request.bitRate,
+            depth: request.depth, sceneDetection: request.sceneDetection,
+            intervalsPerSegment: plan.intervalsPerSegment)
+
+        var manifest = request.restart ? nil : try JobManifest.load(from: directory)
+        if let found = manifest, let difference = found.fingerprint.difference(from: fingerprint) {
+            // Half of one job joined to half of another plays perfectly and is wrong —
+            // two different films, or one film at two different bit rates. Refusing is
+            // the only safe answer; `restart` is the way to say "I know, throw it away".
+            guard request.restart else { throw Failure.manifestMismatch(difference) }
+            manifest = nil
+        }
+        var working = manifest ?? JobManifest(fingerprint: fingerprint)
+        let finished = working.completed(in: directory, plan: plan)
+
+        var problems: [String] = []
+        var sourceFrames = 0
+        var interpolatedFrames = 0
+        var passthroughFrames = 0
+        var cutCount = 0
+        var wallSeconds = 0.0
+
+        for segment in plan.segments where !finished.contains(segment.index) {
+            let file = directory.appendingPathComponent(
+                JobManifest.segmentFileName(index: segment.index,
+                                            of: plan.segments.count))
+            // Discard, not trust. A segment file that exists may be complete or may be
+            // half of one; those two are indistinguishable from the outside, and the
+            // manifest is the only thing that says which.
+            try? manager.removeItem(at: file)
+
+            let report = try render(segment: segment, of: plan, request: request,
+                                    info: info, resolution: resolution, to: file)
+
+            // Zero frames means the source ran out before this segment began, which is
+            // how a plan built on an estimated length finds the end of the film.
+            guard report.outputFrames > 0 else { break }
+
+            sourceFrames += report.sourceFrames
+            interpolatedFrames += report.interpolatedFrames
+            passthroughFrames += report.passthroughFrames
+            cutCount += report.cutCount
+            wallSeconds += report.wallSeconds
+
+            let size = (try? manager.attributesOfItem(atPath: file.path))?[.size]
+            working.record(JobManifest.Entry(
+                index: segment.index,
+                file: file.lastPathComponent,
+                bytes: (size as? NSNumber)?.int64Value ?? 0,
+                // What landed, not what was planned: the last segment can end short.
+                frames: report.outputFrames,
+                sourceStart: segment.sourceStart,
+                sourceCount: segment.sourceCount,
+                outputStart: segment.outputStart,
+                outputCount: segment.outputCount,
+                wallSeconds: report.wallSeconds))
+            // Written *after* the segment is finished and checked, and atomically, so a
+            // crash leaves the previous record intact rather than a half-written one.
+            try working.write(to: directory)
+            problems += report.problems
+        }
+
+        // Everything that is finished, in the film's order. The plan's own order, so the
+        // concat list is the film even if the manifest was written out of order.
+        let files = plan.segments.compactMap { segment -> URL? in
+            guard working.entry(for: segment.index) != nil else { return nil }
+            return directory.appendingPathComponent(
+                JobManifest.segmentFileName(index: segment.index, of: plan.segments.count))
+        }
+        guard !files.isEmpty else {
+            throw Failure.shortOutput(expected: plan.outputFrameCount, written: 0)
+        }
+
+        // The join is a container operation over bitstreams that are already correct —
+        // no second generation of loss — and it is checked against what the plan says
+        // the film has, because a lost boundary is not an error to ffmpeg.
+        let joiner = makeJoiner()
+        let joined = try joiner.join(files: files, output: staging,
+                                     expectedFrames: working.segments.reduce(0) { $0 + $1.frames },
+                                     expectedRate: resolution.output)
+
+        let written = joined.frames ?? working.segments.reduce(0) { $0 + $1.frames }
+        let videoSeconds = resolution.output.doubleValue > 0
+            ? Double(written) / resolution.output.doubleValue : 0
+
+        func place(_ url: URL) throws {
+            if request.overwrite, manager.fileExists(atPath: request.output.path) {
+                try manager.removeItem(at: request.output)
+            }
+            try manager.moveItem(at: url, to: request.output)
+            placed = true
+        }
+
+        var audio: AudioMuxer.Outcome?
+        if audioPlan.isSilent {
+            try place(staging)
+        } else {
+            // The audio is muxed once, over the joined picture, and never segmented. A
+            // compressed stream can only be cut at a packet boundary, so cutting it per
+            // segment would mean re-encoding the DTS-HD MA master that the whole point
+            // of the MKV path is to keep bit for bit.
+            let outcome = try mux(MuxRequest(
+                video: staging,
+                source: request.input,
+                output: temporary,
+                plan: audioPlan,
+                audioStart: request.startSeconds.map {
+                    AudioMuxer.alignedStart($0, rate: info.frameRate)
+                },
+                videoSeconds: videoSeconds,
+                boundAudio: request.maximumSourceFrames != nil,
+                frameTolerance: 1.0 / info.frameRate.doubleValue,
+                sourceChapters: info.chapterCount))
+            audio = outcome
+            problems += outcome.problems
+            try place(temporary)
+        }
+
+        let size = (try? manager.attributesOfItem(atPath: request.output.path))?[.size]
+        let bytes = (size as? NSNumber)?.int64Value ?? 0
+
+        let outcome = SegmentOutcome(plan: plan, entries: working.segments,
+                                     resumed: finished, joined: joined,
+                                     problems: joined.problems)
+        problems += joined.problems
+        if !outcome.isComplete {
+            problems.append("only \(outcome.entries.count) of \(plan.segments.count) "
+                            + "segments were rendered; the film ends early")
+        }
+
+        return Result(output: request.output,
+                      source: info,
+                      resolution: resolution,
+                      report: InterpolationPipeline.Report(
+                        sourceFrames: sourceFrames,
+                        outputFrames: written,
+                        interpolatedFrames: interpolatedFrames,
+                        passthroughFrames: passthroughFrames,
+                        engineCalls: 0,
+                        decisions: [],
+                        wallSeconds: wallSeconds,
+                        problems: []),
+                      written: written,
+                      bytes: bytes,
+                      wallSeconds: wallSeconds,
+                      problems: problems,
+                      audio: audio,
+                      audioPolicy: audioPolicy,
+                      segments: outcome)
+    }
+
+    /// Render one segment into its own file.
+    private func render(segment: SegmentPlan.Segment,
+                        of plan: SegmentPlan,
+                        request: Request,
+                        info: MediaInfo,
+                        resolution: OutputRatePolicy.Resolution,
+                        to file: URL) throws -> InterpolationPipeline.Report {
+        let settings = VideoEncodeSettings.forSource(info, bitRate: request.bitRate)
+        let sink = try makeSink(file, settings)
+
+        // Half a frame into the frame's own presentation, so a seek that lands a hair
+        // early still lands on this frame rather than the one before it.
+        let base = request.startSeconds ?? 0
+        let seek = base + (Double(segment.readStart) + 0.5) / info.frameRate.doubleValue
+        let source = try makeSource(request.input, info, seek, segment.readCount)
+        let engine = try makeEngine(info.frameRate, resolution.output, request.depth)
+
+        let pipeline = InterpolationPipeline(
+            source: source,
+            sourceRate: info.frameRate,
+            outputRate: resolution.output,
+            engine: engine,
+            configuration: .init(depth: request.depth,
+                                 sceneDetection: request.sceneDetection,
+                                 maximumSourceFrames: segment.readCount,
+                                 expectedOutputFrameCount: segment.outputCount,
+                                 window: .init(segment: segment)))
+
+        let report = try pipeline.run(into: sink)
+        guard sink.written == report.outputFrames else {
+            throw Failure.shortOutput(expected: report.outputFrames, written: sink.written)
+        }
+        return report
     }
 
     // MARK: - Helpers
