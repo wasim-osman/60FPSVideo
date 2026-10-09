@@ -560,6 +560,47 @@ These are not choices. Each one is a measured failure mode, and violating any of
     last step. On a 2-hour conversion that is three hours of work discarded by one line. If overwriting
     was authorised, remove the destination before the move — and prefer a window with no file to a file
     that is half of each.
+31. **ffmpeg's Matroska muxer rebases every stream by `−min(raw PTS)`, and a source can present from zero
+    while its packets start below it.** An MKV conversion came out with the sound **253 ms** late. The
+    cause is that Matroska cannot carry an **edit list**: when an encoder has reordered its frames and
+    the source container cancelled the delay with one, the muxer lifts the picture to zero and drags the
+    audio up with it. Measured: video raw packet PTS **−0.250**, picture presents at 0.000, audio lands
+    at **0.253**. Two traps follow. First, **`start_time` is not the fact** — the source presents from
+    0.000 while its packets start at −0.250, so reading `start_time` misses exactly the case that needs
+    correcting; the correction has to come from the lowest *raw* packet PTS over the reorder window
+    (HEVC's DPB holds ≤16 frames, so 32 packets is safe). Second, **`-avoid_negative_ts disabled` is a
+    trap, not a fix** — it leaves the video's timestamps unreadable (`N/A`) and the audio still
+    misaligned, so an offset check goes silent while the film is out of sync. The fix is
+    `-itsoffset <videoMinPTS>` on the **audio** input, and **Matroska only**: MP4 carries the edit list
+    through, so the offset would push the audio *early* there (measured 0.003 → 0.000). Verified:
+    253 ms → **3 ms**.
+32. **`ffmpeg -ss` returns the first frame at or *after* the instant, so aiming at the middle of a frame
+    lands on the next one.** Frame `n` presents at `n / rate`, so to land on `n` the instant must sit in
+    `(PTS(n−1), PTS(n)]`, whose midpoint is `(n − 0.5) / rate`. Aiming at `(n + 0.5) / rate` — the
+    natural reading of "aim at the middle of the frame" — returns frame `n + 1`. Measured: a seek to
+    frame **100.5** produced frame **101**. Every segment of the segmented render was therefore one
+    source frame late: invisible on the film's static opening, **37 MAD** by two minutes in. Same rule
+    as invariant 22, one layer down — and the reason a *static* opening is the worst place to look for
+    it.
+33. **A passthrough's `sourceIndex` is film-wide, not local to the run.** The pipeline chose `slot.a` or
+    `slot.b` by comparing that film-wide index against the run's *local* interval. Whole-film `readBase`
+    is 0 and the two coincide; in every segment but the first they do not, so every passthrough in every
+    segment but the first wrote the **far** frame of its interval instead of the near one. It would have
+    looked like a one-frame hitch at each segment start and been blamed on the encoder. Found by
+    comparing passthrough bytes against the source frames the film-wide plan names — ground truth, not a
+    second implementation.
+34. **A concat list must sit beside the segments it names.** ffmpeg resolves the names *in* the list
+    against the list's own directory, and that is not the same place as the output's directory. The
+    segments live in `<output>.segments/`, so a list written beside the output named the right files and
+    could not open any of them. This surfaced only on a real run, because every test stubs ffmpeg —
+    which is invariant 35's lesson arriving from the other direction.
+35. **A test double must model the tool it stands in for, or it will agree with whatever is wrong.** The
+    tests' source double turned a seek into a frame index with `.rounded(.down)`. ffmpeg's `-ss` rounds
+    the other way (invariant 32), so the double reproduced the bug exactly and every test passed while
+    the real film drifted. A double that is *convenient* rather than *faithful* is worse than no double,
+    because it converts a real failure into a green tick. Where the behaviour can be pinned down, it
+    belongs in a named function the test can call — `seekSeconds(forFrame:rate:base:)` is now tested
+    over 200 indices.
 
 ---
 
@@ -1405,6 +1446,165 @@ check that cannot fail is worse than no check, because it is believed. **Invaria
 **Tests: 124 in 15 suites → 136 in 16 suites**, and the three regressions are pinned by name: the
 overwrite path, `mediaTimeScale` (asserting the container reports `60000/1001`, via ffprobe), and
 `nb_frames` as a string.
+
+---
+
+## 22. The audio goes back in — both containers, and the 250 ms Matroska was hiding
+
+Audio is now a setting, not a decision: **MP4 + AAC** by default, **MKV + a bit-perfect copy**.
+The output's extension implies one; naming a policy explicitly is how you ask for the other.
+
+**DTS cannot go into MP4, measured.** `DTS-HD MA + DTS:X 7.1` copies into Matroska unchanged —
+that is the whole point of the MKV path. Into MP4 it does not, and the request is refused in a
+second rather than after a two-hour render.
+
+**A cut forces a transcode, and that is correct.** A compressed stream can only be cut at a
+packet boundary. `--max-frames` and `--start` are cuts, so either one turns the bit-perfect copy
+into a re-encode. The rule is stated in the report's `audio:` line rather than left to be
+discovered.
+
+**Chapters survive.** 12 in, 12 out.
+
+### The 253 ms, and what it actually was
+
+An MKV conversion came out with the sound 253 ms late. The obvious suspects were all innocent:
+a hand-written EBML walker showed the file carries no `CodecDelay` and no `SeekPreRoll`, so
+nothing was declaring a delay.
+
+It was **ffmpeg's Matroska muxer rebasing every stream by `−min(raw PTS)`**. The video's earliest
+*raw* packet PTS was −0.250 — an encoder had reordered its frames and the source container
+cancelled the delay with an **edit list**. Matroska cannot carry an edit list, so ffmpeg lifts the
+picture to zero and drags the audio with it. Measured: video raw PTS −0.250, picture presents at
+0.000, audio landed at 0.253.
+
+Two things follow, and both are easy to get wrong:
+
+- **`start_time` is not the fact.** The MP4 presents from 0.000 while its packets start at
+  −0.250. Reading `start_time` misses exactly the case that needs correcting. The correction has
+  to come from the lowest *raw* packet PTS over the reorder window — HEVC's DPB holds ≤16 frames,
+  so 32 packets is safe.
+- **`-avoid_negative_ts disabled` is a trap, not a fix.** It leaves the video's timestamps
+  unreadable (`N/A`) and the audio still misaligned — so the offset check goes quiet while the
+  film is out of sync.
+
+The fix is `-itsoffset <videoMinPTS>` on the *audio* input, **for Matroska only**: it drops the
+audio's raw start below the picture's minimum, so the rebase still lifts everything by the same
++0.250 and lands the audio at 0.003, where the edit list said it was. MP4 must **not** be given
+it — MP4 carries the edit list through, and the offset would push the audio *early* (measured
+0.003 → 0.000). One function decides this, for the command and for the report.
+
+**Invariant 31 — Matroska rebases by `−min(raw PTS)`.** A source that presents from zero can still
+have negative packet times, and the container that cannot carry an edit list will shift the audio
+to hide it.
+
+**The test that could not fail.** My first A/V probe decoded each file's audio from *its own*
+first packet, so lag 0 was guaranteed by construction. It reported "aligned" on a file that was
+253 ms out. Worth recording as a failure mode in its own right: a check that cannot fail is worse
+than none, because it is believed (invariant 29 again).
+
+---
+
+## 23. A film in pieces — segments, resume, and the bugs only a real film found
+
+Segmentation is **not for speed**. Segments cost a little: one frame decoded twice at every
+boundary, and a join at the end. What they buy is survivability — a crash costs one piece rather
+than three hours, and a stopped job can be picked up again.
+
+### What a segment owns, and what it reads
+
+A segment renders intervals `[a, b)`. It **cannot** read only frames `[a, b]`.
+
+The cut verdict for interval `i` is not a function of interval `i`. The adaptive threshold looks
+back `historyLength` (**30**) intervals, and the flash guard looks **two frames forward**. A
+segment that began reading at its own first interval would judge it against a short history with
+no backward evidence, and would judge its last one with no forward evidence at all — because the
+tracker calls `finish()` when its source ends, and end-of-stream semantics are deliberately not
+mid-stream semantics. A cut landing exactly on a boundary would be judged differently from the
+same cut mid-film.
+
+So each segment reads **31 intervals of lead-in and 2 of lead-out**, feeds every frame it reads to
+the tracker, and renders only its own intervals. At the film's own ends the margins are clamped
+away rather than faked — the first segment has no lead-in because the film has nothing before it,
+which is what the whole-film render has there too. Cost: 33 extra decoded frames per segment out
+of ~7200. The result is that a segment's output is the corresponding slice of the whole-film
+output, not merely a similar one.
+
+The distinction is carried into the run by `InterpolationPipeline.Window`: where to read from,
+which intervals to render, and the film-wide number of the first output frame.
+
+Boundaries also have to sit on the **phase period** — `pnum / gcd(pnum, pden)` intervals, which is
+2 for 23.976 → 59.94 and **400** for 23.976 → 60 — or a segment computes its passthroughs from a
+phase the film does not have there. Segment lengths are rounded *up* to a multiple of it.
+
+### Resume is discard, not trust
+
+A segment file that exists may be complete, or may be half of one. Those two are
+indistinguishable from the outside: a truncated MP4 opens, reports fewer frames, and looks like a
+short film. So the manifest is the only thing that says which, and it is written *after* the
+segment is finished and checked — atomically, so an interrupted write leaves the previous record
+intact. An unrecorded file is ignored and overwritten. There is no "mostly done" state to get
+wrong.
+
+A manifest that disagrees with the request is **refused**, because half of one job joined to half
+of another plays perfectly and is wrong. `restart` is how you say you know.
+
+**The audio is not segmented** — it is muxed once over the joined picture, for the reason in §22.
+
+**The plan cannot know the film's length.** Matroska reports `nb_frames=N/A`, so the plan is built
+from the duration and rounded *up*: a plan that covers too much ends with a segment that comes up
+short and stops, which is handled; one that covers too little would truncate the film, which is
+not. Only the last segment is allowed to produce fewer frames than planned.
+
+### Verified on the real film
+
+120 source frames at 4K, 23.976 → 59.94, rendered whole and in 2-second pieces. Comparing
+**passthrough frames against the source frames the film-wide plan names** — ground truth, not a
+second implementation:
+
+```
+whole render : mean |diff| 0.88 vs source, max 2.38
+segmented    : mean 1.03, max 3.03       (before the fix: 2.3 rising to 37.6)
+```
+
+and between the two renders, **PSNR y 35.07 dB → 56.73 dB** (min 28.20 → 51.94). Residual is
+encoding noise: each segment's rate control starts fresh, so the segmented encode delivered 10.9
+Mbps against the whole render's 14.4.
+
+Resume, on the same film, 15 segments at 1 second each:
+
+```
+run 2 (nothing missing) : 15/15 segments (0 rendered, 15 resumed)   0.0 s
+run 3 (007.mp4 deleted) : 15/15 segments (1 rendered, 14 resumed)   2.5 s
+```
+
+### Three bugs, none of which any test could have caught
+
+**`-ss` returns the first frame at or *after* the instant.** Frame `n` presents at `n / rate`, so
+to land on `n` the instant must sit in `(PTS(n-1), PTS(n)]`. I aimed at `(n + 0.5) / rate` — the
+natural reading of "aim at the middle of the frame" — and got `n + 1`. Every segment was one
+source frame late. Measured: a seek to frame 100.5 produced frame **101**. It was invisible on
+the film's static opening and 37 MAD by two minutes in. **Invariant 32.**
+
+*Why no test caught it:* the tests' source double turned a seek into a frame index with
+`.rounded(.down)`. That is not what ffmpeg does, so the double agreed with the bug. **Invariant
+35 — a stand-in has to model the tool it stands in for, or it will agree with whatever is wrong.**
+The double now uses `.rounded(.up)`, and the half-frame decision is a function
+(`seekSeconds(forFrame:rate:base:)`) tested over 200 indices.
+
+**A passthrough's `sourceIndex` is film-wide.** The pipeline chose `slot.a` or `slot.b` by
+comparing it against the run's *local* interval. Whole-film, `readBase` is 0 and the two coincide;
+in every segment but the first they do not, so every passthrough in every segment but the first
+wrote the far frame of its interval. **Invariant 33.**
+
+**The concat list was written beside the output, not beside the segments.** ffmpeg resolves the
+names in it against the list's own directory, and those are different places — the segments live
+in `<output>.segments/`. The join named the right files and could not open any of them. This
+surfaced only on a real run, because every test stubs ffmpeg. **Invariant 34.**
+
+Also found by a test rather than a run: the job directory was created by the first manifest write,
+which happens *after* the first segment renders, so that segment's file was opened into a
+directory that did not exist and the sink placed nothing. It surfaced as "the pipeline produced 60
+frames but the sink placed 0" — the count check doing its job one layer up from the mistake.
 
 ---
 
