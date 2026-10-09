@@ -187,6 +187,52 @@ struct AssetWriterSinkTests {
         #expect(sdrSettings.contentLightLevel == nil)
     }
 
+    // MARK: - The rate
+
+    @Test("the container keeps the exact rate instead of rounding it to a whole number")
+    func exactRateSurvivesTheContainer() throws {
+        // 60000/1001 is the shipping rate, and one frame of it is 1001/60000 s — which
+        // is **10.01** ticks at the timescale AVAssetWriter gives a video track by
+        // default (600). Rounded to 10, the file becomes 60.000: a different rate,
+        // arrived at silently, with every frame present and every duration uniform.
+        //
+        // Measured before this was fixed, on a 12-source-frame render of the real film:
+        // `mdhd` 600, `stts` 28 x 10 ticks, 0.46667 s where the same 28 frames are
+        // 0.46713 s. `movieTimeScale` does not fix it — that sets `mvhd` only, which is
+        // why the first attempt at this changed nothing. It is `mediaTimeScale` on the
+        // input, and it is only visible by reading the container back.
+        let width = 320, height = 240
+        let directory = AssetWriterSinkTests.temporaryDirectory
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("rate.mp4")
+
+        let frameCount = 5
+        let sink = AssetWriterSink(url: output,
+                                   settings: VideoEncodeSettings(bitRate: 4_000_000))
+        try sink.begin(SinkGeometry(width: width, height: height, format: .nv12,
+                                    sourceRate: .twentyFourNTSC, outputRate: .sixtyNTSC,
+                                    sourceFrameCount: frameCount,
+                                    outputFrameCount: frameCount))
+        for index in 0..<frameCount {
+            sink.write(try AssetWriterSinkTests.uniformFrame(
+                width: width, height: height, format: .nv12, luma: UInt8(20 + index * 16)),
+                       at: index)
+        }
+        try sink.finish()
+        #expect(sink.appended == frameCount)
+
+        let text = try AssetWriterSinkTests.streamText(output)
+        #expect(text.contains("avg_frame_rate=60000/1001"))
+        #expect(text.contains("r_frame_rate=60000/1001"))
+
+        // And the same answer through the shipping probe, so the rate the rest of the
+        // app would read back is the rate that went in.
+        let check = try MediaProbe.probeStreamOnly(output)
+        #expect(check.frameRate == .sixtyNTSC)
+        #expect(check.frameCount == frameCount)
+    }
+
     // MARK: - Copying
 
     @Test("copying honours each buffer's own row stride")

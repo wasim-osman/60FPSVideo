@@ -74,7 +74,7 @@ public protocol FrameSink: AnyObject, Sendable {
 /// stream, which is exactly the contract ``FrameSink`` states.
 ///
 /// `@unchecked Sendable` is accurate: everything mutable is behind `lock`.
-public final class PackedFileSink: FrameSink, @unchecked Sendable {
+public final class PackedFileSink: FrameCountingSink, @unchecked Sendable {
 
     private let descriptor: Int32
     private let width: Int
@@ -95,10 +95,13 @@ public final class PackedFileSink: FrameSink, @unchecked Sendable {
     /// single late write silently truncates a frame off the end.
     private var expectedFrames: Int?
 
-    /// Takes an already-open descriptor, and closes it on `finish()`.
+    /// Takes an already-open descriptor. **Does not close it** — call
+    /// ``closeFile()`` when the result is no longer needed.
     ///
-    /// Opening is left to the caller because the harness needs the descriptor to
-    /// size the file and to verify the result afterwards.
+    /// Opening is left to the caller because the harness needs the descriptor to size
+    /// the file and to verify the result afterwards, which means the file has to stay
+    /// open past `finish()`. `finish()` therefore flushes and truncates, and closing
+    /// is a separate, later decision.
     public init(descriptor: Int32, width: Int, height: Int, format: FrameFormat = .nv12) {
         self.descriptor = descriptor
         self.width = width

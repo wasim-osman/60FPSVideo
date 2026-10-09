@@ -206,7 +206,12 @@ what `IntervalPlanner` actually emits over 3,000 intervals.
 
 ---
 
-## 6. 🔴 GATE — 4K policy
+## 6. ✅ SETTLED — 4K policy
+
+> **Heading corrected 2026-10-08.** This was left marked as an open gate long after it was answered;
+> the summary table had recorded the decision all along. The answer is **C with B available**: playback
+> *attempts* true 4K and accepts dropped frames, with a downscale toggle for when that is too ugly.
+> Options B and D below remain the fallbacks, not the decision.
 
 4K real-time is **not achievable** — 33.4 fps measured, against 60 needed. And the low-latency path
 (used for exact-2× rates like 30→60) is **hard-capped at 1920×1080**, failing *silently* above it.
@@ -268,6 +273,15 @@ identically** (76.8 fps either way), because those use the FRC path regardless.
 **Recommendation: B (15.4+)**, since your primary content is film-rate and gains nothing from 26.
 Gate the low-latency path behind a runtime availability check and use it when present.
 
+**✅ Re-confirmed 2026-10-08 — 15.4 stays.** The table above is incomplete: macOS 26 also introduces
+CoreVideo's **typed-buffer API** (`CVMutablePixelBuffer`, `CVPixelBufferCreationAttributes`,
+`CVImageSize`) and, with it, the non-deprecated `AVAssetWriter.inputPixelBufferReceiver`. So the 26 floor
+now has *two* independent arguments, not one. It was put to the user again on that basis and 15.4 was
+kept anyway, because the audience is the point of an open-source DMG. The consequence is recorded as
+**invariant 26**: `AssetWriterSink` uses the AVFoundation writer API deprecated in 27, confined to one
+factory method, and the modern typed-buffer path is deliberately unused. That is now a *settled* choice
+rather than an oversight — if the floor ever moves to 26, the sink is the place to revisit.
+
 ---
 
 ## 10. Encoder and output
@@ -282,6 +296,27 @@ Gate the low-latency path behind a runtime availability check and use it when pr
 
 **Recommendation:** HEVC hardware, quality mode, 8-bit initially (verify 10-bit in a later phase),
 audio copied untouched, MP4/MOV output. Expose codec choice in settings.
+
+### ✅ Updated 2026-10-08 — three of these five rows are now settled differently
+
+**The 10-bit row is done, not pending.** §17 verified the whole chain: 10-bit P010 from decode to encode,
+HDR10 static metadata byte-exact. So "8-bit initially, verify 10-bit in a later phase" is superseded —
+**HDR sources use 10-bit**, and the +27% cost is measured and accepted.
+
+**The audio row contradicted the container row for your actual disc.** "Audio copied untouched" plus
+"MP4/MOV output" cannot both hold for a **DTS-X 7.1** source, because MP4 has no DTS. That inconsistency
+was put to the user and answered: **both, as a setting** — MP4 with AAC 7.1 transcoded by default (plays
+everywhere, loses the DTS-X object/height channels), and MKV with the audio copied bit-perfect as an
+option. ffmpeg does the muxing either way, which is the same split the decode side already uses:
+**ffmpeg handles containers, VideoToolbox handles the encode.**
+
+**The bitrate row is decided but not yet measured.** "Quality mode" is the right mechanism, but the
+*number* has been a guess — 0.12 bits/pixel/frame, about 45 Mbps and 40 GB for a 2-hour 4K film. The
+user's answer is **measure it, targeting visually lossless**: encode the same interpolated frames at
+three rates, compare each against the uncompressed frames, and take the smallest rate that is
+transparent. That is the right experiment because it isolates the *encode's* error from the
+interpolation's, and the interpolation's error is already known from `REAL-CONTENT-AB.md` — the encode
+should sit well below it.
 
 ---
 
@@ -500,6 +535,31 @@ These are not choices. Each one is a measured failure mode, and violating any of
     wrong by a scale factor, and it looks exactly like a bug in whatever wrote the file — it cost a
     round of false suspicion of `AssetWriterSink`'s reorder buffer. Decode to `yuv420p` and read the
     luma plane, which is the plane the encoder actually wrote.
+28. **`AVAssetWriter` gives a video track a media timescale of 600, and 59.94 does not fit in it.**
+    One frame of `60000/1001` is `1001/60000 s = 10.01` ticks at 1/600. Rounded to 10, the file is
+    **60.000 fps** — a different rate, arrived at silently, with every frame present, every duration
+    uniform, and `finishWriting` succeeding. Measured on a 12-source-frame render of the real film:
+    `mdhd` 600, `stts` 28 × 10 ticks, 0.46667 s where the same 28 frames are 0.46713 s. Over a feature
+    film that is seconds of drift, and the whole exact-rational `FrameRate` design upstream cannot see
+    it. The fix is **`AVAssetWriterInput.mediaTimeScale = rate.numerator`** — *not* `movieTimeScale`,
+    which sets `mvhd` only and changes nothing about the samples. Verified after: `mdhd` 60000,
+    `stts` 28 × **1001** ticks, 0.467133 s. **Anything written before this fix is 60.000 and needs
+    re-rendering** — including `work/vt_hdr_test.mp4`. Detect it by reading the container's
+    `time_base` and `stts`; nothing else in the pipeline can.
+29. **ffprobe reports `nb_frames` as a JSON *string*, and a cast to `Int` fails silently.** It is a
+    string because the same field may be `"N/A"`. `MediaProbe` read it as `stream["nb_frames"] as? Int`,
+    so `MediaInfo.frameCount` was `nil` for **every file that actually stated a count** — and every
+    check downstream that guards on the count then passed *vacuously*. The batch converter's read-back
+    check, which compares the container's frame count against what was written, never compared anything
+    in any run it ever made. A check that cannot fail is worse than no check, because it is believed.
+    Accept both forms. Note the same parser already handled `duration` and `r_frame_rate` as strings —
+    the inconsistency was the tell.
+30. **`FileManager.moveItem` refuses an existing destination, so "may I overwrite?" is not the same
+    question as "can I write there?".** A converter that checks for an existing output up front, gets
+    permission, and then renames its finished work into place will run the *entire* job and throw at the
+    last step. On a 2-hour conversion that is three hours of work discarded by one line. If overwriting
+    was authorised, remove the destination before the move — and prefer a window with no file to a file
+    that is half of each.
 
 ---
 
@@ -522,12 +582,14 @@ its first row is now answered. Kept only so the record shows what was unknown be
 | 6 | 4K | A refuse · B downscale · C all | B | **Keep true 4K, accept the drops** — recorded, with a downscale toggle built in |
 | 7 | Playback depth | A 1 · B 2 · C 3+ | B | *(default applied — non-negotiable)* |
 | 8 | Batch workers | 1 · 2 · 3 · 4 | 4 | *(default applied — no sandbox, so directly valid)* |
-| 9 | macOS floor | A 26+ · B 15.4+ | B | *(default applied)* |
-| 10 | Encoder | HEVC/H.264 · bitrate mode · 10-bit | HEVC, quality, 8-bit | *(default applied)* |
+| 9 | macOS floor | A 26+ · B 15.4+ | B | **Keep 15.4** ✅ re-confirmed 2026-10-08, after the macOS 26 CoreVideo typed-buffer API was found — see below |
+| 10 | Encoder | HEVC/H.264 · bitrate mode · 10-bit | HEVC, quality, 8-bit | **HEVC, 10-bit for HDR** (superseded — §17 proved the 10-bit path works, so "8-bit initially" no longer applies). Bit rate: **measured, not guessed** ✅ 2026-10-08 — `0.12 bpp` ≈ 45 Mbps at 4K/59.94, which is the smallest rate clearing "well under the interpolation's own error" on both clips; see §20 |
 | 11 | Passthrough | A use · B ignore | A | *(default applied)* |
 | 12 | Failure policy | refuse / warn / fallback | refuse VFR+interlaced | *(default applied)* |
 | 13 | Notarization route | Cask+script · README xattr · pay $99 | Cask + script | **Homebrew Cask + de-quarantine install script** |
 | 14 | Licence | MIT · Apache-2.0 | MIT | **MIT** |
+| 15 | Audio for codecs MP4 cannot hold | transcode · MKV+copy · both · drop | — | **Both, as a setting** ✅ 2026-10-08 — MP4 + AAC 7.1 by default, MKV + bit-perfect copy as an option |
+| 16 | HDR in playback | 10-bit passthrough · tone-map to 8-bit · decide per display | — | **10-bit, let macOS tone-map** ✅ 2026-10-08 — no tone-mapping code to write or get wrong |
 
 ---
 
@@ -958,6 +1020,13 @@ source frame `2k/5`, so the exact coincidences are at `k` a multiple of 5:
 - **10/10 cut-forced passthroughs** match the nearest-source rule, phases `0.2, 0.4 → outgoing` and
   `0.6, 0.8 → incoming`, exactly as the plan specifies.
 
+> **⚠️ Cadence correction — added after §21.** The file this section validated, `work/vt_hdr_test.mp4`,
+> is **60.000 fps at a 1/600 time base**, not 59.94. Everything above is about metadata, bit depth and
+> which frames are passthroughs, and all of it holds. The *rate* was never checked, and it did not hold:
+> `AVAssetWriter` quantises frame durations to its default 600 timescale, and 1001/60000 s does not fit.
+> The fix is `AVAssetWriterInput.mediaTimeScale` — **invariant 28**. Any HDR file written before that fix
+> needs re-rendering before it can be called correct.
+
 **The encode.** This is where "properly" is won or lost, because an HEVC Main10 encode with correct
 colour tags still carries **no** HDR10 static metadata unless it is asked for. On the production path —
 AVAssetWriter / VideoToolbox, which is what the batch converter will use — the metadata is set with
@@ -1158,10 +1227,10 @@ bug in whatever wrote the file. Decode to `yuv420p` and read the luma plane (inv
 
 ### What is left in the batch converter
 
-The sink is the output stage only. Still to build, in order:
+The sink is the output stage only. **The driver is now built — see §21.** Still to build, in order:
 
-1. **The driver** — `FFmpegFrameSource` → `InterpolationPipeline` → `AssetWriterSink`, which is
-   assembly rather than new mechanism, now that all three exist.
+1. ~~**The driver**~~ ✅ **Built — §21.** Assembly, as expected, and it found two silent bugs that
+   nothing else in the pipeline could have seen.
 2. **Audio** — the reference disc carries **DTS-X 7.1, which cannot be copied into MP4 at all**. The
    plan is to let ffmpeg mux: `AVAssetWriter` writes a video-only file, then ffmpeg muxes the audio in
    with `-c:v copy` and either `-c:a copy` (AAC/AC-3/E-AC-3) or a transcode (DTS). That keeps the same
@@ -1169,6 +1238,173 @@ The sink is the output stage only. Still to build, in order:
    DTS problem instead of fighting it.
 3. **Segments and resume** — a feature-length job is tens of minutes, and segment-based output is what
    makes a crash survivable.
+
+---
+
+## 20. Four decisions taken before the player is written
+
+Asked because all four land within the next two steps of work, and because three recorded answers had
+gone stale in the meantime. The stale ones were **corrected in place rather than re-asked** — §6's
+heading, §9's incomplete table, and §10's audio row, which contradicted its own container row for a
+DTS-X source.
+
+| Question | Answer | Why it matters |
+| --- | --- | --- |
+| Audio for codecs MP4 cannot hold | **Both, as a setting** — MP4 + AAC by default, MKV + bit-perfect copy | The disc is DTS-X 7.1. Neither "copy it" nor "MP4" works alone, so the container becomes a user choice. Two output paths to test. |
+| macOS floor | **15.4 stays** | Re-asked because macOS 26 also unlocks CoreVideo's typed-buffer API, giving the 26 floor a *second* argument. The audience wins: an open-source DMG is the point. Locks in invariant 26. |
+| HDR in playback | **10-bit passthrough; let macOS tone-map for SDR displays** | The 10-bit path costs +27% per interval, which is exactly the margin between 4K playing and dropping frames. Choosing passthrough means **no tone-mapping code to write, test, or get wrong** — the system compositor does it. |
+| Output bit rate | **Measure it, target visually lossless** | Stops the one number in the encoder being a guess. |
+
+### What the HDR-playback answer actually saves
+
+Worth being explicit, because it is a design decision disguised as a quality preference. The
+alternative — tone-mapping to 8-bit before interpolation — would have needed a tone-mapping curve in
+the playback path. This machine's ffmpeg has **no `zscale`** and `scale_vt` returns `ENOSYS` (both
+measured earlier, and the reason `analysis/hdr_tonemap.py` is hand-rolled), so it would have been a
+Metal compute pass or a hand-rolled curve, in the real-time path, with its own colour-correctness
+questions. Passing 10-bit through and letting macOS composite it removes that entire surface.
+
+The cost is honest and measured: **+27% per interval**, which on a 4K source at 33.4 fps is the
+difference between a comfortable margin and a dropped frame. That is why §6's answer — *accept the
+drops, with a downscale toggle* — and this one fit together rather than conflict.
+
+### The bit-rate experiment — designed, run, and it changed the answer
+
+Isolating the encode from the interpolation is the whole point, so it does **not** compare against the
+original disc:
+
+1. Take a short segment of each real clip (8-bit `bright.nv12`, 10-bit `hdr_night.p010`).
+2. Interpolate it once, uncompressed — that packed output is the **reference**.
+3. Encode that same reference at seven rates, decode each, and compare frame by frame against the
+   reference with `analysis/bitrate_sweep.py`.
+4. Pick the smallest rate whose error sits **well below the interpolation's own error**, which
+   `ENGINE-EQUIVALENCE.md` §3 quantifies against ground truth: **MAE 2.654** for VT on the holdout,
+   excluding cut frames, in 8-bit code steps.
+
+The night clip is the one that decides it: it is dark, and dark gradients are where a low bit rate
+bands first. A rate that passes on the bright desert clip and fails on the night chase is not a rate.
+
+**Measured** — 60 source frames, 148 output frames, error in 8-bit-equivalent code steps:
+
+| target | delivered | bpp | MAE | p99.9 | flat MAE | flat worst |
+|---|---|---|---|---|---|---|
+| **bright 8-bit SDR** | | | | | | |
+| 15 M | 15.5 M | 0.041 | 0.783 | 11 | 0.283 | 54 |
+| 20 M | 20.0 M | 0.053 | 0.695 | 9 | 0.256 | 38 |
+| 25 M | 23.9 M | 0.064 | 0.627 | 8 | 0.235 | 27 |
+| 30 M | 29.0 M | 0.077 | 0.580 | 7 | 0.216 | 22 |
+| **45 M** | 45.0 M | 0.120 | **0.490** | 5 | 0.177 | 23 |
+| 60 M | 60.1 M | 0.160 | 0.430 | 5 | 0.155 | 16 |
+| 90 M | 90.5 M | 0.241 | 0.362 | 4 | 0.126 | 15 |
+| **night 10-bit HDR** | | | | | | |
+| 15 M | 15.4 M | 0.041 | 0.512 | 4.0 | 0.524 | 13.5 |
+| 20 M | 20.6 M | 0.055 | 0.434 | 3.2 | 0.452 | 11.2 |
+| 25 M | 25.2 M | 0.067 | 0.395 | 2.7 | 0.412 | 8.7 |
+| 30 M | 27.8 M | 0.074 | 0.375 | 2.5 | 0.392 | 8.5 |
+| **45 M** | **32.2 M** | 0.086 | **0.335** | 2.2 | 0.361 | 9.0 |
+| 60 M | 40.0 M | 0.107 | 0.294 | 1.7 | 0.322 | 8.0 |
+| 90 M | 72.7 M | 0.194 | 0.213 | 1.5 | 0.234 | 6.7 |
+
+**Four things this establishes, one of which was not expected:**
+
+1. **The default stands, now on evidence.** `0.12 bpp` ≈ 45 Mbps at 4K/59.94 is the smallest rate that
+   clears "well below the interpolation's own error" on **both** clips with margin. Taking "well below"
+   as *a quarter of* 2.654 → **0.66**, the bright clip crosses between 20 M (0.695) and 25 M (0.627),
+   and the night clip is already under at 15 M. The bright clip binds; 45 M sits ~2× above its crossing.
+2. **The threshold is a judgement and the data is smooth**, so this is a *defensible* number rather than
+   a sharp optimum. At a third of the interpolation error, 20 M would pass; at a 1% total-error budget,
+   only 90 M would. What the curve does not support is anything below ~25 M.
+3. **A target rate is not a delivered rate.** On dark content the encoder undershoots badly and
+   progressively — 45 M delivered **32.2 M** (−28%), 90 M delivered 72.7 M (−19%) — while on bright
+   content it hits the target almost exactly. So the app must report what was **written**, which is why
+   `BatchConverter.Result` derives its rate from the file's own byte count.
+4. **Dark content bands, and the flat-region metric is the only thing that shows it.** On the night clip
+   the flat-region error is *worse than the global error at every rate* (1.815 vs 1.743 at 20 M; 0.938 vs
+   0.856 at 90 M) — the error is concentrated exactly where the eye has nothing else to look at. On the
+   bright clip the same metric is 2.7× *better* than global. The two clips fail in opposite directions,
+   which is the reason both are in the test set.
+
+**Two honest caveats.** The flat-region *worst* column is a single-pixel maximum over ~200 M samples and
+is **not monotonic** (22 at 30 M, 23 at 45 M, 16 at 60 M), so it is evidence that dark content is the
+risk, not a curve to optimise. And the comparison is not quite like for like: the interpolator is close
+to exact in flat regions, so the encode's error there is *unmasked* in a way the global 2.654 does not
+capture. Measuring the interpolation's own error **restricted to flat regions** is what would settle the
+threshold properly, and it is not done.
+
+---
+
+## 21. The batch converter's driver — assembly, and three bugs in the last mile
+
+`BatchConverter` is the whole job: probe the file, resolve the rate through `OutputRatePolicy`,
+interpolate, encode, and report what was actually delivered. It is assembly — all three stages already
+existed and were tested — and the interesting part is not the wiring but the four things it refuses to
+do:
+
+1. **It never leaves a file that looks finished.** The write goes to a sibling
+   `<name>.partial-<id>.mp4` and is renamed into place only after the count agrees. A job that throws
+   leaves nothing at all. This also keeps `AssetWriterSink.begin` — which deletes its own output path —
+   away from the user's file.
+2. **It refuses to re-encode a source already at the target rate.** A 59.94 source under the 59.94
+   default is not a conversion; converting it would spend a generation of quality and change nothing.
+   `convertWhenAlreadyAtTarget` exists for the case where the *container* is the point.
+3. **It does not overwrite unless asked**, and it checks before doing any work rather than after.
+4. **It cross-checks the count.** The pipeline says how many frames it produced; the sink says how many
+   it placed; if they disagree the job fails. A short MP4 is a *valid* MP4, so nothing else would
+   notice — invariant 18, one layer up.
+
+The stages are injected — probe, source, sink, engine — with the real ones as defaults, so the tests
+drive the whole converter with a synthetic source and a packed-file sink, without a GPU or a film. The
+engine seam is for the test, not a quality tier; `VTFrameProcessor` remains the only engine.
+
+### Verified end to end on the real film
+
+```
+--convert FNF.mkv out.mp4 --start 3204.5 --max-frames 12
+probe  : 3840x1632  24000/1001  yuv420p10le -> 10-bit  HDR yes
+rate   : policy 59.94 -> 60000/1001   ratio 5/2
+frames : 12 source -> 28 output   (20 interpolated, 8 passthrough, 28.6% free)
+cuts   : 1 detected across 11 intervals, 10 engine calls
+RESULT : clean
+```
+
+Read back independently: `hevc Main 10`, 3840×1632, `yuv420p10le`, 28 frames, `avg_frame_rate`
+**60000/1001**, all four colour tags (`bt2020` / `smpte2084` / `bt2020nc` / `tv`), and both HDR10 SEI
+payloads present. 28 output frames from 12 source is the plan's own count, and 8 of 28 free is the
+predicted 20% plus two cut-forced passthroughs.
+
+### Three bugs, all silent, all found by reading the file back
+
+**1. `overwrite` did not overwrite.** `FileManager.moveItem` refuses an existing destination, and the
+pre-flight check only asked *may* it overwrite — so an overwrite job ran the entire film and then threw
+at the final rename. On a 2-hour conversion that is three hours of work discarded at the last step. The
+test caught it immediately because it asserted on the second run, not the first. Fix: remove the
+destination before the move, when overwriting was asked for.
+
+**2. AVAssetWriter rounds 59.94 into 60.000.** The sink has always passed exact presentation times —
+`CMTime(value: index * 1001, timescale: 60000)` — but the container did not keep them. `AVAssetWriter`
+gives a video track a media timescale of **600** by default, and one frame of 60000/1001 is
+**1001/60000 s = 10.01 ticks** at 1/600. Rounded to 10, the file is 60.000 fps. Measured on the 12-frame
+render: `mdhd` 600, `stts` 28 × 10 ticks, 0.46667 s where the same 28 frames are 0.46713 s.
+
+`movieTimeScale` does **not** fix this — it sets `mvhd` only. The first attempt set it, and the file was
+still 60.000; the box dump showed `mvhd` 60000 and `mdhd` 600 side by side, which is what identified the
+right knob. It is `AVAssetWriterInput.mediaTimeScale`. After the fix: `mdhd` 60000, `stts` 28 × **1001**
+ticks, 0.467133 s — exact. **Invariant 28.**
+
+This also means `work/vt_hdr_test.mp4`, the file §17 used to prove the HDR chain end to end, is itself
+60.000 fps at 1/600. Its claims were about metadata and bit depth, both of which hold — but its *cadence*
+was never checked, and would not have held. Anything written before this fix needs re-rendering.
+
+**3. `nb_frames` is a JSON string, so the count check never ran.** `MediaProbe` read it as
+`stream["nb_frames"] as? Int`. ffprobe emits `"nb_frames": "28"` — a string, because the same field is
+also allowed to be `"N/A"`. The cast therefore returned `nil` for every file that *did* state a count, so
+`MediaInfo.frameCount` was always nil, and the converter's read-back check — the one that compares the
+container's frame count against what was written — passed **vacuously on every run it ever made**. A
+check that cannot fail is worse than no check, because it is believed. **Invariant 29.**
+
+**Tests: 124 in 15 suites → 136 in 16 suites**, and the three regressions are pinned by name: the
+overwrite path, `mediaTimeScale` (asserting the container reports `60000/1001`, via ffprobe), and
+`nb_frames` as a string.
 
 ---
 

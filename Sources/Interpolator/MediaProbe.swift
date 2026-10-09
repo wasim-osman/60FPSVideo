@@ -386,7 +386,15 @@ public enum MediaProbe {
         // estimate, so it is only offered when the container actually said so —
         // callers that need an exact count have to count, and a plausible-looking
         // guess would be worse than nil.
-        let frameCount = stream["nb_frames"] as? Int
+        //
+        // **ffprobe emits this as a string**, not a number: `"nb_frames": "28"`. It is
+        // a string because it is also allowed to be `"N/A"`. An `as? Int` cast therefore
+        // yields `nil` for every file that *does* state a count — which is worse than
+        // useless, because everything downstream that guards on the count then passes
+        // vacuously. Measured: the batch converter's read-back check never once compared
+        // a container's frame count against what was written. Both forms are accepted.
+        let frameCount = (stream["nb_frames"] as? Int)
+            ?? (stream["nb_frames"] as? String).flatMap(Int.init)
 
         return MediaInfo(
             url: url,

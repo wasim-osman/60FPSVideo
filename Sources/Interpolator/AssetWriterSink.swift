@@ -11,8 +11,9 @@ import Foundation
 /// valid file that players have to guess about (invariant 21).
 public struct VideoEncodeSettings: Sendable {
 
-    /// Target bit rate. This is the one field here that is a *guess* rather than a
-    /// measurement — see ``defaultBitRate(width:height:rate:)``.
+    /// Target bit rate. A *target*, not a delivery — on dark content the encoder writes
+    /// up to 28% fewer bits than it is asked for. See
+    /// ``defaultBitRate(width:height:rate:)`` for how the default was measured.
     public var bitRate: Int
     public var maxKeyFrameInterval: Int
     public var profileLevel: String?
@@ -73,13 +74,25 @@ public struct VideoEncodeSettings: Sendable {
 
     /// A bit rate for a given resolution and rate.
     ///
-    /// **This is a starting point, not a measurement.** Nothing in this project has
-    /// measured the rate at which HEVC loses visible detail on interpolated frames,
-    /// and interpolated frames are not the same problem as camera-captured ones — the
-    /// synthesised detail is lower in high-frequency content, so the usual
-    /// bits-per-pixel rules are pessimistic. The coefficient below is deliberately
-    /// generous for that reason, and it should be replaced with a measurement rather
-    /// than tuned by taste.
+    /// **Measured, not guessed** — BUILD-DECISIONS §20. The interpolated output of both
+    /// real clips was encoded at seven rates and compared frame by frame against the
+    /// *uncompressed* reference, so every error measured was the encode's alone. The
+    /// yardstick is the interpolation's own error against ground truth — **MAE 2.654**
+    /// in 8-bit code steps, `ENGINE-EQUIVALENCE.md` §3 — because a rate whose error sits
+    /// well under that is not what anyone can see.
+    ///
+    /// Taking "well under" as a quarter of it — **0.66** — the bright clip crosses
+    /// between 20 Mbps (0.695) and 25 Mbps (0.627), while the dark clip is already under
+    /// at 15 Mbps (0.512). The bright clip binds. `0.12` bpp puts 4K/59.94 at ~45 Mbps,
+    /// roughly **2× above its crossing**; 90 Mbps halves the error again for twice the
+    /// bits, and 20 Mbps misses by 5%.
+    ///
+    /// Two things this number is not. It is **not a sharp optimum**: the curve is smooth
+    /// and the threshold is a judgement, so anything from ~25 to 90 Mbps satisfies the
+    /// criterion — what the data does not support is anything below ~25. And it is **not
+    /// the delivered rate**: on dark content the encoder undershoots by up to 28% (a
+    /// 45 Mbps target wrote 32.2 Mbps), which is why ``BatchConverter/Result`` reports
+    /// the rate derived from the file's own size rather than the one asked for.
     public static func defaultBitRate(width: Int, height: Int, rate: FrameRate) -> Int {
         let bitsPerPixelPerFrame = 0.12
         let raw = Double(width * height) * rate.doubleValue * bitsPerPixelPerFrame
@@ -188,7 +201,7 @@ public struct VideoEncodeSettings: Sendable {
 /// to ``makeAdaptor(input:format:)``. They are deprecated, not removed, and the
 /// measurement in `vt_hdr_encode.swift` confirms they still carry HDR10 metadata
 /// byte-exact.
-public final class AssetWriterSink: FrameSink, @unchecked Sendable {
+public final class AssetWriterSink: FrameCountingSink, @unchecked Sendable {
 
     private let url: URL
     private let settings: VideoEncodeSettings
@@ -238,6 +251,11 @@ public final class AssetWriterSink: FrameSink, @unchecked Sendable {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
+        // The movie header's timescale. This is *not* what makes the frame durations
+        // exact — it only sets `mvhd`, and the track carries its own timescale. Set
+        // anyway, so the movie's duration is stated in the same units as the samples.
+        writer.movieTimeScale = CMTimeScale(geometry.outputRate.numerator)
+
         var compression = settings.compressionProperties
         compression[AVVideoExpectedSourceFrameRateKey] = geometry.outputRate.doubleValue
         var settingsDictionary: [String: Any] = [
@@ -254,6 +272,21 @@ public final class AssetWriterSink: FrameSink, @unchecked Sendable {
         // Offline: there is nothing to gain by racing the encoder, and letting it drop
         // frames would be silent data loss.
         input.expectsMediaDataInRealTime = false
+
+        // The track's own media timescale, and the one that decides whether a frame
+        // duration is *representable*. AVAssetWriter's default is **600**, at which
+        // 1001/60000 s is 10.01 ticks — so every duration is rounded to 10 and a 59.94
+        // request becomes a 60.000 file. Measured on a 12-source-frame render:
+        // `mdhd` 600, `stts` 28 x 10 ticks, 0.46667 s where the source's own 28 frames
+        // are 0.46713 s. Over a feature film that is a couple of seconds of drift, and
+        // it is invisible from the outside: every frame is present, every duration is
+        // uniform, `finishWriting` succeeds.
+        //
+        // `movieTimeScale` above does **not** fix this — it sets `mvhd` only, which is
+        // why the first attempt at this changed nothing. The rate's numerator is the
+        // timescale at which the frame duration is exactly one tick per frame
+        // denominator, which is the whole reason the rate is a rational and not 59.94.
+        input.mediaTimeScale = CMTimeScale(geometry.outputRate.numerator)
 
         let adaptor = makeAdaptor(input: input, format: format)
 
@@ -382,6 +415,11 @@ public final class AssetWriterSink: FrameSink, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return appendedCount
     }
+
+    /// `FrameCountingSink`: the same number as ``appended``, under the name the
+    /// converter's count check uses. They are one value deliberately — a second
+    /// counter would be a second thing to get wrong.
+    public var written: Int { appended }
 
     // MARK: - The reorder buffer
 

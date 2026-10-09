@@ -83,6 +83,21 @@ func parseOptions() -> Options {
     guard args.count >= 6 else {
         FileHandle.standardError.write("""
         usage: interp-harness IN W H SRC_RATE OUT_RATE OUT [options]
+
+        modes:
+          --convert IN OUT [options]
+                               the batch converter end to end: probe the file,
+                               interpolate it, encode it, report what was delivered.
+                               Options: --policy standard|sixty, --bitrate BPS,
+                               --max-frames N, --start SECONDS, --overwrite,
+                               --force (convert even when already at target).
+          --encode IN.packed OUT.mp4 W H [options]
+                               encode a packed stream without interpolating. Options:
+                               --format, --rate, --bitrate, --max-frames,
+                               --metadata-from FILE (colour tags and HDR10 payloads
+                               are taken from that file, through the shipping path).
+
+        options:
           --format nv12|p010   sample width of the packed input (default nv12)
           --scene-mode MODE    offline (whole clip up front, default) or online
                                (two-frame lookahead, as playback must). Both are
@@ -290,6 +305,265 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--decode" {
         log("decoded: \(written) frames  \(source.frameByteSize) B/frame  "
             + String(format: "%.2fs  %.1f frames/s", elapsed, Double(written) / elapsed))
         exit(0)
+    } catch {
+        fail("\(error)")
+    }
+}
+
+// ---------------------------------------------------------------- encode mode
+//
+// `interp-harness --encode IN.packed OUT.mp4 W H [options]` runs packed frames
+// through the shipping `AssetWriterSink` — the same sink the batch converter uses —
+// so the encode can be measured with no pipeline in the way.
+//
+// It exists for the bit-rate experiment in BUILD-DECISIONS §20. The question is not
+// "how good is the output", it is "at what rate does the encode stop being the thing
+// you can see", and that can only be answered by encoding *the same frames* at
+// several rates and comparing each against the uncompressed originals. Comparing
+// against the original disc would confound the encode's error with the
+// interpolation's, which is already measured separately in REAL-CONTENT-AB.md.
+
+if CommandLine.arguments.count >= 6, CommandLine.arguments[1] == "--encode" {
+    let inputPath = CommandLine.arguments[2]
+    let outputPath = CommandLine.arguments[3]
+    guard let width = Int(CommandLine.arguments[4]),
+          let height = Int(CommandLine.arguments[5]) else {
+        fail("usage: interp-harness --encode IN.packed OUT.mp4 W H [options]")
+    }
+    var format = FrameFormat.nv12
+    var rate = FrameRate.sixtyNTSC
+    var bitRate = 0
+    var limit: Int? = nil
+    var metadataFrom: String? = nil
+    let rest = Array(CommandLine.arguments.dropFirst(6))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--format":
+            k += 1
+            guard k < rest.count else { fail("--format needs a value") }
+            switch rest[k] {
+            case "nv12": format = .nv12
+            case "p010": format = .p010
+            default: fail("unknown format '\(rest[k])' — expected nv12 or p010")
+            }
+        case "--rate":
+            k += 1
+            guard k < rest.count, let parsed = FrameRate.parse(rest[k]) else {
+                fail("--rate needs a frame rate")
+            }
+            rate = parsed
+        case "--bitrate":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]) else {
+                fail("--bitrate needs a number of bits per second")
+            }
+            bitRate = value
+        case "--max-frames":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]) else {
+                fail("--max-frames needs a number")
+            }
+            limit = value
+        case "--metadata-from":
+            k += 1
+            guard k < rest.count else { fail("--metadata-from needs a path") }
+            metadataFrom = rest[k]
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+    // Required rather than defaulted: this mode exists to measure the number, so
+    // silently substituting a default would defeat it.
+    guard bitRate > 0 else { fail("--bitrate is required") }
+
+    let frameSize = format.packedByteSize(width: width, height: height)
+    let descriptor = open(inputPath, O_RDONLY)
+    guard descriptor >= 0 else { fail("cannot open \(inputPath)") }
+    var frames = Int(lseek(descriptor, 0, SEEK_END)) / frameSize
+    if let limit { frames = min(frames, limit) }
+    guard frames > 0 else { fail("\(inputPath) holds no whole frames") }
+
+    // Colour tags and HDR10 metadata come from the file the frames were interpolated
+    // from, through the same `forSource` the batch converter will use — so this
+    // exercises the shipping metadata path rather than a copy of it.
+    var settings: VideoEncodeSettings
+    if let metadataFrom {
+        do {
+            let info = try MediaProbe.probe(URL(fileURLWithPath: metadataFrom))
+            settings = VideoEncodeSettings.forSource(info, bitRate: bitRate)
+            log("metadata: from \(URL(fileURLWithPath: metadataFrom).lastPathComponent)"
+                + "   colour \(info.colorPrimaries ?? "-")/\(info.transferFunction ?? "-")"
+                + "   HDR10 \(info.masteringDisplay != nil ? "yes" : "no")")
+        } catch {
+            fail("could not probe \(metadataFrom): \(error)")
+        }
+    } else {
+        settings = VideoEncodeSettings(bitRate: bitRate)
+        log("metadata: none (no --metadata-from)")
+    }
+    log(String(format: "target  : %.1f Mbps  %d frames  %dx%d  %@",
+               Double(bitRate) / 1_000_000, frames, width, height, "\(format.bitDepth)-bit"))
+
+    do {
+        let pool = try PixelBufferPool(width: width, height: height, format: format,
+                                       capacity: 4)
+        let sink = AssetWriterSink(url: URL(fileURLWithPath: outputPath), settings: settings)
+        try sink.begin(SinkGeometry(width: width, height: height, format: format,
+                                    sourceRate: rate, outputRate: rate,
+                                    sourceFrameCount: frames, outputFrameCount: frames))
+        var staging = [UInt8](repeating: 0, count: frameSize)
+        let began = DispatchTime.now().uptimeNanoseconds
+        for index in 0..<frames {
+            let got = staging.withUnsafeMutableBytes {
+                pread(descriptor, $0.baseAddress, frameSize, off_t(index * frameSize))
+            }
+            guard got == frameSize else {
+                fail("short read at frame \(index): \(got) of \(frameSize)")
+            }
+            let buffer = try pool.makeBuffer()
+            staging.withUnsafeBytes {
+                format.load(packed: $0.baseAddress!, into: buffer,
+                            width: width, height: height)
+            }
+            // One pool buffer reused for every frame, which is only safe because
+            // `write` copies before it returns — the same property the batch
+            // converter depends on when the pipeline reuses its slots.
+            sink.write(buffer, at: index)
+        }
+        try sink.finish()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - began) / 1e9
+        close(descriptor)
+
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: outputPath)[.size]
+                     as? Int) ?? 0
+        let megabytes = Double(bytes) / 1_000_000
+        log(String(format: "encoded : %d/%d frames -> %.1f MB  %.2fs  "
+                   + "(%.1f Mbps written, %.1f%% of target)",
+                   sink.appended, frames, megabytes, elapsed,
+                   Double(bytes * 8) / elapsed / 1_000_000,
+                   Double(bytes * 8) / elapsed / Double(bitRate) * 100))
+        if !sink.problems.isEmpty {
+            for problem in sink.problems.prefix(5) { log("  problem: " + problem) }
+            exit(1)
+        }
+        exit(0)
+    } catch {
+        fail("\(error)")
+    }
+}
+
+// ---------------------------------------------------------------- convert
+
+// The batch converter, end to end, on a real file. Everything here is assembly —
+// probe, interpolate, encode, report what was actually delivered — and the point of
+// running it from the harness is that it exercises the shipping path rather than a
+// copy of it. The rate decision in particular is the same `OutputRatePolicy` the
+// player will use, so a film converted here and played back there land their
+// passthrough frames in the same places.
+if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
+    let inputPath = CommandLine.arguments[2]
+    let outputPath = CommandLine.arguments[3]
+
+    var policy = OutputRatePolicy.default
+    var bitRate: Int? = nil
+    var limit: Int? = nil
+    var start: Double? = nil
+    var overwrite = false
+    var force = false
+
+    let rest = Array(CommandLine.arguments.dropFirst(4))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--policy":
+            k += 1
+            guard k < rest.count, let named = OutputRatePolicy.named(rest[k]) else {
+                fail("--policy needs standard or sixty")
+            }
+            policy = named
+        case "--bitrate":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]) else {
+                fail("--bitrate needs a number of bits per second")
+            }
+            bitRate = value
+        case "--max-frames":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]) else {
+                fail("--max-frames needs a number")
+            }
+            limit = value
+        case "--start":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else {
+                fail("--start needs a number of seconds")
+            }
+            start = value
+        case "--overwrite":
+            overwrite = true
+        case "--force":
+            force = true
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+
+    let request = BatchConverter.Request(
+        input: URL(fileURLWithPath: inputPath),
+        output: URL(fileURLWithPath: outputPath),
+        policy: policy,
+        bitRate: bitRate,
+        maximumSourceFrames: limit,
+        startSeconds: start,
+        overwrite: overwrite,
+        convertWhenAlreadyAtTarget: force)
+
+    log("input  : \(inputPath)")
+    log("output : \(outputPath)")
+
+    do {
+        let result = try BatchConverter().run(request)
+        let info = result.source
+        log("probe  : \(info.width)x\(info.height)  \(info.frameRate)  "
+            + "\(info.pixelFormat) -> \(info.format.bitDepth)-bit  "
+            + "HDR \(info.isHDR ? "yes" : "no")")
+        log("rate   : policy \(policy.label) -> \(result.resolution.output)"
+            + "   ratio \(result.resolution.ratio.numerator)"
+            + "/\(result.resolution.ratio.denominator)"
+            + (result.resolution.isPassthrough ? "   (already at target)" : ""))
+        if let note = result.resolution.note { log("note   : \(note)") }
+        log("frames : \(result.report.sourceFrames) source -> "
+            + "\(result.outputFrames) output   "
+            + "(\(result.report.interpolatedFrames) interpolated, "
+            + "\(result.report.passthroughFrames) passthrough, "
+            + String(format: "%.1f%% free)", result.passthroughFraction * 100))
+        log("cuts   : \(result.cutCount) detected across "
+            + "\(result.report.decisions.count) intervals, "
+            + "\(result.report.engineCalls) engine calls")
+        log(String(format: "encode : %.1f MB   %.1f Mbps delivered   %.4f bpp   "
+                   + "%.1f s of video",
+                   Double(result.bytes) / 1e6, result.megabitsPerSecond,
+                   result.bitsPerPixelPerFrame, result.outputSeconds))
+        // Cost per source frame is the number that projects. 2 h at 23.976 is 172 627
+        // source frames; at 4K it is the difference between an evening and a night.
+        let throughput = result.wallSeconds > 0
+            ? Double(result.report.sourceFrames) / result.wallSeconds : 0
+        log(String(format: "time   : %.1fs wall   %.1f source frames/s   "
+                   + "-> %.1f h for a 2 h film",
+                   result.wallSeconds, throughput,
+                   172_627 / max(throughput, 0.0001) / 3600))
+        if !result.isClean {
+            for problem in result.problems.prefix(10) { log("  problem: " + problem) }
+            log("RESULT : \(result.problems.count) problem(s)")
+            exit(1)
+        }
+        log("RESULT : clean")
+        exit(0)
+    } catch let failure as BatchConverter.Failure {
+        fail(failure.description)
     } catch {
         fail("\(error)")
     }

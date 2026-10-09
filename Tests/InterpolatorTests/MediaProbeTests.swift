@@ -165,6 +165,37 @@ struct MediaProbeTests {
         }
     }
 
+    @Test("a frame count is read from the string ffprobe actually emits")
+    func frameCountIsAString() throws {
+        // ffprobe writes `"nb_frames": "28"` — a *string*, because the same field is
+        // also allowed to be `"N/A"`. Casting it to `Int` therefore yields nil for
+        // every file that does state a count, and every check downstream that guards on
+        // the count passes vacuously instead of failing. The batch converter's
+        // read-back check was dead for exactly this reason, and nothing noticed.
+        let json = """
+        {"streams":[{"width":3840,"height":1632,"pix_fmt":"yuv420p10le",
+          "r_frame_rate":"60000/1001","nb_frames":"28"}]}
+        """.data(using: .utf8)!
+        let info = try MediaProbe.parse(json, url: URL(fileURLWithPath: "/tmp/x.mp4"))
+        #expect(info.frameCount == 28)
+
+        // "N/A" means not known — never a number, and never zero.
+        let absent = """
+        {"streams":[{"width":3840,"height":1632,"pix_fmt":"yuv420p10le",
+          "r_frame_rate":"60000/1001","nb_frames":"N/A"}]}
+        """.data(using: .utf8)!
+        #expect(try MediaProbe.parse(absent,
+                                     url: URL(fileURLWithPath: "/tmp/x.mkv")).frameCount == nil)
+
+        // A Matroska file does not state one at all.
+        let silent = """
+        {"streams":[{"width":3840,"height":1632,"pix_fmt":"yuv420p10le",
+          "r_frame_rate":"24000/1001"}]}
+        """.data(using: .utf8)!
+        #expect(try MediaProbe.parse(silent,
+                                     url: URL(fileURLWithPath: "/tmp/x.mkv")).frameCount == nil)
+    }
+
     @Test("audio that cannot go into MP4 is called out")
     func audioPassthrough() {
         // The reference disc carries DTS-X 7.1, which MP4 cannot hold. Silently
