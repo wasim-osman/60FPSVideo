@@ -510,6 +510,21 @@ public struct BatchConverter: Sendable {
         return Int((info.duration * info.frameRate.doubleValue).rounded(.up)) + 1
     }
 
+    /// Where to seek so that the first frame out is source frame `index`.
+    ///
+    /// `-ss` discards frames until the requested instant, so the first frame out is the
+    /// first one at or **after** the seek. Frame `n` presents at `n / rate`, so the
+    /// instant has to sit in `(PTS(n-1), PTS(n)]` — and the middle of that interval is
+    /// `(n - 0.5) / rate`.
+    ///
+    /// Aiming at `(n + 0.5) / rate` instead — the natural reading of "aim at the middle
+    /// of the frame" — returns `n + 1` and shifts every segment by one source frame.
+    /// Measured on the real film: a seek to frame 100.5 produced frame 101.
+    static func seekSeconds(forFrame index: Int, rate: FrameRate, base: Double = 0) -> Double {
+        let offset = Double(index) - 0.5
+        return offset > 0 ? base + offset / rate.doubleValue : base
+    }
+
     static func segmentPlan(request: Request,
                             info: MediaInfo,
                             resolution: OutputRatePolicy.Resolution,
@@ -713,11 +728,24 @@ public struct BatchConverter: Sendable {
         let settings = VideoEncodeSettings.forSource(info, bitRate: request.bitRate)
         let sink = try makeSink(file, settings)
 
-        // Half a frame into the frame's own presentation, so a seek that lands a hair
-        // early still lands on this frame rather than the one before it.
-        let base = request.startSeconds ?? 0
-        let seek = base + (Double(segment.readStart) + 0.5) / info.frameRate.doubleValue
-        let source = try makeSource(request.input, info, seek, segment.readCount)
+        // Half a frame *before* the frame's own presentation, not after it.
+        //
+        // `-ss` discards frames until the requested instant, so the first frame out is
+        // the first one at or **after** the seek. The frame at index `n` presents at
+        // `n / rate`, so asking for `(n - 0.5) / rate` lands on `n` and nowhere else:
+        // the previous frame presents strictly earlier and is discarded. Asking for
+        // `(n + 0.5) / rate` — the obvious way to "aim at the middle of the frame" —
+        // lands on `n + 1` and shifts the whole segment by one source frame.
+        //
+        // Measured on the real film: a seek to frame 100.5 produced frame 101. On a
+        // static opening the shift is invisible, which is why it was not obvious; by
+        // two minutes in the passthrough frames were 37 mean-absolute-difference away
+        // from the source frames they name.
+        let source = try makeSource(request.input, info,
+                                    Self.seekSeconds(forFrame: segment.readStart,
+                                                     rate: info.frameRate,
+                                                     base: request.startSeconds ?? 0),
+                                    segment.readCount)
         let engine = try makeEngine(info.frameRate, resolution.output, request.depth)
 
         let pipeline = InterpolationPipeline(

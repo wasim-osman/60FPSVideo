@@ -108,8 +108,13 @@ public struct SegmentJoiner: Sendable {
             throw SegmentJoinError.ffmpegMissing
         }
 
-        // The list lives beside the segments so ffmpeg's relative resolution finds them.
-        let list = output.deletingLastPathComponent().appendingPathComponent("concat.txt")
+        // The list lives beside the segments it names, not beside the output, because
+        // ffmpeg resolves the names in it against the list's own directory. The two are
+        // different places: the segments are in the job directory and the joined file is
+        // a sibling of the output. Getting this wrong does not fail the join — it fails
+        // to *find* the first segment, which is the same thing from further away.
+        let list = files[0].deletingLastPathComponent()
+            .appendingPathComponent("concat.txt")
         try listContents(files: files.map(\.lastPathComponent))
             .write(to: list, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: list) }

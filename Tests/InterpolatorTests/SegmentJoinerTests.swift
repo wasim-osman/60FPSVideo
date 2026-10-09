@@ -209,6 +209,53 @@ struct SegmentJoinerTests {
         #expect(!FileManager.default.fileExists(atPath: listPath.path))
     }
 
+    /// The list has to be written where the segments are, not where the output is.
+    ///
+    /// ffmpeg resolves the names in the list against the list's own directory, and the two
+    /// are different places in a real job: the segments live in `<output>.segments/` and the
+    /// joined file is a sibling of the output. Writing the list beside the output produces a
+    /// file that names the right segments and cannot open any of them — which no test can
+    /// catch while ffmpeg is stubbed, and which is why this one reads the list back and
+    /// checks it sits next to files that exist.
+    @Test("the list is written beside the segments, not beside the output")
+    func listIsWrittenBesideTheSegments() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let segments = directory.appendingPathComponent("job.segments", isDirectory: true)
+        try FileManager.default.createDirectory(at: segments, withIntermediateDirectories: true)
+        // The joined file goes somewhere else entirely, as it does in a real run.
+        let elsewhere = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: elsewhere) }
+        let output = elsewhere.appendingPathComponent("joined.mp4")
+
+        for name in ["000.mp4", "001.mp4"] {
+            FileManager.default.createFile(
+                atPath: segments.appendingPathComponent(name).path, contents: Data([1, 2, 3]))
+        }
+
+        let saw = Recorder<String>("")
+        let joiner = stubbedJoiner(probe: { _ in (frames: 20, rate: "60000/1001") },
+                                   onRun: { arguments in
+            // Read the list while ffmpeg "runs"; it is deleted afterwards.
+            if let index = arguments.firstIndex(of: "-i"), index + 1 < arguments.count {
+                saw.value = arguments[index + 1]
+            }
+        })
+        try joiner.join(files: [segments.appendingPathComponent("000.mp4"),
+                                segments.appendingPathComponent("001.mp4")],
+                        output: output, expectedFrames: 20,
+                        expectedRate: rate("60000/1001"))
+
+        let list = saw.value
+        #expect(!list.isEmpty, "the list path has to be passed to ffmpeg")
+        // In the segments' directory, so the names in it resolve.
+        #expect(list.hasPrefix(segments.path), "\(list) is not beside \(segments.path)")
+        #expect(FileManager.default.fileExists(
+            atPath: segments.appendingPathComponent("000.mp4").path))
+        // And gone afterwards.
+        #expect(!FileManager.default.fileExists(atPath: list))
+    }
+
     @Test("the join says what it produced")
     func cleanJoinReports() throws {
         let directory = try makeDirectory()

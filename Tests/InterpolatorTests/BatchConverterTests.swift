@@ -783,9 +783,13 @@ struct BatchConverterTests {
         BatchConverter(
             probe: { url in url == input ? info : info.statingFrameCount(outputFrameCount) },
             makeSource: { _, media, start, limit in
-                // The seek is half a frame into the frame, so flooring recovers it.
+                // ffmpeg's `-ss` returns the first frame **at or after** the instant, so
+                // the frame a seek lands on is the ceiling, not the floor. Modelling this
+                // the other way round is what let a half-frame error in the seek hide
+                // from every test in this file while shifting every segment of a real
+                // film by one source frame.
                 let offset = start.map {
-                    Int(($0 * media.frameRate.doubleValue).rounded(.down))
+                    Int(($0 * media.frameRate.doubleValue).rounded(.up))
                 } ?? 0
                 return SyntheticFrameSource(width: media.width, height: media.height,
                                             format: media.format,
@@ -936,6 +940,33 @@ struct BatchConverterTests {
                        overwrite: true, segmentSeconds: 1.0, keepSegments: true))
         #expect(FileManager.default.fileExists(atPath: directory2.path))
         #expect(kept.segments?.isComplete == true)
+    }
+
+    /// The seek has to land on the frame it names, and the only way to know that is to
+    /// know what `-ss` does: it returns the first frame at or after the instant.
+    ///
+    /// This is the bug that shifted every segment of a real film by one source frame
+    /// while every test in this file passed. It was invisible on the static opening and
+    /// thirty-odd mean-absolute-difference by two minutes in, and it was found by
+    /// comparing passthrough frames against the source frames the plan names — not by
+    /// any count.
+    @Test("a seek lands on the frame it names, not the one after it")
+    func seekLandsOnTheFrameItNames() throws {
+        let rate = FrameRate.twentyFourNTSC
+        for index in 0..<200 {
+            let seconds = BatchConverter.seekSeconds(forFrame: index, rate: rate)
+            // What ffmpeg does with it: the first frame at or after the instant.
+            let landed = Int((seconds * rate.doubleValue).rounded(.up))
+            #expect(landed == index,
+                    "a seek for frame \(index) at \(seconds) s lands on \(landed)")
+        }
+        // And it is inside the frame's own window, not on either edge, so a rounding
+        // difference of a microsecond cannot move it.
+        let seconds = BatchConverter.seekSeconds(forFrame: 100, rate: rate)
+        #expect(seconds > 99.0 / rate.doubleValue)
+        #expect(seconds < 100.0 / rate.doubleValue)
+        // A base offset is added, not replaced.
+        #expect(BatchConverter.seekSeconds(forFrame: 0, rate: rate, base: 12.5) == 12.5)
     }
 
     @Test("a source that does not state its frame count is still planned")

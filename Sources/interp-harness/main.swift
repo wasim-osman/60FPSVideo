@@ -633,6 +633,9 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     var overwrite = false
     var force = false
     var audioPolicy: AudioMuxPolicy? = nil
+    var segmentSeconds: Double? = nil
+    var restart = false
+    var keepSegments = false
 
     let rest = Array(CommandLine.arguments.dropFirst(4))
     var k = 0
@@ -680,6 +683,16 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
             overwrite = true
         case "--force":
             force = true
+        case "--segment-seconds":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]), value > 0 else {
+                fail("--segment-seconds needs a positive number of seconds")
+            }
+            segmentSeconds = value
+        case "--restart":
+            restart = true
+        case "--keep-segments":
+            keepSegments = true
         default:
             fail("unknown option '\(rest[k])'")
         }
@@ -695,7 +708,10 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
         startSeconds: start,
         overwrite: overwrite,
         convertWhenAlreadyAtTarget: force,
-        audio: audioPolicy)
+        audio: audioPolicy,
+        segmentSeconds: segmentSeconds,
+        restart: restart,
+        keepSegments: keepSegments)
 
     log("input  : \(inputPath)")
     log("output : \(outputPath)")
@@ -711,6 +727,21 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
             + "/\(result.resolution.ratio.denominator)"
             + (result.resolution.isPassthrough ? "   (already at target)" : ""))
         if let note = result.resolution.note { log("note   : \(note)") }
+        // Printed before the frame counts, because on a resumed job those counts
+        // describe only the work that was done *this* run and reading them as the
+        // film's would make a finished job look like a one-segment render.
+        if let segments = result.segments {
+            log("pieces : \(segments.summary)")
+            log("         \(segments.plan.phasePeriod)-interval phase period, "
+                + "\(segments.plan.intervalsPerSegment) intervals per piece, "
+                + "\(segments.plan.leadIn)/\(segments.plan.leadOut) lead-in/out")
+            if !segments.resumed.isEmpty {
+                log("         resumed \(segments.resumed.count)")
+            }
+            if let joined = segments.joined {
+                log("         \(joined.summary)")
+            }
+        }
         log("frames : \(result.report.sourceFrames) source -> "
             + "\(result.outputFrames) output   "
             + "(\(result.report.interpolatedFrames) interpolated, "
