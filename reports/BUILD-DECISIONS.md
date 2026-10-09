@@ -601,6 +601,14 @@ These are not choices. Each one is a measured failure mode, and violating any of
     because it converts a real failure into a green tick. Where the behaviour can be pinned down, it
     belongs in a named function the test can call — `seekSeconds(forFrame:rate:base:)` is now tested
     over 200 indices.
+36. **A player must not start its clock before there is something to show.** Pressing play started the
+    film's clock immediately, and on the real 4K film the decoder opening the file, the engine preparing
+    a session and the buffer pool being created take **1.3 s**. Because the clock *is* the film's own
+    time, that was not a gap that closes — the first frame carried film time **1.28 s** and everything
+    after it stayed that far behind the sound for the whole run. A play request has to be a *request*,
+    honoured by the presenter when the first frame exists. After the fix the first frame carries film
+    time **0.00 s**. The same applies to a seek: a new position means a new decoder, and resuming through
+    the same gate costs nothing and starts the clock into a gap otherwise.
 
 ---
 
@@ -1605,6 +1613,81 @@ Also found by a test rather than a run: the job directory was created by the fir
 which happens *after* the first segment renders, so that segment's file was opened into a
 directory that did not exist and the sink placed nothing. It surfaced as "the pipeline produced 60
 frames but the sink placed 0" — the count check doing its job one layer up from the mistake.
+
+---
+
+## 24. The player — built, and what 4K playback actually costs
+
+The playback layer is five pieces, and the split is deliberate: the three that decide things
+have no window, no GPU and no `AVSampleBufferDisplayLayer` in them, so they are tested exactly
+rather than approximately.
+
+| Piece | What it decides |
+| --- | --- |
+| `PlaybackClock` | media time, recomputed from anchors rather than accumulated |
+| `PlaybackPacer` | which finished frames to drop, and which intervals not to compute |
+| `PlaybackBuffer` | the bounded handoff, blocking at both ends |
+| `DisplayFrameSink` | copy out of the engine's buffers (invariant 25), queue |
+| `DisplayPresenter` | wrap as timed samples, pace against the clock |
+
+### The clock is the only clock
+
+`AVSampleBufferDisplayLayer` can be given a `CMTimebase` and left to schedule, which is what
+AVPlayer does. That means two clocks that have to agree — the timebase for the picture and the
+media clock for everything else — kept in step through play, pause, rate changes and seeks. A
+presenter whose only job is waiting for the right moment does not need the second clock, so
+there is one, and it is the one the rest of the app can read.
+
+### Two ways to throw a frame away, and they are different
+
+The **presenter** drops finished frames whose moment has passed *and* for which something
+newer is already queued. The guard is the second half: without it a machine that cannot keep
+up drops everything and shows nothing, which is a black screen rather than a stutter.
+
+The **pipeline** refuses to compute intervals the film has already finished playing. It has
+to, because computing them is the bottleneck — 104.7 ms per interval at 4K against the 41.7 ms
+the film spends on one — and a player that rendered them all would cover 0.4 s of film per
+second while the sound covered 1.0. This is the "accept the drops" decision made concrete.
+
+### Measured on the real 4K HDR film
+
+40 seconds, 23.976 → 59.94, 3840×1632, 10-bit:
+
+```
+  t=   5.0 s | picture   4.84 s | shown   88 | lag   180 ms
+  t=  10.0 s | picture   9.74 s | shown  183 | lag   261 ms
+  t=  15.0 s | picture  14.93 s | shown  279 | lag    74 ms
+  t=  20.0 s | picture  19.94 s | shown  373 | lag    84 ms
+  t=  25.0 s | picture  24.86 s | shown  469 | lag   163 ms
+  t=  30.0 s | picture  29.95 s | shown  567 | lag    90 ms
+  t=  35.0 s | picture  34.87 s | shown  664 | lag   133 ms
+  t=  40.0 s | picture  39.87 s | shown  758 | lag   148 ms
+
+clock  : 40.02 s of film in 40.88 s wall  -> 0.98x
+picture: 39.87 s covered by 758 frames -> 18.5 fps presented
+skipped: 450 of 960 intervals
+[PASS] the picture advanced 0.996x the clock's rate
+```
+
+**The lag oscillates and does not grow.** That is the whole finding. It swings between ~75 ms
+and ~260 ms because the renderer produces frames in bursts and the last frame handed over is
+whatever the burst ended with — but over forty seconds the picture advances at **0.996×** the
+clock. A constant latency is a player working at its limit; a rate below 1 is a player that
+will be seconds out of sync by the end of a reel. One subtraction apart, and a single
+end-of-run number cannot tell them apart, which is why the harness traces instead of
+reporting.
+
+So the cost of 4K playback on this machine, measured rather than estimated: **half the
+intervals skipped, ~19 fps presented, and a fifth of a second of picture behind the clock,
+permanently and without growth.**
+
+**Invariant 36 — a clock must not start before there is something to show.** The first run
+started the film's clock the moment play was pressed, and the decoder opening the file, the
+engine preparing a session and the buffer pool being created take **1.3 s** on the real 4K
+film. Because the clock *is* the film's own time, that was not a gap that closes: the first
+frame carried film time 1.28 s and everything after it was that far behind the sound for the
+rest of the run. A play request is now a request, honoured by the presenter when the first
+frame exists. First sample after the fix: **0.00 s**.
 
 ---
 
