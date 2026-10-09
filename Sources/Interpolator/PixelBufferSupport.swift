@@ -233,6 +233,75 @@ public final class PixelBufferPool {
     }
 }
 
+/// Plane-wise copies between two pixel buffers.
+///
+/// Two sinks now need this and they need it for the same reason: both hand the buffer to
+/// something that reads it **asynchronously** — an `AVAssetWriterInput` and an
+/// `AVSampleBufferDisplayLayer` — and the pipeline releases a slot's buffers as soon as the
+/// completion returns (invariant 25). So a sink that keeps the buffer it was given is
+/// reading memory the pipeline is entitled to overwrite, and the damage is not noise: a slow
+/// shot comes out almost right and a fast one badly wrong.
+///
+/// One implementation rather than two, because the interesting part is not the `memcpy` — it
+/// is the strides.
+public enum PixelBufferCopy {
+
+    /// Copy every plane, honouring each buffer's own row stride.
+    ///
+    /// The strides are read from the buffers rather than assumed: `CVPixelBufferPool` pads
+    /// rows, and for 4K the padded stride is routinely larger than the visible width.
+    /// Assuming `width * bytesPerSample` here would shear the picture.
+    public static func planes(from source: CVPixelBuffer, into destination: CVPixelBuffer) {
+        let sourcePlanes = CVPixelBufferGetPlaneCount(source)
+        let destinationPlanes = CVPixelBufferGetPlaneCount(destination)
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(destination, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+
+        guard sourcePlanes > 0 else {
+            // Non-planar: one buffer, one stride.
+            guard let src = CVPixelBufferGetBaseAddress(source),
+                  let dst = CVPixelBufferGetBaseAddress(destination) else { return }
+            rows(from: src, srcStride: CVPixelBufferGetBytesPerRow(source),
+                 to: dst, dstStride: CVPixelBufferGetBytesPerRow(destination),
+                 count: CVPixelBufferGetHeight(source))
+            return
+        }
+
+        for plane in 0..<min(sourcePlanes, destinationPlanes) {
+            guard let src = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                  let dst = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else {
+                continue
+            }
+            rows(from: src,
+                 srcStride: CVPixelBufferGetBytesPerRowOfPlane(source, plane),
+                 to: dst,
+                 dstStride: CVPixelBufferGetBytesPerRowOfPlane(destination, plane),
+                 count: CVPixelBufferGetHeightOfPlane(source, plane))
+        }
+    }
+
+    private static func rows(from source: UnsafeMutableRawPointer, srcStride: Int,
+                             to destination: UnsafeMutableRawPointer, dstStride: Int,
+                             count: Int) {
+        if srcStride == dstStride {
+            memcpy(destination, source, count * srcStride)
+            return
+        }
+        // Different padding: copy the visible width row by row and leave the destination's
+        // padding alone. Copying the full stride would run past the end of the shorter
+        // allocation.
+        let bytes = min(srcStride, dstStride)
+        for row in 0..<count {
+            memcpy(destination + row * dstStride, source + row * srcStride, bytes)
+        }
+    }
+}
+
 public enum InterpolatorError: Error, CustomStringConvertible {
     case poolCreationFailed(OSStatus)
     case bufferAllocationFailed(OSStatus)

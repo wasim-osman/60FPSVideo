@@ -119,17 +119,42 @@ public final class InterpolationPipeline {
         public var expectedOutputFrameCount: Int?
         /// The part of the film this run renders. `nil` for the whole source.
         public var window: Window?
+        /// Which intervals this run renders, by the film's own interval number.
+        ///
+        /// `nil` renders every interval in the window, which is what batch conversion wants
+        /// and what every test up to now has assumed.
+        ///
+        /// ## Why playback needs it
+        ///
+        /// A player cannot render every interval and stay with its clock. Interpolation at
+        /// 4K measures **104.7 ms per interval** against the 41.7 ms the film spends on one
+        /// at 23.976 — it runs at about **0.4× real time**. A player that rendered every
+        /// interval would advance through the film at 0.4 s per second, and no amount of
+        /// queueing fixes a deficit that is per-frame rather than transient: the picture
+        /// would fall further behind the sound with every second of film.
+        ///
+        /// So the player renders a **subset** — the intervals whose output is still ahead of
+        /// the clock — and the film advances at its own rate. The motion judders, which is
+        /// the recorded trade ("keep true 4K, accept the drops"), and the film stays in sync,
+        /// which is the part that matters.
+        ///
+        /// This is a filter rather than a stride because *which* intervals to keep is not
+        /// arithmetic: it depends on where the clock is, which changes as the run proceeds.
+        /// The closure is called once per interval, on the driving thread, in order.
+        public var rendersInterval: (@Sendable (Int) -> Bool)?
 
         public init(depth: Int = 2,
                     sceneDetection: Bool = true,
                     maximumSourceFrames: Int? = nil,
                     expectedOutputFrameCount: Int? = nil,
-                    window: Window? = nil) {
+                    window: Window? = nil,
+                    rendersInterval: (@Sendable (Int) -> Bool)? = nil) {
             self.depth = depth
             self.sceneDetection = sceneDetection
             self.maximumSourceFrames = maximumSourceFrames
             self.expectedOutputFrameCount = expectedOutputFrameCount
             self.window = window
+            self.rendersInterval = rendersInterval
         }
     }
 
@@ -361,7 +386,13 @@ public final class InterpolationPipeline {
                     ? CutResolution.resolve(planned, isCut: isCut)
                     : planned
 
-                if !resolved.isEmpty {
+                // Playback's skip. The interval is read and judged either way — only the
+                // work is skipped — so the tracker's history is the same whether or not the
+                // interval is rendered, and a cut decision does not depend on what the clock
+                // happened to be doing when it was made.
+                let wanted = configuration.rendersInterval?(globalInterval) ?? true
+
+                if wanted, !resolved.isEmpty {
                     let slotIndex = submitted % engine.depth
                     // Invariant 17: acquired before the load, released in the completion.
                     slotFree[slotIndex].wait()

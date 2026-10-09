@@ -473,64 +473,8 @@ public final class AssetWriterSink: FrameCountingSink, @unchecked Sendable {
             throw InterpolatorError.writerFailed("the sink was not started")
         }
         let destination = try pool.makeBuffer()
-        AssetWriterSink.copyPlanes(from: source, into: destination)
+        PixelBufferCopy.planes(from: source, into: destination)
         return destination
-    }
-
-    /// Plane-wise copy honouring each buffer's own row stride.
-    ///
-    /// The strides are read from the buffers rather than assumed: `CVPixelBufferPool`
-    /// pads rows, and for 4K the padded stride is routinely larger than the visible
-    /// width. Assuming `width * bytesPerSample` here would shear the picture.
-    static func copyPlanes(from source: CVPixelBuffer, into destination: CVPixelBuffer) {
-        let sourcePlanes = CVPixelBufferGetPlaneCount(source)
-        let destinationPlanes = CVPixelBufferGetPlaneCount(destination)
-
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        CVPixelBufferLockBaseAddress(destination, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(destination, [])
-            CVPixelBufferUnlockBaseAddress(source, .readOnly)
-        }
-
-        guard sourcePlanes > 0 else {
-            // Non-planar: one buffer, one stride.
-            guard let src = CVPixelBufferGetBaseAddress(source),
-                  let dst = CVPixelBufferGetBaseAddress(destination) else { return }
-            let srcStride = CVPixelBufferGetBytesPerRow(source)
-            let dstStride = CVPixelBufferGetBytesPerRow(destination)
-            let rows = CVPixelBufferGetHeight(source)
-            copyRows(from: src, srcStride: srcStride, to: dst, dstStride: dstStride, rows: rows)
-            return
-        }
-
-        for plane in 0..<min(sourcePlanes, destinationPlanes) {
-            guard let src = CVPixelBufferGetBaseAddressOfPlane(source, plane),
-                  let dst = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else {
-                continue
-            }
-            copyRows(from: src,
-                     srcStride: CVPixelBufferGetBytesPerRowOfPlane(source, plane),
-                     to: dst,
-                     dstStride: CVPixelBufferGetBytesPerRowOfPlane(destination, plane),
-                     rows: CVPixelBufferGetHeightOfPlane(source, plane))
-        }
-    }
-
-    private static func copyRows(from source: UnsafeMutableRawPointer, srcStride: Int,
-                                 to destination: UnsafeMutableRawPointer, dstStride: Int,
-                                 rows: Int) {
-        if srcStride == dstStride {
-            memcpy(destination, source, rows * srcStride)
-            return
-        }
-        // Different padding: copy the visible width row by row and leave the
-        // destination's padding alone. Copying the full stride would run past the end
-        // of the shorter allocation.
-        let bytes = min(srcStride, dstStride)
-        for row in 0..<rows {
-            memcpy(destination + row * dstStride, source + row * srcStride, bytes)
-        }
     }
 
     private func record(_ problem: String) {

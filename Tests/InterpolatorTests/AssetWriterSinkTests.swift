@@ -259,7 +259,7 @@ struct AssetWriterSinkTests {
             return
         }
 
-        AssetWriterSink.copyPlanes(from: source, into: destination)
+        PixelBufferCopy.planes(from: source, into: destination)
 
         // Every visible pixel of the copy must be the luma that went in, and the
         // destination's padding must not have been written past.

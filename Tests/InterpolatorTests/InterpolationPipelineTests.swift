@@ -715,6 +715,79 @@ struct InterpolationPipelineTests {
         #expect(shifted == whole.cutIntervals,
                 "the segment found \(shifted); the film found \(whole.cutIntervals)")
     }
+
+    // MARK: - Skipping, which is what playback is
+
+    /// Playback cannot render every interval and stay with its clock. At 4K an interval costs
+    /// 104.7 ms against the 41.7 ms the film spends on one, so a player that rendered them all
+    /// would cover 0.4 s of film per second while the sound covered 1.0. `rendersInterval` is
+    /// how the player renders a subset instead — and this is the property that makes it usable:
+    /// **the output contains exactly the frames of the intervals that were rendered**, not a
+    /// contiguous run of them.
+    @Test("a render filter decides which intervals are computed, and only those frames appear")
+    func renderFilterSelectsIntervals() throws {
+        let frames = 47
+        let source = makeSource(frames: frames)
+        let planner = IntervalPlanner(source: Self.sourceRate, output: Self.outputRate)
+
+        // Every third interval, which is the shape a 4K player needs and not a stride a
+        // count could express: the *choice* depends on the clock, and only the arithmetic
+        // of which frames that implies is fixed.
+        let keep: @Sendable (Int) -> Bool = { $0 % 3 == 0 }
+
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let report = try InterpolationPipeline(
+            source: source,
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                    maximumInterpolationsPerInterval: 5, depth: 2,
+                                    readDelayMicroseconds: 0),
+            configuration: .init(sceneDetection: false, rendersInterval: keep))
+            .run(into: sink)
+
+        let expected = Set((0..<(frames - 1)).filter(keep)
+            .flatMap { planner.output(forInterval: $0).map(\.index) })
+        let got = Set(sink.ordered.map(\.index))
+        let missing = expected.subtracting(got).sorted()
+        let unexpected = got.subtracting(expected).sorted()
+        #expect(got == expected,
+                "missing \(missing), unexpected \(unexpected)")
+        #expect(report.outputFrames == expected.count)
+        #expect(report.problems.isEmpty, "\(report.problems)")
+
+        // And the frames that *are* there are the right ones, not merely the right count —
+        // every passthrough must still be the source frame the film names for it.
+        var kinds: [Int: OutputFrame.Kind] = [:]
+        for interval in (0..<(frames - 1)).filter(keep) {
+            for frame in planner.output(forInterval: interval) { kinds[frame.index] = frame.kind }
+        }
+        for (index, bytes) in sink.ordered {
+            guard case .passthrough(let sourceIndex) = kinds[index] else { continue }
+            #expect(bytes == source.packedFrame(sourceIndex),
+                    "output frame \(index) is not source frame \(sourceIndex)")
+        }
+    }
+
+    @Test("with no filter, every interval is rendered — which is what batch conversion needs")
+    func noFilterRendersEverything() throws {
+        let frames = 47
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let report = try InterpolationPipeline(
+            source: makeSource(frames: frames),
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                    maximumInterpolationsPerInterval: 5, depth: 2,
+                                    readDelayMicroseconds: 0),
+            configuration: .init(sceneDetection: false)).run(into: sink)
+
+        let plan = try #require(PhasePlan(sourceFrameCount: frames, source: Self.sourceRate,
+                                          output: Self.outputRate))
+        #expect(report.outputFrames == plan.outputFrameCount)
+        #expect(sink.ordered.map(\.index) == Array(0..<plan.outputFrameCount),
+                "a batch run must produce a contiguous output")
+    }
 }
 
 /// A source that changes abruptly at a chosen frame, so there is a real cut to find.

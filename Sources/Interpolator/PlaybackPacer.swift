@@ -105,6 +105,28 @@ public struct PlaybackPacer: Sendable {
         index < targetOutputIndex(at: mediaTime)
     }
 
+    /// Whether a source interval is still worth rendering.
+    ///
+    /// This is the drop policy seen from the other end. The presenter decides which
+    /// *finished* frames to throw away; this decides which intervals not to compute in the
+    /// first place, and it has to, because computing them is the bottleneck. At 4K an
+    /// interval costs **104.7 ms** against the **41.7 ms** the film spends on one, so a
+    /// player that rendered every interval would cover 0.4 s of film per second while the
+    /// sound covered 1.0 — and the picture would fall further behind with every second.
+    ///
+    /// The rule is the interval's own end: once the clock has passed `(j + 1) / sourceRate`,
+    /// interval `j` is entirely in the past and rendering it would only widen the gap. What
+    /// is left is the intervals the film has not finished playing, and rendering roughly two
+    /// in five of those is what makes the film advance at its own rate.
+    ///
+    /// The cost is a video lag of about one render time — a frame cannot be shown before it
+    /// has been computed. That is inherent to real-time interpolation rather than a defect
+    /// in this rule, and it is the reason the 4K trade is stated as "accept the drops".
+    public func rendersInterval(_ interval: Int, source: FrameRate, at mediaTime: Double) -> Bool {
+        guard interval >= 0 else { return false }
+        return Double(interval + 1) / source.doubleValue > mediaTime
+    }
+
     /// How far the head of the queue is behind the playhead, in output frames.
     ///
     /// Negative when the producer is ahead, which is the normal case. Exposed so a
