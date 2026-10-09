@@ -56,6 +56,54 @@ public final class InterpolationPipeline {
 
     // MARK: - Configuration
 
+    /// Where in the film a run sits, when it is a piece of a segmented job rather than the
+    /// whole thing.
+    ///
+    /// ## Why a run has to be told this
+    ///
+    /// Two numbers in this pipeline are *global* and are computed from a local index:
+    ///
+    /// - **the phase.** Which output frames are free passthroughs depends on the output
+    ///   frame's number, not on how far into this run it is. A segment that numbered its
+    ///   output frames from zero would compute passthroughs for a phase the film does not
+    ///   have there, and the join would show a duplicate or a drop at every boundary.
+    /// - **the cut decision.** Interval `i`'s verdict needs signatures from `i - historyLength`
+    ///   to `i + 2`. A run that began reading at its own first interval would judge it with
+    ///   a short history and no backward evidence, and would judge its last interval with no
+    ///   forward evidence at all, because the tracker calls `finish()` when its source ends.
+    ///
+    /// So a window says where to read from, which intervals to render, and what the first
+    /// rendered output frame's global number is. Intervals outside the render range are read
+    /// and fed to the tracker and produce no output — that is the whole point of the type.
+    ///
+    /// `nil` means the whole source, from frame zero, numbered from zero.
+    public struct Window: Sendable {
+        /// The global source interval this run's first frame is read at.
+        public let readFromInterval: Int
+        /// The global source interval this run begins rendering at.
+        public let renderFromInterval: Int
+        /// The global source interval this run stops rendering at, exclusive.
+        public let renderToInterval: Int
+        /// The global output frame this run's first rendered output frame is.
+        public let outputStart: Int
+
+        public init(readFromInterval: Int, renderFromInterval: Int,
+                    renderToInterval: Int, outputStart: Int) {
+            self.readFromInterval = readFromInterval
+            self.renderFromInterval = renderFromInterval
+            self.renderToInterval = renderToInterval
+            self.outputStart = outputStart
+        }
+
+        /// The window that renders one segment of a plan.
+        public init(segment: SegmentPlan.Segment) {
+            self.readFromInterval = segment.readStart
+            self.renderFromInterval = segment.sourceStart
+            self.renderToInterval = segment.intervalEnd
+            self.outputStart = segment.outputStart
+        }
+    }
+
     public struct Configuration: Sendable {
         /// Requests kept in flight. **2 is the minimum that works**: depth 1 fails
         /// outright on 23.976 → 60, dropping to 56.7 fps (invariant 3).
@@ -69,15 +117,19 @@ public final class InterpolationPipeline {
         /// frame. The pipeline never uses it to decide anything — it stops when the
         /// source stops, and the hint being wrong cannot corrupt the output.
         public var expectedOutputFrameCount: Int?
+        /// The part of the film this run renders. `nil` for the whole source.
+        public var window: Window?
 
         public init(depth: Int = 2,
                     sceneDetection: Bool = true,
                     maximumSourceFrames: Int? = nil,
-                    expectedOutputFrameCount: Int? = nil) {
+                    expectedOutputFrameCount: Int? = nil,
+                    window: Window? = nil) {
             self.depth = depth
             self.sceneDetection = sceneDetection
             self.maximumSourceFrames = maximumSourceFrames
             self.expectedOutputFrameCount = expectedOutputFrameCount
+            self.window = window
         }
     }
 
@@ -194,7 +246,10 @@ public final class InterpolationPipeline {
 
         try sink.begin(SinkGeometry(width: width, height: height, format: format,
                                     sourceRate: sourceRate, outputRate: outputRate,
-                                    sourceFrameCount: source.info.frameCount,
+                                    // What this run reads, which for a segment is its own
+                                    // frames rather than the film's.
+                                    sourceFrameCount: configuration.maximumSourceFrames
+                                        ?? source.info.frameCount,
                                     outputFrameCount: configuration.expectedOutputFrameCount))
 
         let ring = FrameRing(count: 3, frameByteSize: frameByteSize)
@@ -241,6 +296,20 @@ public final class InterpolationPipeline {
         let problems = ProblemLog()
         let slotFree = (0..<engine.depth).map { _ in DispatchSemaphore(value: 1) }
 
+        // Where this run sits in the film. Local interval `j` is the film's interval
+        // `readBase + j`; only those in `[localRenderFrom, localRenderTo)` produce output.
+        let readBase = configuration.window?.readFromInterval ?? 0
+        let outputBase = configuration.window?.outputStart ?? 0
+        let localRenderFrom = (configuration.window?.renderFromInterval ?? 0) - readBase
+        let localRenderTo = configuration.window.map { $0.renderToInterval - readBase } ?? Int.max
+        // Keep reading past the last rendered interval, so the tracker holds the forward
+        // evidence the flash guard needs for it. Without this the last interval of every
+        // segment is decided by `finish()` — end-of-stream semantics — and a cut landing
+        // exactly on a segment boundary would be judged differently from the same cut
+        // mid-film. Two intervals is what the guard reaches.
+        let lastLocalInterval = localRenderTo == Int.max
+            ? Int.max : localRenderTo + (configuration.sceneDetection ? 2 : 0)
+
         var interval = 0
         var submitted = 0
         var outputFrames = 0
@@ -248,7 +317,7 @@ public final class InterpolationPipeline {
         var passthroughFrames = 0
         let started = DispatchTime.now().uptimeNanoseconds
 
-        while true {
+        while interval < lastLocalInterval {
             // Interval `j` exists only if source frame `j + 1` does.
             guard try hold(interval) else { break }
             guard try hold(interval + 1) else { break }
@@ -268,69 +337,87 @@ public final class InterpolationPipeline {
                 trackerFinished = true
             }
 
-            let isCut = configuration.sceneDetection
-                && interval < decisions.count
-                && decisions[interval].isCut
+            // Outside the render range the interval is read for the tracker's sake and
+            // produces nothing. This is the whole reason a window exists: the lead-in gives
+            // the first rendered interval the history the whole-film render would have given
+            // it, and the lead-out gives the last one its forward guard.
+            if interval >= localRenderFrom, interval < localRenderTo {
+                let isCut = configuration.sceneDetection
+                    && interval < decisions.count
+                    && decisions[interval].isCut
 
-            let planned = planner.output(forInterval: interval)
-            // The cut rule is not restated here — `CutResolution` is the same code
-            // `PhasePlan.resolvingCuts` runs. A second copy is how a cut ends up
-            // handled one way when converting and another when watching.
-            let resolved = configuration.sceneDetection
-                ? CutResolution.resolve(planned, isCut: isCut)
-                : planned
+                // The film's interval, not this run's. Which output frames are free
+                // passthroughs is a property of the output frame's own number, and a
+                // passthrough's `sourceIndex` names a frame in the film's numbering — so
+                // the choice of `slot.a` or `slot.b` has to be made against this same
+                // global index. Comparing it against the local one silently wrote the far
+                // frame of every passthrough in every segment but the first.
+                let globalInterval = readBase + interval
+                let planned = planner.output(forInterval: globalInterval)
+                // The cut rule is not restated here — `CutResolution` is the same code
+                // `PhasePlan.resolvingCuts` runs. A second copy is how a cut ends up
+                // handled one way when converting and another when watching.
+                let resolved = configuration.sceneDetection
+                    ? CutResolution.resolve(planned, isCut: isCut)
+                    : planned
 
-            if !resolved.isEmpty {
-                let slotIndex = submitted % engine.depth
-                // Invariant 17: acquired before the load, released in the completion.
-                slotFree[slotIndex].wait()
-                let slot = slots[slotIndex]
+                if !resolved.isEmpty {
+                    let slotIndex = submitted % engine.depth
+                    // Invariant 17: acquired before the load, released in the completion.
+                    slotFree[slotIndex].wait()
+                    let slot = slots[slotIndex]
 
-                format.load(packed: UnsafeRawPointer(ring.pointers[interval % ring.count]),
-                            into: slot.a, width: width, height: height)
-                format.load(packed: UnsafeRawPointer(ring.pointers[(interval + 1) % ring.count]),
-                            into: slot.b, width: width, height: height)
+                    format.load(packed: UnsafeRawPointer(ring.pointers[interval % ring.count]),
+                                into: slot.a, width: width, height: height)
+                    format.load(packed: UnsafeRawPointer(ring.pointers[(interval + 1) % ring.count]),
+                                into: slot.b, width: width, height: height)
 
-                // Passthrough frames cost nothing and need no engine call. On
-                // 23.976 -> 59.94 that is one output frame in five, free.
-                for frame in resolved {
-                    guard case .passthrough(let sourceIndex) = frame.kind else { continue }
-                    sink.write(sourceIndex == interval ? slot.a : slot.b, at: frame.index)
-                    passthroughFrames += 1
-                }
-
-                let interpolations = resolved.filter { !$0.isPassthrough }
-                if interpolations.isEmpty {
-                    // Nothing submitted, so no completion will arrive to release the
-                    // slot. Release it here or the pipeline deadlocks after `depth`
-                    // intervals.
-                    slotFree[slotIndex].signal()
-                } else {
-                    submitted += 1
-                    let destinations = Array(slot.destinations.prefix(interpolations.count))
-                    let destinationSet = DestinationSet(buffers: destinations)
-                    let intervalIndex = interval
-                    let request = InterpolationRequest(
-                        interval: SourceInterval(sourceIndex: interval, output: resolved),
-                        sourceA: slot.a,
-                        sourceB: slot.b,
-                        destinations: destinations
-                    ) { result in
-                        defer { slotFree[slotIndex].signal() }
-                        switch result {
-                        case .success:
-                            for (n, frame) in interpolations.enumerated()
-                            where n < destinationSet.buffers.count {
-                                sink.write(destinationSet.buffers[n], at: frame.index)
-                            }
-                        case .failure(let error):
-                            problems.record("interval \(intervalIndex): \(error)")
-                        }
+                    // Passthrough frames cost nothing and need no engine call. On
+                    // 23.976 -> 59.94 that is one output frame in five, free.
+                    for frame in resolved {
+                        guard case .passthrough(let sourceIndex) = frame.kind else { continue }
+                        // `frame.index` is the film's output frame; the sink is writing this
+                        // run's file, which begins at zero.
+                        sink.write(sourceIndex == globalInterval ? slot.a : slot.b,
+                                   at: frame.index - outputBase)
+                        passthroughFrames += 1
                     }
-                    engine.submit(request)
-                    interpolatedFrames += interpolations.count
+
+                    let interpolations = resolved.filter { !$0.isPassthrough }
+                    if interpolations.isEmpty {
+                        // Nothing submitted, so no completion will arrive to release the
+                        // slot. Release it here or the pipeline deadlocks after `depth`
+                        // intervals.
+                        slotFree[slotIndex].signal()
+                    } else {
+                        submitted += 1
+                        let destinations = Array(slot.destinations.prefix(interpolations.count))
+                        let destinationSet = DestinationSet(buffers: destinations)
+                        let intervalIndex = globalInterval
+                        let request = InterpolationRequest(
+                            interval: SourceInterval(sourceIndex: globalInterval,
+                                                     output: resolved),
+                            sourceA: slot.a,
+                            sourceB: slot.b,
+                            destinations: destinations
+                        ) { result in
+                            defer { slotFree[slotIndex].signal() }
+                            switch result {
+                            case .success:
+                                for (n, frame) in interpolations.enumerated()
+                                where n < destinationSet.buffers.count {
+                                    sink.write(destinationSet.buffers[n],
+                                               at: frame.index - outputBase)
+                                }
+                            case .failure(let error):
+                                problems.record("interval \(intervalIndex): \(error)")
+                            }
+                        }
+                        engine.submit(request)
+                        interpolatedFrames += interpolations.count
+                    }
+                    outputFrames += resolved.count
                 }
-                outputFrames += resolved.count
             }
 
             // Frame `interval` is no longer needed by anyone: the next interval
@@ -340,7 +427,10 @@ public final class InterpolationPipeline {
             interval += 1
         }
 
-        if configuration.sceneDetection, !trackerFinished {
+        // Only when the source really ended. A run that stopped because its window was
+        // satisfied has no tail to decide, and deciding one would invent verdicts for
+        // intervals the film continues past.
+        if configuration.sceneDetection, !trackerFinished, eof {
             decisions.append(contentsOf: tracker.finish())
         }
 

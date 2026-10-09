@@ -41,35 +41,68 @@ import Foundation
 /// The output showed it as a two-frame gap at each join and nothing else — a plan that
 /// looked right, tiled right in the source, and silently dropped a fiftieth of a second
 /// per boundary.
+///
+/// ## Why a segment reads more than it renders
+///
+/// The cut decision for interval `i` is not a function of interval `i`. The adaptive
+/// threshold looks back over ``SceneChangeDetector/Config/historyLength`` intervals, and the
+/// flash guard looks one frame forward. A segment that began reading at its own first
+/// interval would judge that interval with a short history and no backward evidence, and
+/// would judge its last one with no forward evidence at all — because the tracker calls
+/// `finish()` when its source ends, and end-of-stream semantics are deliberately not
+/// mid-stream semantics.
+///
+/// So each segment reads a **lead-in** before its first interval and a **lead-out** after
+/// its last, feeds every frame it reads to the tracker, and renders only its own intervals.
+/// With `leadIn >= historyLength` the first rendered interval sees exactly the history the
+/// whole-film render would have given it, and with `leadOut >= 2` the last one keeps its
+/// forward guard. The result is that a segment's output is the corresponding slice of the
+/// whole-film output, not merely a similar one — which is the property the entire segmented
+/// design rests on, and which is why it is worth 33 extra decoded frames per segment.
+///
+/// At the film's own ends the margins are clamped away rather than faked: the first segment
+/// has no lead-in because the film has nothing before it, and the last one's lead-out runs
+/// off the end and stops. Both are what the whole-film render does there too.
 public struct SegmentPlan: Sendable {
 
     /// One piece of the job.
     public struct Segment: Sendable, Equatable, CustomStringConvertible {
         /// Position in the plan, and the number that names its file.
         public let index: Int
-        /// First source frame read. Also the first interval rendered, since they share
-        /// a number.
+        /// First interval rendered, as a global source interval index. Also the first
+        /// source frame the segment's *own* picture begins at.
         public let sourceStart: Int
-        /// Source frames read. One more than the intervals rendered.
+        /// Intervals rendered. The segment's identity: what it owns, and what no other
+        /// segment renders.
         public let sourceCount: Int
+        /// First source frame read, which is ``sourceStart`` less the lead-in and never
+        /// below zero.
+        public let readStart: Int
+        /// Source frames read: the intervals rendered, plus one for the far side of the
+        /// last interval, plus the lead-in and lead-out the tracker needs.
+        public let readCount: Int
         /// The first output frame of the film this segment produces.
         public let outputStart: Int
         public let outputCount: Int
 
-        /// Intervals rendered, which is one fewer than the frames read.
-        public var intervalCount: Int { max(0, sourceCount - 1) }
+        /// One past the last interval rendered. The next segment starts here, so this is
+        /// the anchor the tiling is checked against.
+        public var intervalEnd: Int { sourceStart + sourceCount }
         /// One past the last source frame read. Half-open, like every other range here.
-        public var sourceEnd: Int { sourceStart + sourceCount }
-        /// One past the last interval rendered. This is `sourceEnd - 1`, because the last
-        /// frame read is the far side of the last interval and no interval starts at it.
-        public var intervalEnd: Int { sourceStart + intervalCount }
+        public var readEnd: Int { readStart + readCount }
         /// One past the last output frame.
         public var outputEnd: Int { outputStart + outputCount }
+        /// Intervals read but not rendered, before the first rendered one.
+        public var leadIn: Int { sourceStart - readStart }
+        /// Intervals read but not rendered, after the last rendered one. One less than the
+        /// frame margin, because the far side of the last rendered interval is itself read.
+        public var leadOut: Int { readEnd - intervalEnd - 1 }
 
         public var description: String {
-            "segment \(index): source [\(sourceStart), \(sourceEnd)) "
+            "segment \(index): intervals [\(sourceStart), \(intervalEnd)) "
                 + "-> output [\(outputStart), \(outputEnd)) "
-                + "(\(sourceCount) frames read, \(intervalCount) intervals rendered)"
+                + "(\(sourceCount) intervals, \(readCount) frames read "
+                + "from \(readStart))"
         }
     }
 
@@ -82,8 +115,24 @@ public struct SegmentPlan: Sendable {
     /// begins on a multiple of it.
     public let phasePeriod: Int
     /// Intervals a full segment renders, after rounding up to a phase boundary. It reads
-    /// one more source frame than this.
+    /// one more source frame than this, plus the lead-in and lead-out.
     public let intervalsPerSegment: Int
+    /// Context read before a segment's first interval, and after its last. See the note
+    /// on the type.
+    public let leadIn: Int
+    public let leadOut: Int
+
+    // MARK: - Context
+
+    /// Context a segment reads before its first rendered interval.
+    ///
+    /// `SceneChangeDetector.Config.historyLength` is 30, and the adaptive threshold reaches
+    /// that far back; one more covers the backward half of the flash guard, which needs the
+    /// interval before the one being judged.
+    public static let defaultLeadIn = 31
+    /// Context a segment reads after its last rendered interval: the forward half of the
+    /// flash guard needs the frame after next.
+    public static let defaultLeadOut = 2
 
     // MARK: - Building
 
@@ -95,11 +144,14 @@ public struct SegmentPlan: Sendable {
     public init?(sourceFrameCount: Int,
                  source: FrameRate,
                  output: FrameRate,
-                 targetSourceFrames: Int) {
+                 targetSourceFrames: Int,
+                 leadIn: Int = SegmentPlan.defaultLeadIn,
+                 leadOut: Int = SegmentPlan.defaultLeadOut) {
         let planner = IntervalPlanner(source: source, output: output)
         let period = planner.phasePeriod
         guard planner.isUsable, period > 0,
-              sourceFrameCount >= 2, targetSourceFrames >= 2 else { return nil }
+              sourceFrameCount >= 2, targetSourceFrames >= 2,
+              leadIn >= 0, leadOut >= 0 else { return nil }
 
         // Every segment but the last has to begin where the phase pattern begins, so the
         // length is rounded *up* to the next multiple of the period. Rounding down would
@@ -130,12 +182,20 @@ public struct SegmentPlan: Sendable {
             guard let outputStart = planner.outputIndexAtPhaseBoundary(interval: start) else {
                 return nil
             }
+            // The context, clamped at the film's own ends rather than invented. A segment
+            // that ran off either end would read frames that do not exist, and a segment
+            // that pretended to have context it does not have would judge its first
+            // intervals differently from the whole-film render.
+            let readStart = max(0, start - leadIn)
+            // Frames read: the far side of the last interval, plus the context on each
+            // side, and never past the end of the film.
+            let readEnd = min(end + 1 + leadOut, sourceFrameCount)
             segments.append(Segment(
                 index: index,
                 sourceStart: start,
-                // Frames read, which is the intervals rendered plus the one frame on the
-                // far side of the last of them.
-                sourceCount: end - start + 1,
+                sourceCount: end - start,
+                readStart: readStart,
+                readCount: readEnd - readStart,
                 outputStart: outputStart,
                 outputCount: planner.outputFrameCount(fromInterval: start,
                                                       count: end - start)))
@@ -147,6 +207,8 @@ public struct SegmentPlan: Sendable {
                                                         count: sourceFrameCount - 1)
         self.phasePeriod = period
         self.intervalsPerSegment = length
+        self.leadIn = leadIn
+        self.leadOut = leadOut
     }
 
     /// Split by a target duration rather than an interval count.
@@ -158,11 +220,13 @@ public struct SegmentPlan: Sendable {
     public init?(sourceFrameCount: Int,
                  source: FrameRate,
                  output: FrameRate,
-                 segmentSeconds: Double) {
+                 segmentSeconds: Double,
+                 leadIn: Int = SegmentPlan.defaultLeadIn,
+                 leadOut: Int = SegmentPlan.defaultLeadOut) {
         guard segmentSeconds > 0, source.doubleValue > 0 else { return nil }
         let frames = Int((segmentSeconds * source.doubleValue).rounded())
         self.init(sourceFrameCount: sourceFrameCount, source: source, output: output,
-                  targetSourceFrames: frames)
+                  targetSourceFrames: frames, leadIn: leadIn, leadOut: leadOut)
     }
 
     // MARK: - Lookups
@@ -210,8 +274,8 @@ public struct SegmentPlan: Sendable {
         var found: [String] = []
         guard !segments.isEmpty else { return ["the plan has no segments"] }
 
-        if segments.map(\.sourceCount).contains(where: { $0 < 2 }) {
-            found.append("a segment of fewer than 2 source frames renders no interval")
+        if segments.map(\.sourceCount).contains(where: { $0 < 1 }) {
+            found.append("a segment renders no interval")
         }
         if segments.map(\.outputCount).contains(where: { $0 <= 0 }) {
             found.append("a segment produces no output frames")
@@ -219,18 +283,38 @@ public struct SegmentPlan: Sendable {
         if segments.first?.sourceStart != 0 {
             found.append("the first segment does not start at source frame 0")
         }
-        if segments.last?.sourceEnd != sourceFrameCount {
+        // The last interval index is `sourceFrameCount - 1`, so the last segment's
+        // half-open interval range has to end there.
+        if segments.last?.intervalEnd != sourceFrameCount - 1 {
             found.append("the last segment does not reach the end of the source")
         }
         if segments.last?.outputEnd != outputFrameCount {
             found.append("the last segment does not reach the end of the output")
         }
-        // The intervals tile exactly — no gap and no overlap — and the source frames
-        // overlap by exactly the one frame that two neighbouring segments share. Both
-        // conditions are the same condition, because a segment's last frame read is the far
-        // side of its last interval and no interval begins there. A gap in the intervals
-        // loses a piece of the film; an overlap plays one twice; and neither is visible in
-        // the finished file until someone watches the join.
+        // A segment has to read the far side of its last interval, or it cannot render that
+        // interval at all; and it must not read past the film.
+        for segment in segments {
+            if segment.readCount < segment.sourceCount + 1 {
+                found.append("segment \(segment.index) reads \(segment.readCount) frames "
+                             + "for \(segment.sourceCount) intervals, so the far side of "
+                             + "its last interval is missing")
+            }
+            if segment.readStart > segment.sourceStart {
+                found.append("segment \(segment.index) reads from frame \(segment.readStart) "
+                             + "but renders intervals from \(segment.sourceStart)")
+            }
+            if segment.readEnd > sourceFrameCount {
+                found.append("segment \(segment.index) reads to frame \(segment.readEnd), "
+                             + "past the source's \(sourceFrameCount)")
+            }
+            if segment.leadIn < 0 || segment.leadOut < 0 {
+                found.append("segment \(segment.index) has a negative margin")
+            }
+        }
+        // The intervals tile exactly — no gap and no overlap. A gap loses a piece of the
+        // film, an overlap plays one twice, and neither is visible in the finished file
+        // until someone watches the join. The *read* ranges deliberately overlap, which is
+        // why this checks intervals and not frames.
         for (previous, next) in zip(segments, segments.dropFirst()) {
             if next.sourceStart != previous.intervalEnd {
                 found.append("intervals \(previous.intervalEnd)…\(next.sourceStart) "

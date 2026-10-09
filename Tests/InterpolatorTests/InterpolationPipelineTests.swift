@@ -20,15 +20,22 @@ final class SyntheticFrameSource: FrameSource, @unchecked Sendable {
     private let height: Int
     private let format: FrameFormat
     private let totalFrames: Int
+    /// The film-wide number of the first frame this source yields.
+    ///
+    /// Zero for a whole-film run. A segmented run seeks its source to the segment's
+    /// read start, so its "first frame" is not the film's — which is exactly the
+    /// distinction ``InterpolationPipeline/Window`` exists to carry.
+    private let firstFrame: Int
     private var framesRead = 0
     private var closed = false
 
     init(width: Int, height: Int, format: FrameFormat, frameRate: FrameRate,
-         totalFrames: Int) {
+         totalFrames: Int, firstFrame: Int = 0) {
         self.width = width
         self.height = height
         self.format = format
         self.totalFrames = totalFrames
+        self.firstFrame = firstFrame
         self.frameByteSize = format.packedByteSize(width: width, height: height)
         self.info = MediaInfo(
             url: URL(fileURLWithPath: "/dev/null"),
@@ -84,7 +91,7 @@ final class SyntheticFrameSource: FrameSource, @unchecked Sendable {
 
     func read(into destination: UnsafeMutableRawPointer) throws -> Bool {
         guard !closed, framesRead < totalFrames else { return false }
-        let frame = packedFrame(framesRead)
+        let frame = packedFrame(firstFrame + framesRead)
         _ = frame.withUnsafeBytes { memcpy(destination, $0.baseAddress!, frameByteSize) }
         framesRead += 1
         return true
@@ -222,9 +229,11 @@ struct InterpolationPipelineTests {
     private static let sourceRate = FrameRate.parse("23.976")!
     private static let outputRate = FrameRate.parse("59.94")!
 
-    private func makeSource(frames: Int, format: FrameFormat = .nv12) -> SyntheticFrameSource {
+    private func makeSource(frames: Int, format: FrameFormat = .nv12,
+                            firstFrame: Int = 0) -> SyntheticFrameSource {
         SyntheticFrameSource(width: Self.width, height: Self.height, format: format,
-                             frameRate: Self.sourceRate, totalFrames: frames)
+                             frameRate: Self.sourceRate, totalFrames: frames,
+                             firstFrame: firstFrame)
     }
 
     // MARK: - Invariant 17, the reason the loop was extracted
@@ -514,6 +523,185 @@ struct InterpolationPipelineTests {
         #expect(detected.outputFrames == plain.outputFrames,
                 "detection changes what a frame is, never how many there are")
     }
+
+    // MARK: - A run that renders a piece of the film rather than all of it
+
+    /// Renders one segment of a plan, the way a segmented job does: a source seeked to the
+    /// segment's read start, `maximumSourceFrames` set to what it reads, and a window naming
+    /// which of the frames it reads are its own to render.
+    private func runSegment(_ segment: SegmentPlan.Segment,
+                            makeSource: (Int, Int) -> SyntheticFrameSource)
+        throws -> (report: InterpolationPipeline.Report,
+                   sink: MemoryFrameSink,
+                   source: SyntheticFrameSource) {
+        let frameSource = makeSource(segment.readStart, segment.readCount)
+        let engine = RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                     maximumInterpolationsPerInterval: 5, depth: 2,
+                                     readDelayMicroseconds: 0)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let pipeline = InterpolationPipeline(
+            source: frameSource,
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: engine,
+            configuration: .init(
+                sceneDetection: false,
+                maximumSourceFrames: segment.readCount,
+                expectedOutputFrameCount: segment.outputCount,
+                window: .init(segment: segment)))
+        let report = try pipeline.run(into: sink)
+        return (report, sink, frameSource)
+    }
+
+    @Test("a windowed run produces its segment's frames, numbered from zero")
+    func windowedRunProducesItsSegment() throws {
+        let frames = 200
+        let plan = try #require(SegmentPlan(sourceFrameCount: frames,
+                                            source: Self.sourceRate,
+                                            output: Self.outputRate,
+                                            targetSourceFrames: 30))
+        for segment in plan.segments {
+            let (report, sink, _) = try runSegment(segment) { start, count in
+                makeSource(frames: count, firstFrame: start)
+            }
+            let detail = "\(segment.description)"
+            #expect(report.outputFrames == segment.outputCount, "\(detail)")
+            // Its file starts at zero, whatever the segment's place in the film is.
+            #expect(sink.count == segment.outputCount, "\(detail)")
+            #expect(sink.ordered.map(\.index) == Array(0..<segment.outputCount), "\(detail)")
+            #expect(sink.problems.isEmpty, "\(detail)")
+            #expect(report.problems.isEmpty, "\(detail)")
+        }
+    }
+
+    @Test("a windowed run renders only its own intervals, not all the frames it reads")
+    func windowedRunRendersOnlyItsOwn() throws {
+        // The whole point of the lead-in and lead-out: a segment reads 33 more frames than
+        // it renders intervals for, and must not emit a single output frame for them.
+        let frames = 200
+        let plan = try #require(SegmentPlan(sourceFrameCount: frames,
+                                            source: Self.sourceRate,
+                                            output: Self.outputRate,
+                                            targetSourceFrames: 30))
+        let interior = try #require(plan.segments.dropLast().dropFirst().first)
+        #expect(interior.leadIn > 0, "this segment needs a real lead-in to be a test")
+
+        let (report, sink, _) = try runSegment(interior) { start, count in
+            makeSource(frames: count, firstFrame: start)
+        }
+        // If the context were rendered, the count would be the read count's worth of
+        // intervals rather than the segment's own.
+        #expect(report.outputFrames == interior.outputCount)
+        #expect(sink.count == interior.outputCount)
+        // And the whole plan's segments still add up to the film.
+        #expect(plan.outputFrameCount == PhasePlan(sourceFrameCount: frames,
+                                                   source: Self.sourceRate,
+                                                   output: Self.outputRate)!.outputFrameCount)
+    }
+
+    /// Ground truth, not a comparison against a second implementation. A frame the global
+    /// plan calls a passthrough has to come out of a segment's own file as the source frame
+    /// the plan names — and the plan name comes from the film-wide output index, which is
+    /// exactly what a run without a window would get wrong.
+    @Test("a windowed run's passthrough frames are the source frames the film names")
+    func windowedPassthroughsAreExact() throws {
+        let frames = 200
+        let planner = IntervalPlanner(source: Self.sourceRate, output: Self.outputRate)
+        let plan = try #require(SegmentPlan(sourceFrameCount: frames,
+                                            source: Self.sourceRate,
+                                            output: Self.outputRate,
+                                            targetSourceFrames: 30))
+        let reference = SyntheticFrameSource(width: Self.width, height: Self.height,
+                                             format: .nv12, frameRate: Self.sourceRate,
+                                             totalFrames: frames)
+
+        var checked = 0
+        for segment in plan.segments {
+            let (_, sink, _) = try runSegment(segment) { start, count in
+                makeSource(frames: count, firstFrame: start)
+            }
+            for local in 0..<segment.outputCount {
+                let global = segment.outputStart + local
+                guard planner.isPassthrough(outputIndex: global) else { continue }
+                let expected = reference.packedFrame(planner.interval(forOutputIndex: global))
+                let got = sink.frame(at: local)
+                #expect(got == expected,
+                        "segment \(segment.index) local frame \(local) is film frame \(global), which the plan makes a passthrough")
+                checked += 1
+            }
+        }
+        // Every passthrough the film has was checked, not merely some of them. A magic
+        // threshold would pass while the loop silently skipped most of its work.
+        let expected = try #require(PhasePlan(sourceFrameCount: frames,
+                                              source: Self.sourceRate,
+                                              output: Self.outputRate))
+        #expect(checked == expected.passthroughCount,
+                "\(checked) passthroughs checked against the film's \(expected.passthroughCount)")
+    }
+
+    /// The reason the margins exist, as a test.
+    ///
+    /// The cut is placed on the last interval of a segment, which is the one the lead-out
+    /// protects: without it the tracker would hit the end of its source and call
+    /// `finish()`, and the final interval would be judged with the forward half of the
+    /// flash guard unavailable — a different verdict from the one the same interval gets
+    /// mid-film.
+    @Test("a cut on a segment's last interval is judged as it is mid-film")
+    func cutOnASegmentBoundaryIsJudgedTheSame() throws {
+        let frames = 63
+        // Target 20 puts a boundary at interval 20, so interval 19 — the cut — is the last
+        // interval of segment 0. (20 is already a multiple of the phase period, so it is
+        // not rounded up; 21 would become 22 and land the boundary one interval late.)
+        let cutAt = 19
+        let plan = try #require(SegmentPlan(sourceFrameCount: frames,
+                                            source: Self.sourceRate,
+                                            output: Self.outputRate,
+                                            targetSourceFrames: 20))
+        let first = try #require(plan.segments.first)
+        #expect(first.intervalEnd == cutAt + 1,
+                "the cut must land on the segment's last interval for this to test anything, but the segment ends at \(first.intervalEnd)")
+
+        // What the whole film decides.
+        let wholeSource = CutFrameSource(width: Self.width, height: Self.height,
+                                         format: .nv12, frameRate: Self.sourceRate,
+                                         totalFrames: frames, cutAfter: cutAt)
+        let wholeSink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let whole = try InterpolationPipeline(
+            source: wholeSource,
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                    maximumInterpolationsPerInterval: 5, depth: 2,
+                                    readDelayMicroseconds: 0),
+            configuration: .init(sceneDetection: true)).run(into: wholeSink)
+        #expect(whole.cutIntervals == [cutAt], "the film should find the cut: \(whole.cutIntervals)")
+
+        // What that segment decides on its own.
+        let segmentSource = CutFrameSource(width: Self.width, height: Self.height,
+                                           format: .nv12, frameRate: Self.sourceRate,
+                                           totalFrames: first.readCount,
+                                           cutAfter: cutAt,
+                                           firstFrame: first.readStart)
+        let segmentSink = MemoryFrameSink(width: Self.width, height: Self.height,
+                                          format: .nv12)
+        let part = try InterpolationPipeline(
+            source: segmentSource,
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                    maximumInterpolationsPerInterval: 5, depth: 2,
+                                    readDelayMicroseconds: 0),
+            configuration: .init(sceneDetection: true,
+                                 maximumSourceFrames: first.readCount,
+                                 expectedOutputFrameCount: first.outputCount,
+                                 window: .init(segment: first))).run(into: segmentSink)
+
+        // The segment's decisions are numbered from its read start, so they are shifted back
+        // to the film's numbering before being compared.
+        let shifted = part.cutIntervals.map { $0 + first.readStart }
+        #expect(shifted == whole.cutIntervals,
+                "the segment found \(shifted); the film found \(whole.cutIntervals)")
+    }
 }
 
 /// A source that changes abruptly at a chosen frame, so there is a real cut to find.
@@ -527,16 +715,20 @@ final class CutFrameSource: FrameSource, @unchecked Sendable {
     private let format: FrameFormat
     private let totalFrames: Int
     private let cutAfter: Int
+    /// The film-wide number of the first frame this source yields, so a source can stand
+    /// in for one seeked to a segment's read start.
+    private let firstFrame: Int
     private var framesRead = 0
     private var closed = false
 
     init(width: Int, height: Int, format: FrameFormat, frameRate: FrameRate,
-         totalFrames: Int, cutAfter: Int) {
+         totalFrames: Int, cutAfter: Int, firstFrame: Int = 0) {
         self.width = width
         self.height = height
         self.format = format
         self.totalFrames = totalFrames
         self.cutAfter = cutAfter
+        self.firstFrame = firstFrame
         self.frameByteSize = format.packedByteSize(width: width, height: height)
         self.info = MediaInfo(
             url: URL(fileURLWithPath: "/dev/null"),
@@ -576,7 +768,7 @@ final class CutFrameSource: FrameSource, @unchecked Sendable {
 
     func read(into destination: UnsafeMutableRawPointer) throws -> Bool {
         guard !closed, framesRead < totalFrames else { return false }
-        let frame = packedFrame(framesRead)
+        let frame = packedFrame(firstFrame + framesRead)
         _ = frame.withUnsafeBytes { memcpy(destination, $0.baseAddress!, frameByteSize) }
         framesRead += 1
         return true

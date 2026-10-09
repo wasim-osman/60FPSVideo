@@ -135,12 +135,15 @@ struct SegmentPlanTests {
                     #expect(plan.problems.isEmpty,
                             "\(source) -> \(output) \(frames)/\(target): \(detail)")
                     #expect(plan.segments.first?.sourceStart == 0)
-                    #expect(plan.segments.last?.sourceEnd == frames)
+                    #expect(plan.segments.last?.intervalEnd == frames - 1,
+                            "the intervals tile the film's \(frames - 1)")
                     #expect(plan.segments.last?.outputEnd == plan.outputFrameCount)
                     #expect(plan.segments.reduce(0) { $0 + $1.outputCount }
                                 == plan.outputFrameCount)
-                    #expect(plan.segments.reduce(0) { $0 + $1.sourceCount }
-                                >= frames, "a boundary frame is read twice, never skipped")
+                    // The intervals are a partition: every one of the film's belongs to
+                    // exactly one segment.
+                    #expect(plan.segments.reduce(0) { $0 + $1.sourceCount } == frames - 1,
+                            "the intervals have to tile the film exactly once")
                 }
             }
         }
@@ -152,7 +155,7 @@ struct SegmentPlanTests {
             let planner = IntervalPlanner(source: source, output: output)
             let plan = try makePlan(source, output, frames: 5000, target: 400)
             for segment in plan.segments {
-                let summed = (segment.sourceStart..<segment.sourceEnd - 1)
+                let summed = (segment.sourceStart..<segment.intervalEnd)
                     .reduce(0) { $0 + planner.output(forInterval: $1).count }
                 #expect(segment.outputCount == summed, "\(segment.description)")
             }
@@ -177,9 +180,11 @@ struct SegmentPlanTests {
                 let plan = try makePlan(source, output, frames: frames, target: target)
                 var rebuilt: [String] = []
                 for segment in plan.segments {
-                    // A fresh planner, exactly as a fresh segment render would have.
+                    // A fresh planner indexed from zero, which is the naive segment render.
+                    // It reproduces the film only because every segment but the last starts
+                    // on a phase boundary.
                     let local = IntervalPlanner(source: source, output: output)
-                    for j in 0..<segment.intervalCount {
+                    for j in 0..<segment.sourceCount {
                         rebuilt += shape(local.output(forInterval: j))
                     }
                 }
@@ -219,20 +224,18 @@ struct SegmentPlanTests {
         let plan = try makePlan(rate("24000/1001"), rate("60000/1001"),
                                 frames: 401, target: 400)
         #expect(plan.segments.count == 1)
-        #expect(plan.segments[0].sourceCount == 401)
-        #expect(plan.segments[0].intervalCount == 400)
+        // 401 source frames are 400 intervals, all of them in one segment.
+        #expect(plan.segments[0].sourceCount == 400)
         #expect(plan.problems.isEmpty)
 
-        // A tail of two frames does render an interval, so it stays — and it reads both
-        // frames, one of which the previous segment already read.
+        // A tail of two frames does render a second interval, so it stays.
         let kept = try makePlan(rate("24000/1001"), rate("60000/1001"),
                                 frames: 402, target: 400)
         #expect(kept.segments.count == 2)
-        #expect(kept.segments[1].sourceCount == 2)
-        #expect(kept.segments[1].intervalCount == 1)
+        #expect(kept.segments[1].sourceCount == 1)
         #expect(kept.segments[1].sourceStart == 400)
-        #expect(kept.segments[0].sourceEnd == 401,
-                "the shared frame belongs to both segments")
+        #expect(kept.segments[0].intervalEnd == 400,
+                "the intervals tile: the second segment starts where the first stopped")
         #expect(kept.problems.isEmpty)
     }
 
@@ -286,9 +289,8 @@ struct SegmentPlanTests {
         let plan = try makePlan(rate("24000/1001"), rate("60000/1001"),
                                 frames: 1000, target: 100)
         #expect(plan.segments.count == 10)
-        // Each segment renders 100 intervals and therefore reads 101 frames.
-        #expect(plan.segments.dropLast().allSatisfy { $0.sourceCount == 101 })
-        #expect(plan.segments.dropLast().allSatisfy { $0.intervalCount == 100 })
+        // Each segment renders 100 intervals.
+        #expect(plan.segments.dropLast().allSatisfy { $0.sourceCount == 100 })
 
         for segment in plan.segments {
             // Every output frame in the segment resolves back to it, and the frames either
@@ -334,14 +336,16 @@ struct SegmentPlanTests {
         // Neither gap would be visible in the finished file: it would open, play, and be
         // missing two seconds in the middle.
         let holed = SegmentPlan.Segment(index: 0, sourceStart: 0, sourceCount: 100,
+                                        readStart: 0, readCount: 103,
                                         outputStart: 0, outputCount: 249)
         let other = SegmentPlan.Segment(index: 1, sourceStart: 150, sourceCount: 100,
+                                        readStart: 150, readCount: 103,
                                         outputStart: 373, outputCount: 250)
         let found = SegmentPlan.problems(in: [holed, other],
                                          sourceFrameCount: 300,
                                          outputFrameCount: 700,
                                          phasePeriod: 2)
-        #expect(found.contains { $0.contains("intervals 99…150") },
+        #expect(found.contains { $0.contains("intervals 100…150") },
                 "the interval gap has to be reported: \(found)")
         #expect(found.contains { $0.contains("output frames 249…373") },
                 "the output gap has to be reported: \(found)")
@@ -353,5 +357,128 @@ struct SegmentPlanTests {
                                      sourceFrameCount: plan.sourceFrameCount,
                                      outputFrameCount: plan.outputFrameCount,
                                      phasePeriod: plan.phasePeriod).isEmpty)
+    }
+
+    // MARK: - The context a segment reads
+
+    /// Why the margins exist: the cut verdict for interval `i` is a function of the
+    /// `historyLength` intervals before it and the two frames after it. A segment that
+    /// read only what it renders would judge its first intervals with a short history and
+    /// its last one with no forward guard, because the tracker calls `finish()` when its
+    /// source ends and end-of-stream semantics are deliberately not mid-stream semantics.
+    @Test("a segment reads the context its cut decisions need")
+    func segmentsReadTheirContext() throws {
+        let plan = try makePlan(rate("24000/1001"), rate("60000/1001"),
+                                frames: 5000, target: 100)
+        #expect(plan.segments.count == 50)
+        #expect(plan.leadIn == SegmentPlan.defaultLeadIn)
+        #expect(plan.leadOut == SegmentPlan.defaultLeadOut)
+        // historyLength is 30, so the lead-in has to be at least that deep or the first
+        // rendered interval is judged against a shorter history than the film's.
+        #expect(plan.leadIn >= 30, "the lead-in has to cover historyLength")
+
+        // The first segment is exempt from the lead-in — see the clamping test below — so
+        // the full-context claim is about the segments that have neighbours both sides.
+        for segment in plan.segments.dropLast().dropFirst() {
+            #expect(segment.leadIn == plan.leadIn, "\(segment.description)")
+            #expect(segment.leadOut == plan.leadOut, "\(segment.description)")
+            // And it reads the far side of its last interval, or it could not render it.
+            #expect(segment.readCount == segment.sourceCount + 1
+                        + segment.leadIn + segment.leadOut, "\(segment.description)")
+        }
+        #expect(plan.problems.isEmpty)
+
+        // Consecutive segments overlap in what they read by the shared frame plus the
+        // context either side. That overlap is the whole reason a segment can be rendered
+        // on its own and still agree with the film.
+        let first = plan.segments[1]
+        let previous = plan.segments[0]
+        #expect(first.readStart < previous.readEnd)
+        #expect(first.readStart == previous.readEnd - (1 + plan.leadIn + plan.leadOut),
+                "\(first.description) against \(previous.description)")
+    }
+
+    @Test("the margins are clamped at the film's own ends rather than invented")
+    func marginsAreClampedAtTheFilm() throws {
+        let plan = try makePlan(rate("24000/1001"), rate("60000/1001"),
+                                frames: 5000, target: 100)
+        // Nothing precedes the film, so the first segment has no lead-in — which is exactly
+        // what the whole-film render has there too.
+        #expect(plan.segments.first?.readStart == 0)
+        #expect(plan.segments.first?.leadIn == 0)
+        // Nothing follows it, so the last segment's lead-out runs off the end and stops
+        // rather than reading frames that do not exist.
+        #expect(plan.segments.last?.readEnd == plan.sourceFrameCount)
+        #expect(plan.segments.last?.leadOut == 0)
+        #expect(plan.problems.isEmpty)
+
+        // A film shorter than the margins still plans, and still clamps.
+        let short = try makePlan(rate("24000/1001"), rate("60000/1001"),
+                                 frames: 40, target: 100)
+        #expect(short.segments.count == 1)
+        #expect(short.segments[0].readStart == 0)
+        #expect(short.segments[0].readEnd == 40)
+        #expect(short.segments[0].sourceCount == 39)
+        #expect(short.problems.isEmpty)
+    }
+
+    @Test("a window names the segment a run renders")
+    func windowDescribesASegment() throws {
+        let plan = try makePlan(rate("24000/1001"), rate("60000/1001"),
+                                frames: 5000, target: 100)
+        let segment = try #require(plan.segments.dropLast().last)
+        let window = InterpolationPipeline.Window(segment: segment)
+
+        // The run reads from where the segment reads, renders only the segment's own
+        // intervals, and numbers its output from the segment's place in the film.
+        #expect(window.readFromInterval == segment.readStart)
+        #expect(window.renderFromInterval == segment.sourceStart)
+        #expect(window.renderToInterval == segment.intervalEnd)
+        #expect(window.outputStart == segment.outputStart)
+    }
+
+    /// The property the margins buy. A run rendering a segment asks for its intervals at
+    /// their film-wide index, which is what `Window` carries; concatenating those runs has
+    /// to give back the film's own output frames, indices and all.
+    @Test("windowed runs reproduce the film's output indices, not just its shapes")
+    func windowedRunsReproduceTheFilm() throws {
+        for (source, output) in pairs() {
+            let planner = IntervalPlanner(source: source, output: output)
+            let frames = 600
+
+            // What the whole film produces, as (index, kind) pairs.
+            var expected: [String] = []
+            for j in 0..<(frames - 1) {
+                for frame in planner.output(forInterval: j) {
+                    expected.append("\(frame.index)\(shape([frame])[0])")
+                }
+            }
+
+            for target in [2, 3, 7, 16, 61, 400] {
+                let plan = try makePlan(source, output, frames: frames, target: target)
+                var rebuilt: [String] = []
+                for segment in plan.segments {
+                    // What a run with this window produces: the segment's intervals, at
+                    // their film-wide indices, written into its own file from zero.
+                    for j in 0..<segment.sourceCount {
+                        for frame in planner.output(forInterval: segment.sourceStart + j) {
+                            rebuilt.append("\(frame.index)\(shape([frame])[0])")
+                        }
+                    }
+                }
+                let what = "\(source) -> \(output), target \(target)"
+                #expect(rebuilt == expected,
+                        "\(what): the joined segments do not reproduce the film")
+                // And the window's output offset is where the segment's first frame sits,
+                // so subtracting it lands the file's own frame 0.
+                let opening = try #require(plan.segments.first)
+                #expect(opening.outputStart == 0)
+                for segment in plan.segments {
+                    let window = InterpolationPipeline.Window(segment: segment)
+                    let head = planner.output(forInterval: segment.sourceStart).first
+                    #expect(head?.index == window.outputStart, "\(what)")
+                }
+            }
+        }
     }
 }
