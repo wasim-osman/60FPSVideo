@@ -609,6 +609,67 @@ These are not choices. Each one is a measured failure mode, and violating any of
     honoured by the presenter when the first frame exists. After the fix the first frame carries film
     time **0.00 s**. The same applies to a seek: a new position means a new decoder, and resuming through
     the same gate costs nothing and starts the clock into a gap otherwise.
+37. **AVFoundation delivers its callbacks to the main queue, so a blocked main thread starves the very
+    events that make an item ready.** Measured three ways while building the sound: a poll loop that
+    slept with `usleep` on the main thread left the item at `.unknown` for 3 s with `rate` reading 1.0
+    and `currentTime` pinned at 0.000; with `RunLoop.main.run(until:)` it reached `.readyToPlay` and
+    advanced at **1.002×**. And a seek's completion handler is **not a way to wait for it** — with the
+    main thread on a semaphore it never arrived at all (3 s timeout, while `currentTime` had already
+    moved to 62.892), because it is delivered to the main queue. `PlaybackAudio.seek` therefore spins
+    the run loop in 2 ms turns, which lands a seek in **2.2–46.8 ms**, one spin in five cases out of
+    five. `currentTime` is also stale the instant `seek` returns: a seek to 60.0 read back 0.807.
+38. **`@preconcurrency` silences the compiler and nothing else — an isolated member still asserts its
+    executor at run time.** `AVSampleBufferDisplayLayer` is `NS_SWIFT_UI_ACTOR`, so conforming it to a
+    protocol the presenter calls from its own thread needed `@preconcurrency` to compile. It compiled,
+    and it passed every test, because every test used a double. The first frame of the first real film:
+    `EXC_BREAKPOINT (SIGTRAP) — dispatch_assert_queue_fail`, in the witness thunk for
+    `VideoDisplay.isReadyForMoreMediaData`, under `DisplayPresenter.waitUntilReady()`.
+    The conformance belongs on **`AVSampleBufferVideoRenderer`** — a plain `NSObject`, no actor — which
+    is what the SDK is asking for anyway: `enqueueSampleBuffer:`, `flush`, `status`, `error`,
+    `requiresFlushToResumeDecoding` and `readyForMoreMediaData` on the *layer* are all deprecated in
+    macOS 15 with the same message, *use `sampleBufferRenderer`'s instead*. The annotation and the
+    deprecation are one instruction, not two: the layer is the UI object and the renderer does the work.
+39. **A count read from an end-of-run report is zero for the whole of the run.** `PlaybackController`
+    built `Status.shown` from `lastReport`, which is assigned in `finish(_:session:)` — the handler for
+    a run that has *ended* — so `nil` became `0` and stayed `0`. The app played the real 4K film
+    correctly, picture advancing, skip counter climbing, sound in sync, while its rate readout said
+    **"0.0 fps of 59.94 presented"** from the first frame to the last. `DisplayPresenter.shown` exists
+    for this and says so ("readable *during* a run, which is the only way a player can show a live drop
+    rate"); the controller was not asking it. The report stays as the fallback for the state after a
+    session is released.
+40. **A play *request* is not a play, so the measurement must be armed on the transition into playing.**
+    Invariant 36 is why: the controller holds the clock until the first frame exists, so at the instant
+    play is pressed nothing has been shown and nothing is running. Arming there and disarming on the
+    first "not playing yet" tick left the rate at zero for the whole of a film — twice, because the
+    first fix moved the arming to the play path and the play path is the wrong instant too. Armed on the
+    transition, it also survives a buffering gap, a seek and a settings reload, none of which is a play
+    request the model ever sees.
+41. **A real-time player has to tell macOS it is doing real-time work.** With the window behind another
+    app the film **stalled**: the transport went back to "play" and the position sat at 0:01:10.3
+    across three samples twelve seconds apart — while the same build in the foreground advanced
+    normally, 798 → 799 → 800 → 801 intervals. `ProcessInfo.beginActivity(options:
+    [.userInitiated, .latencyCritical])` for the life of a session is the fix. After it, in the
+    background: **19.6 fps of 59.94**, and the film advancing 14.6 → 25.0 → 35.4 → 46.0 → 56.5 s across
+    ten-second samples — **1.0× real time, at 4K**, which is what §13 promised and what the readout now
+    says out loud. The assertion is held across a pause as well as a play: releasing it on pause is how
+    you get a player that stutters for a second after every resume while the scheduler works out that it
+    means it again.
+42. **`screencapture -l <windowid>` does not capture a hardware-accelerated video layer — it returns
+    the last composite, and the text updates while the video does not.** A verification pass that
+    captured the player's window by ID and diffed consecutive frames reported **0.0% of pixels
+    changed** across samples 5 s apart, twice, while the interval counter climbed 310 → 394 and the
+    timecode advanced. The conclusion drawn from that — "the picture is frozen" — was wrong, and it
+    was wrong about a build that was playing correctly. Capturing the **whole screen** instead, over
+    the same window region and the same interval, reported **69.0%** and **54.8%** of pixels changed.
+    The tell is that the *text* in the stale capture keeps updating: a capture path that shows fresh
+    counters and frozen video is a capture path that cannot see the video. Use the full-screen path,
+    or a region of it, to verify anything drawn by `AVSampleBufferDisplayLayer`.
+43. **A stalled timecode and a frozen picture are different claims, and only one of them can be read
+    from a screenshot.** Invariant 41's stall was established by the *position* standing still across
+    twelve seconds while the transport read "play" — text and state, both of which the capture renders
+    faithfully. The frozen *pixels* were invariant 42's artifact, inferred from the same images rather
+    than measured, and they were never evidence of anything. When one screenshot is doing two jobs,
+    say which job it is doing.
 
 ---
 
@@ -1691,7 +1752,155 @@ frame exists. First sample after the fix: **0.00 s**.
 
 ---
 
-## What I need from you
+## 25. The shell — built, shipped, and four things that only running it could find
+
+The app is the last piece and the thinnest: the pipeline, the player, the converter, the audio
+and all the arithmetic are in `Interpolator` and tested without a window. What is in
+`Sources/InterpolatorApp/` is the part that needs one.
+
+| File | What it is |
+| --- | --- |
+| `SixtyFPSApp.swift` | `@main`, one `Window`, the menu bar and its shortcuts |
+| `AppModel.swift` | the observable model: settings, the open film, the transport, the queue |
+| `AppSettings.swift` | every recorded decision, in one `Codable` struct |
+| `VideoLayer.swift` | the display host, the `NSView` whose backing layer is the display layer, the file chooser |
+| `PlayerView.swift` | the picture, the transport, the §13 honest readout |
+| `BatchView.swift` | the queue, per-interval progress, projection, the cache |
+| `SettingsView.swift` | each decision, with the reason it was made |
+| `OpenRequest.swift` | files from the Finder, and the app delegate |
+| `Formatting.swift` | timecodes and byte counts |
+
+### What it does
+
+Play a film at 59.94 with the sound, the picture computed as it plays, and an honest readout of
+what that actually costs; or queue films for conversion and watch a bar that runs for four
+hours; or change a recorded decision and see why it was recorded. The player also offers the
+one-click way out — **Interpolate at 1080p** — because §13 requires the app to say that a 4K
+source is playing at a third of the target rate rather than pretend, and a readout that states a
+problem without offering the fix is a readout that is only half honest.
+
+### The four findings
+
+All four are invariants now, and none of them could have been found by reading the code.
+
+**Invariant 38 — `@preconcurrency` silences the compiler and nothing else.** The display layer
+is `NS_SWIFT_UI_ACTOR`; the presenter deliberately is not, because it blocks and a player that
+blocks the main thread has a frozen window. The conformance compiled under
+`@preconcurrency` and passed every test — every test uses a double — and then died on the first
+frame of the first real film, in the witness thunk, under `DisplayPresenter.waitUntilReady()`.
+The conformance is on `AVSampleBufferVideoRenderer` now, which is a plain `NSObject` and is what
+the SDK's own deprecation messages point at.
+
+**Invariant 39 — `Status.shown` was structurally zero during playback.** The counters came from
+`lastReport`, which is assigned when a run *ends*. The app played a film correctly while
+reporting "0.0 fps of 59.94 presented" for the whole of it. `DisplayPresenter.shown` exists for
+exactly this; the controller was not asking it.
+
+**Invariant 40 — a play request is not a play.** Invariant 36 is the reason, and it caught this
+twice: the first fix armed the measurement on the play path, and the play path is the wrong
+instant, because the clock is held until the first frame exists. Armed on the transition into
+playing instead, which also survives a seek and a settings reload.
+
+**Invariant 41 — a real-time player has to say so.** With the window behind another app the film
+stalled: the transport went back to "play" and the position sat at 0:01:10.3 across three samples
+twelve seconds apart. `ProcessInfo.beginActivity` with `.userInitiated` and `.latencyCritical` for
+the life of a session. After it, in the background:
+
+```
+  t= 0 s | 0:00:14.6 | 19.8 fps | 151 of 153721 intervals skipped |  197 late frames
+  t=10 s | 0:00:25.0 | 19.8 fps | 263                       |  339
+  t=20 s | 0:00:35.4 | 19.7 fps | 371                       |  491
+  t=30 s | 0:00:46.0 | 19.7 fps | 484                       |  637
+  t=40 s | 0:00:56.5 | 19.6 fps | 600                       |  776
+```
+
+**19.6 fps presented and 1.0× real time, at 4K, in the background** — against the harness's
+independently measured 18.5–19.0 fps for the same content. Two instruments, one number.
+
+**Invariant 42 — and the instrument has to be able to see the thing it is measuring.** Verifying the
+release build, a pass that captured the player's window by ID and diffed consecutive frames reported
+**0.0% of pixels changed**, twice, on a build whose interval counter had climbed 310 → 394 and whose
+timecode had advanced. `screencapture -l` does not capture a hardware-accelerated video layer: it
+returns the last composite, so the AppKit-drawn text is fresh and the video underneath is not. The
+conclusion drawn from it — "the picture is frozen" — was wrong about a player that was working.
+Capturing the **whole screen** over the same region and the same interval gave **69.0%** and
+**54.8%**. The tell is a capture that shows live counters over dead video.
+
+That mistake is invariant 43's subject and it is worth stating separately, because it is the same
+class of error as invariant 35 and it cost the same kind of time: a *stalled timecode* and a *frozen
+picture* are two claims, only one of them can be read from a screenshot, and the stall was
+established by the position standing still across twelve seconds — text, which the capture renders
+faithfully. The frozen pixels were inferred rather than measured and were never evidence of
+anything.
+
+### Two smaller things the Finder found
+
+**`WindowGroup` opened two windows.** Opening a film from the Finder produced one window from
+the launch and one from the document-open event — both named 60FPS, one of them empty — because
+`WindowGroup` is document-shaped and this app is not. `Window` is a single unique scene, and
+with `applicationShouldTerminateAfterLastWindowClosed` returning true it also removes the only
+way to end up running with no window at all.
+
+**The file chooser must not filter by a type macOS cannot name.** `FileChooser` builds its
+filter from `UTType(filenameExtension:)` and passes the empty array — no filter — if any
+extension resolves to a *dynamic* type, because a dynamic type matches nothing on disk and a
+panel given one greys out the very files the app exists to read. Measured on this machine, all
+eight extensions are declared (`mkv` is `public.matroska`, `ts` is
+`public.mpeg-2-transport-stream`, and every one conforms to `public.movie`), so the filter is
+used — but `isDeclared` means *declared by the system or by some installed app*, and
+`public.matroska` is exactly the kind of UTI a media player brings with it.
+
+### Packaging
+
+SwiftPM produces a bare Mach-O executable; macOS wants a bundle. `scripts/bundle.sh` assembles
+`60FPS.app` — plist, icon, `PkgInfo`, the macOS 15.4 floor stated where the system reads it, and
+`CFBundleDocumentTypes` at rank **Alternate** so the app appears in "Open With" without taking
+MP4 and MOV away from QuickTime. `scripts/make-icon.py` draws the icon from code, so the mark is
+reviewable rather than a blob in the repository.
+
+Signing is **ad-hoc** (`codesign --sign -`) with the hardened runtime. That is not a placeholder
+for signing nobody got round to: it is the only honest option without a Developer ID, and it
+still buys something real — the signature covers the whole bundle, so a modified binary is
+detected rather than run. The script reports Gatekeeper's verdict without treating a refusal as
+an error, and the About panel states the situation in the same words, so the user is not left to
+discover it.
+
+**Measured, and worth stating plainly: Gatekeeper is disabled on this machine** (`spctl` reports
+`override=security disabled`), so the "accepted" the script prints here means nothing about what
+happens on a machine where it is on. The first launch of a real download will need
+System Settings › Privacy & Security › Open Anyway, and that is what the About panel says.
+
+The disk image is a plain one: the app, and a symlink to `/Applications`. The symlink is the
+whole install instruction — without it the user gets a window with an app in it and no statement
+of what to do next, which is how a disk image ends up mounted forever with the app being run
+from inside it.
+
+### First run, installed from the disk image
+
+The bundle was mounted, copied out, and launched the way a user launches it:
+
+```
+open -a /tmp/installed/60FPS.app <film>
+  -> 1 window, 1180x760, playing
+  -> macOS: "60FPS would like to access files in your Desktop folder"
+```
+
+**That prompt is the first-run experience and it is not optional.** The film was on the Desktop,
+and Desktop, Documents and Downloads are protected by TCC. The app is a viewer that has to read
+the user's films, so the prompt is correct — but it arrives with no explanation, at the moment
+the window appears, and a user who clicks "Don't Allow" gets an app that does nothing. This is
+the one thing in the shell I would change before shipping to strangers: say what the app is
+about to ask for *before* the system asks.
+
+### The suite
+
+**366 tests in 30 suites, zero warnings** — including in the test target, where a redundant
+`#require` had been hiding because `swift build` does not compile tests and only `swift test`
+does. `swift build --disable-sandbox` and `swift test --disable-sandbox` are both clean.
+
+---
+
+
 
 **All three answers are in — 2026-10-08.**
 

@@ -351,6 +351,60 @@ interpolator and judge the quality against SVP. Everything else here is measured
 
 ---
 
+## 12. What was actually built — added 2026-10-09
+
+The table above is the feasibility answer, written before any of it existed. This is the same
+questions answered by the thing that now ships. The full record is `BUILD-DECISIONS.md`
+§§13–25; this is the summary, and the row that changed is the 4K one.
+
+| Question | Answer, measured on the built app |
+| --- | --- |
+| Both playback and batch? | **Yes.** One engine, two schedulers, and the batch converter is now the *only* consumer that does not drop anything. |
+| 1080p real-time playback? | **Yes.** 59.94 out, sound in sync, the picture at the target rate. |
+| 4K real-time playback? | **It plays, and it drops.** ~19 fps presented, ~half the intervals not computed, the picture a fifth of a second behind the clock — permanently, and not growing. That is §13's "keep true 4K and accept the drops", made concrete, and the app says so out loud instead of hiding it. |
+| 50 fps sources? | Batch only, unchanged. |
+| Batch throughput? | 4 workers, segments with resume, both containers, audio muxed once over the joined picture. |
+| Output rate | 59.94 (`OutputRatePolicy.standard`), with `exactSixty` as an override. A policy is a *value*, so batch and playback cannot disagree. |
+| HDR | 10-bit P010 end to end, disc metadata carried through, tone-mapped by the system compositor. Verified on the real UHD disc. |
+| Sound | Both, as a setting: MP4 + AAC, or MKV + a bit-for-bit copy. On the real disc the copy is the **AC-3 5.1 compatibility track**, not the DTS-HD MA default — a real track off the disc, prepared in 1.67 s. |
+
+### The three things the numbers above cost
+
+**The sound is the clock.** A compressed stream cannot be retimed, so the soundtrack plays at
+its own rate and the picture follows it. The clock's own rate stays 1 and the *sound* carries
+the speed; putting it in both would advance a 2× film at 4×. The measured A/V lag oscillates
+between 92 and 236 ms over a minute and does not grow — a constant offset is a player working
+at its limit, and a growing one is a player that will be seconds out by the end of a reel. One
+subtraction apart, which is why the harness traces rather than reporting a single number.
+
+**A film is read in pieces and joined once.** A segment renders intervals `[a,b)` but must
+*read* `[a−31, b+2]`: the cut verdict needs thirty intervals of history and two frames of
+lookahead. Resume is **discard, not trust** — only the manifest says a file is complete, and it
+is written after the segment is checked. Audio is muxed once over the joined picture, because
+cutting a compressed stream forces a re-encode.
+
+**Progress is counted in intervals, not frames.** A film of `n` frames has `n − 1` intervals and
+the pipeline's last announced interval is `n − 2`; dividing by the frame count parks the bar at
+99.99% for the last hour of a job, which reads as a hang. The bar also carries the **film's**
+interval number rather than the run's, so a resumed job's bar does not restart at zero — a bar
+that restarts at 0% on a 90%-finished job makes the user think their work was thrown away.
+
+### Two things worth repeating here
+
+**AVFoundation cannot open Matroska.** ffmpeg decodes and describes; AVFoundation encodes. The
+sound therefore needs a route, and there are three with costs 1000× apart: `direct` (open in
+place), `remux` (copy the track into MP4 — **1.94 s** for a whole feature film), `transcode`
+(re-encode to AAC — **4.5 s per 120 s**, about 3.6 minutes). The app prefers a decodable track,
+falls back to a copy, and only re-encodes if there is no choice — and it says which one it took
+in the window, because "the sound is fine" and "the sound was re-encoded" are different claims.
+
+**`-map_chapters -1` is not optional.** ffmpeg carries a Matroska's chapters into MP4 as a
+`bin_data` track as long as the *whole film*: a 120-second extraction reported a duration of
+**5811.447 s**, and `AVAsset.duration` believed it. Every downstream "is this the end of the
+film" comparison was then wrong by a factor of 48.
+
+---
+
 ## Reproduce
 
 ```bash

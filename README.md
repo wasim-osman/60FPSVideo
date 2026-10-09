@@ -34,9 +34,46 @@ setting with 59.94 as its default rather than a constant.
 Batch throughput scales to **~247 output fps aggregate with 4 concurrent workers** — a 2 h film in
 about 29 minutes at 1080p.
 
+## The app — built
+
+**60FPS.app** is a native frame-interpolation player and batch converter for Apple Silicon. It
+plays a film at 59.94 with its own soundtrack, computing the picture as it goes, and it converts
+films in a queue. Both are the same engine with two schedulers.
+
+```bash
+swift build --disable-sandbox          # the library, the harness and the app
+swift test  --disable-sandbox          # 366 tests in 30 suites, zero warnings
+
+scripts/bundle.sh                      # build 60FPS.app (ad-hoc signed)
+scripts/bundle.sh --dmg                # ... and 60FPS-1.0.0.dmg
+open build/60FPS.app --args film.mkv   # or just drag a film onto it
+```
+
+Needs **macOS 15.4** and **ffmpeg** on `PATH` (Homebrew's `/opt/homebrew/bin` is probed
+directly, so a Finder launch works without a shell). MIT licensed.
+
+| | |
+| --- | --- |
+| Playback | 1080p real time. 4K **plays and drops**: ~19 fps presented, ~half the intervals not computed, the picture a fifth of a second behind the clock — permanently, and stated in the window rather than hidden. One click switches to 1080p. |
+| Sound | The soundtrack is the clock. MP4 + AAC by default, or MKV + a bit-for-bit copy of a real track off the disc. |
+| HDR | 10-bit P010 end to end, disc metadata carried through, tone-mapped by the system compositor. |
+| Batch | 4 workers, segments with resume, both containers, audio muxed once over the joined picture. |
+| Output rate | 59.94 (`OutputRatePolicy.standard`); `exactSixty` overrides. A policy is a *value*, so batch and playback cannot disagree. |
+
+The whole record — every measured trap with its numbers — is
+[`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md) §§0–25 and invariants 1–43.
+
 ## Read this first
 
-**→ [`reports/ENGINE-EQUIVALENCE.md`](reports/ENGINE-EQUIVALENCE.md)** ⭐ **latest**
+**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)** ⭐ **latest — §§0–25**
+The index, and the one to read before touching the pipeline. The 14 decisions with measured
+effects and your recorded choices; **§§13–25 are what was built**; and **invariants 1–43** are
+every measured failure mode, each with the numbers that produced it. If you read one thing,
+read the invariants — they are the difference between a build that works and a build that looks
+like it works. §25 covers the shell: the four bugs that only running it could find, the bundle,
+the signing, and what the first launch actually does.
+
+**→ [`reports/ENGINE-EQUIVALENCE.md`](reports/ENGINE-EQUIVALENCE.md)**
 **The RIFE tier question is closed.** VTFrameProcessor and CoreML RIFE 4.25 are statistically
 indistinguishable on real 4K HDR film — 465 of 475 frames within 2/255, and on a ground-truth holdout
 (delete every odd frame, re-create it at t=0.5, score) they differ by 0.105 MAE with |t| = 1.06, while
@@ -53,12 +90,10 @@ Phase 0 executed: RIFE 4.25 converted to CoreML (all 18 warps → `resample`, 68
 benchmarked. **Convertibility solved; real-time disproved** — 25.9 calls/s at 1080p against
 47.9–59.8 needed. Includes the `.all`-is-8×-slower trap and three corrections to earlier reports.
 
-**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)**
-The 14 build decisions with measured effects, your recorded choices, and the consequences of each.
-
 **→ [`reports/PLAYBACK-AND-BATCH.md`](reports/PLAYBACK-AND-BATCH.md)**
 Playback + batch in one app, film-rate sources to 60 fps, the pipelining finding that lifts
 throughput 35%, 60.000 vs 59.94 target rates, concurrency scaling, recommended architecture, risks.
+**§12 is the same questions answered by the thing that now ships.**
 
 **→ [`reports/WHY-NOT-RIFE.md`](reports/WHY-NOT-RIFE.md)**
 Why RIFE isn't the primary engine even though it's MIT and already arm64 — measured head-to-head
@@ -112,10 +147,21 @@ conversion, and the API resolution ceilings. *Partly superseded — see the corr
 
 ```
 60FPSVideo/
+├── Sources/
+│   ├── Interpolator/                 the library: engine, pipeline, player, batch, audio
+│   ├── InterpolatorApp/              the SwiftUI shell (player, queue, settings, about)
+│   └── interp-harness/               headless measurement harness (--play, --convert, …)
+├── Tests/InterpolatorTests/          366 tests in 30 suites
+├── packaging/Info.plist              the bundle's plist, read before the process exists
+├── scripts/
+│   ├── bundle.sh                     assemble 60FPS.app, sign it ad-hoc, write the .dmg
+│   └── make-icon.py                  draw the icon from code
 ├── reports/
-│   ├── PHASE0-COREML-RIFE.md         CoreML conversion + speed spike        (latest)
-│   ├── BUILD-DECISIONS.md            14 decisions, your choices, consequences
-│   ├── PLAYBACK-AND-BATCH.md         playback + batch, 60 fps, film sources
+│   ├── BUILD-DECISIONS.md            §§0–25, invariants 1–43 — read before touching the pipeline
+│   ├── ENGINE-EQUIVALENCE.md         RIFE vs VTFrameProcessor, closed
+│   ├── REAL-CONTENT-AB.md            real 4K HDR film, both engines
+│   ├── PLAYBACK-AND-BATCH.md         feasibility + §12, what was actually built
+│   ├── PHASE0-COREML-RIFE.md         CoreML conversion + speed spike
 │   ├── WHY-NOT-RIFE.md               RIFE/MVTools measured vs VTFrameProcessor
 │   ├── 60FPS-OUTPUT.md               60 fps-only output, per-rate ceilings   (partly superseded)
 │   └── FEASIBILITY-AND-STACK.md      architecture, legal position, stack
