@@ -240,6 +240,10 @@ public enum InterpolatorError: Error, CustomStringConvertible {
     case shortWrite(frame: Int, expected: Int, got: Int)
     case engineRejected(String)
     case unsupportedResolution(width: Int, height: Int, reason: String)
+    /// The output could not be written. Distinct from `engineRejected` because it is
+    /// the *result* that failed, not the interpolation — a run can interpolate every
+    /// frame correctly and still produce nothing usable.
+    case writerFailed(String)
 
     public var description: String {
         switch self {
@@ -249,6 +253,7 @@ public enum InterpolatorError: Error, CustomStringConvertible {
         case .shortWrite(let f, let e, let g): "short write at frame \(f): wanted \(e) bytes, got \(g)"
         case .engineRejected(let m): "engine rejected the request: \(m)"
         case .unsupportedResolution(let w, let h, let r): "\(w)x\(h) unsupported: \(r)"
+        case .writerFailed(let m): "could not write the output: \(m)"
         }
     }
 }

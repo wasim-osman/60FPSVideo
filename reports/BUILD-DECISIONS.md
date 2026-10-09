@@ -471,6 +471,35 @@ These are not choices. Each one is a measured failure mode, and violating any of
     reports both gaps and indices past the end of the plan. Both are silent otherwise — and the second
     is worse than the first, because the file length is derived from the plan, so a frame written past
     the end is written and then thrown away.
+25. **A sink that does not own its pixels gets torn frames, and only on fast motion.** The pipeline
+    releases a slot's buffers as soon as the completion returns — that is the design, and it is what
+    keeps the pool at two requests' worth of memory (invariant 17). So a `FrameSink` that stores a
+    `CVPixelBuffer` and appends it *later* is reading memory the pipeline is entitled to overwrite. The
+    failure is not random noise: a slow shot is almost correct, a fast one is badly wrong, and the final
+    interval is perfect because nothing follows it to clobber the buffers — which is the same signature
+    invariant 17's bug had, for the same reason. `PackedFileSink` was never exposed to this because it
+    copies into its own staging buffer inside `write`. `AssetWriterSink` copies for the same reason: one
+    plane-wise `memcpy` per frame, against an HEVC encode that costs orders of magnitude more, in
+    exchange for independence from the producer's buffer lifetimes. **The display sink will need the
+    same treatment, because `AVSampleBufferDisplayLayer` also reads asynchronously.**
+26. **`AVAssetWriter.inputPixelBufferReceiver` is not a drop-in replacement for the adaptor.** The
+    deprecation message reads like a rename, and it is not one. The receiver takes `CVReadOnlyPixelBuffer`
+    and consumes it with `sending` ownership, which belongs to CoreVideo's typed-buffer API
+    (`CVMutablePixelBuffer`, `CVPixelBufferCreationAttributes`, `CVImageSize`) introduced in **macOS 26** —
+    a world the rest of this codebase does not use, because the pipeline's pool hands out `CVPixelBuffer`.
+    Adopting it means either moving the whole pipeline onto the typed buffers or raising the deployment
+    target from 15.4 to 26, and neither is a change to make as a side effect of writing a sink. So
+    `AssetWriterSink` uses the deprecated pair, **confined to one factory method** with the reason
+    written down. They are deprecated, not removed, and `vt_hdr_encode.swift` measured them carrying
+    HDR10 metadata byte-exact. Note the deprecation does **not** warn at a 15.4 deployment target —
+    Swift only reports it once the target reaches the deprecating version — so this is a decision that
+    has to be *recorded*, because the compiler will not remind anyone.
+27. **`ffmpeg -pix_fmt gray` converts range, so it cannot be used to read back a studio-range encode.**
+    The same family of trap as invariant 22. Decoding a limited-range (16…235) encode to `gray` asks for
+    full-range 8-bit, so ffmpeg stretches it to 0…255 on the way out. Every value read back is then
+    wrong by a scale factor, and it looks exactly like a bug in whatever wrote the file — it cost a
+    round of false suspicion of `AssetWriterSink`'s reorder buffer. Decode to `yuv420p` and read the
+    luma plane, which is the plane the encoder actually wrote.
 
 ---
 
@@ -1067,6 +1096,79 @@ inputs. So a verification pass must be **per-frame with an allowance for a few o
 tolerance: a global ±1 check fails a correct render about one run in ten, and a global ±45 check hides
 a real error on every frame but two. `analysis/compare_packed.py` now implements that policy, and
 prints the outliers it forgives.
+
+---
+
+## 19. The batch converter's output stage — built, and two traps it had to dodge
+
+`AssetWriterSink` is the first `FrameSink` that writes a real file. `PackedFileSink` was the
+measurement instrument; this is the deliverable. Both implement the same contract, and the contract is
+where the difficulty is.
+
+### The contract has a trap in it
+
+`FrameSink.write` is called from the engine's completion threads, **out of order and concurrently**,
+but an `AVAssetWriterInput` takes samples in order. So the sink holds frames in a dictionary keyed by
+output index and releases them in sequence. A frame can therefore sit in the sink while an earlier one
+is still in flight — and that delay is the whole problem, because **the pipeline reuses a slot's
+buffers the moment the completion returns.** Storing a `CVPixelBuffer` and appending it later means
+reading memory the pipeline is entitled to overwrite. That is invariant 25, and its failure signature
+is nasty: a slow shot is almost right, a fast one is badly wrong, and the last interval is perfect
+because nothing follows it.
+
+The fix is to copy. One plane-wise `memcpy` per frame, honouring each buffer's own row stride (the pool
+pads rows, and at 4K the padded stride is routinely wider than the visible width — assuming
+`width * bytesPerSample` shears the picture). The copy costs a fraction of the HEVC encode and buys
+independence from the producer's buffer lifetimes, which the display sink will need for exactly the
+same reason.
+
+### The deprecation that looks like a rename and is not
+
+`AVAssetWriterInputPixelBufferAdaptor` and `AVAssetWriter.add(_:)` are deprecated in macOS 27, with a
+message that reads like a simple rename to `inputPixelBufferReceiver(for:pixelBufferAttributes:)`. It
+is not. The receiver takes `CVReadOnlyPixelBuffer` and consumes it with `sending` ownership, which
+belongs to CoreVideo's typed-buffer API introduced in **macOS 26** — a world this codebase does not use,
+because the pipeline's pool hands out `CVPixelBuffer`. Adopting it means moving the whole pipeline onto
+the typed buffers or raising the deployment target from 15.4 to 26. Neither is a side effect to accept
+while writing a sink, so the deprecated pair stays, confined to one factory method with the reasoning
+attached. And note: **the deprecation does not warn at a 15.4 deployment target** — Swift only reports
+it once the target reaches the deprecating version — so the compiler will never remind anyone. It has
+to be written down (invariant 26).
+
+### Verified by reading the file back, not by inspecting the objects that wrote it
+
+| what | how | result |
+| --- | --- | --- |
+| Out-of-order writes land in order | 12 frames written **in reverse from 12 threads**, each a distinct flat luma; file decoded and every frame's luma compared to its index | exact, to 0.1 code step |
+| Colour tags survive | `ffprobe -show_streams` on the written file | `bt2020` / `smpte2084` present |
+| HDR10 metadata survives | `ffprobe -show_streams` on the written file | Main 10, mastering display and luminance present |
+| Stride mismatch does not shear | copy between two buffers with different row alignment | every visible pixel correct |
+| SDR asks for no HDR metadata | `VideoEncodeSettings.forSource` on an SDR `MediaInfo` | both payloads `nil`, not zeroed |
+
+The order test was checked against a deliberately broken sink: removing the reorder buffer makes
+`finishWriting` fail with status 3, because the writer rejects non-monotonic presentation times. So the
+test fails when the behaviour is absent, which is the only thing that makes it worth having.
+
+**One more tooling trap, and it cost a round of false suspicion of the reorder buffer.** `ffmpeg
+-pix_fmt gray` converts range: a limited-range (16…235) encode decoded to `gray` gets stretched to
+0…255 on the way out, so every value read back is wrong by a scale factor and it looks exactly like a
+bug in whatever wrote the file. Decode to `yuv420p` and read the luma plane (invariant 27).
+
+**Tests: 118 in 14 suites → 124 in 15 suites.**
+
+### What is left in the batch converter
+
+The sink is the output stage only. Still to build, in order:
+
+1. **The driver** — `FFmpegFrameSource` → `InterpolationPipeline` → `AssetWriterSink`, which is
+   assembly rather than new mechanism, now that all three exist.
+2. **Audio** — the reference disc carries **DTS-X 7.1, which cannot be copied into MP4 at all**. The
+   plan is to let ffmpeg mux: `AVAssetWriter` writes a video-only file, then ffmpeg muxes the audio in
+   with `-c:v copy` and either `-c:a copy` (AAC/AC-3/E-AC-3) or a transcode (DTS). That keeps the same
+   split as decode — **ffmpeg handles containers, VideoToolbox handles the encode** — and sidesteps the
+   DTS problem instead of fighting it.
+3. **Segments and resume** — a feature-length job is tens of minutes, and segment-based output is what
+   makes a crash survivable.
 
 ---
 
