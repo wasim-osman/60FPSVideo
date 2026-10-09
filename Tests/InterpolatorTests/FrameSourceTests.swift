@@ -46,9 +46,11 @@ struct FrameSourceTests {
 
             var readBack: [UInt8] = []
             var staging = [UInt8](repeating: 0, count: size)
-            while try staging.withUnsafeMutableBytes { raw in
+            // Parenthesised rather than trailing: `while try x { ... } { ... }` is two
+            // closures in a row and the compiler cannot tell which belongs to which.
+            while try staging.withUnsafeMutableBytes({ raw in
                 try source.read(into: raw.baseAddress!)
-            } {
+            }) {
                 readBack += staging
             }
             #expect(readBack == bytes, "\(format.bitDepth)-bit round trip")

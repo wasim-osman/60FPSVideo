@@ -87,15 +87,25 @@ func parseOptions() -> Options {
         modes:
           --convert IN OUT [options]
                                the batch converter end to end: probe the file,
-                               interpolate it, encode it, report what was delivered.
-                               Options: --policy standard|sixty, --bitrate BPS,
+                               interpolate it, encode it, mux the audio, report what was
+                               delivered. Options: --policy standard|sixty, --bitrate BPS,
                                --max-frames N, --start SECONDS, --overwrite,
-                               --force (convert even when already at target).
+                               --force (convert even when already at target),
+                               --container mp4|mkv (default: from OUT's extension),
+                               --audio automatic|copy|transcode|drop.
           --encode IN.packed OUT.mp4 W H [options]
                                encode a packed stream without interpolating. Options:
                                --format, --rate, --bitrate, --max-frames,
                                --metadata-from FILE (colour tags and HDR10 payloads
                                are taken from that file, through the shipping path).
+          --mux VIDEO SOURCE OUT [options]
+                               the audio stage on its own: take SOURCE's chosen audio
+                               stream and put it into VIDEO without re-encoding the
+                               picture. Options: --container mp4|mkv,
+                               --audio automatic|copy|transcode|drop,
+                               --start SECONDS, --video-seconds D, --bound.
+                               This is how the whole-film bit-perfect copy is checked
+                               without rendering a whole film first.
 
         options:
           --format nv12|p010   sample width of the packed input (default nv12)
@@ -232,8 +242,34 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--probe" {
         } else {
             log("  content light level: absent")
         }
-        log("audio   : \(info.audioCodec ?? "none")"
-            + (info.audioCanPassThroughToMP4 ? "" : "  (cannot be copied into MP4)"))
+        if info.audioTracks.isEmpty {
+            log("audio   : none")
+        }
+        // Every stream, because the usable one is often not the first — on the
+        // reference disc the 7.1 master is stream 1 and the copyable compatibility
+        // track is stream 2.
+        for track in info.audioTracks {
+            log("audio   : #\(track.index) \(track)"
+                + (track.isLossless ? "  lossless" : "")
+                + (track.isDefault ? "  [default]" : "")
+                + (MediaInfo.audioPassThroughCodecs.contains(track.codec)
+                   ? "  -> MP4 ok" : "  -> MP4 needs a transcode"))
+        }
+        // What each policy would do, so the decision is visible without running a job.
+        // Both halves matter: a whole-film conversion copies, and a partial render
+        // cannot, because a compressed stream only cuts at a packet boundary.
+        for candidate in AudioMuxPolicy.all {
+            do {
+                let whole = try candidate.plan(for: info).summary
+                log("policy  : \(candidate.label) -> \(whole)")
+                let cut = try candidate.plan(for: info, cutting: true).summary
+                if cut != whole {
+                    log("           when cut -> \(cut)")
+                }
+            } catch {
+                log("policy  : \(candidate.label) -> refuses: \(error)")
+            }
+        }
         exit(0)
     } catch {
         fail("\(error)")
@@ -454,6 +490,130 @@ if CommandLine.arguments.count >= 6, CommandLine.arguments[1] == "--encode" {
     }
 }
 
+// ---------------------------------------------------------------- mux mode
+//
+// `interp-harness --mux VIDEO SOURCE OUT [options]` runs the audio stage on its own.
+//
+// It exists because the shipping audio path — a whole film, no seek, no bound, so the
+// track is copied bit for bit — cannot be reached any other way without rendering a
+// two-hour film first, and "we could not check it" is not the same as "it works".
+// Here a short extract of the real disc stands in for the film, and the copy path is
+// exercised exactly as the converter would run it.
+
+if CommandLine.arguments.count >= 5, CommandLine.arguments[1] == "--mux" {
+    let videoPath = CommandLine.arguments[2]
+    let sourcePath = CommandLine.arguments[3]
+    let outputPath = CommandLine.arguments[4]
+
+    var policy = AudioMuxPolicy.forOutput(URL(fileURLWithPath: outputPath))
+    var start: Double? = nil
+    var videoSeconds = 0.0
+    var bound = false
+
+    let rest = Array(CommandLine.arguments.dropFirst(5))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--container":
+            k += 1
+            guard k < rest.count, let named = AudioMuxPolicy.named(rest[k]) else {
+                fail("--container needs mp4 or mkv")
+            }
+            policy = AudioMuxPolicy(container: named.container, handling: policy.handling)
+        case "--audio":
+            k += 1
+            guard k < rest.count,
+                  let handling = AudioMuxPolicy.Handling(rawValue: rest[k]) else {
+                fail("--audio needs automatic, copy, transcode or drop")
+            }
+            policy.handling = handling
+        case "--start":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else {
+                fail("--start needs a number of seconds")
+            }
+            start = value
+        case "--video-seconds":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else {
+                fail("--video-seconds needs a number")
+            }
+            videoSeconds = value
+        case "--bound":
+            bound = true
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+
+    do {
+        let info = try MediaProbe.probe(URL(fileURLWithPath: sourcePath))
+        // The cut is decided by the same rule the converter uses, so this cannot
+        // disagree with the shipping path about what is possible.
+        let cutting = (start ?? 0) > 0 || bound
+        let plan = try policy.plan(for: info, cutting: cutting)
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+
+        let request = MuxRequest(
+            video: URL(fileURLWithPath: videoPath),
+            source: sourceURL,
+            output: URL(fileURLWithPath: outputPath),
+            plan: plan,
+            audioStart: start.map { AudioMuxer.alignedStart($0, rate: info.frameRate) },
+            videoSeconds: videoSeconds,
+            boundAudio: bound,
+            frameTolerance: 1.0 / info.frameRate.doubleValue,
+            sourceChapters: info.chapterCount)
+
+        log("source : \(sourcePath)")
+        log("video  : \(videoPath)")
+        log("output : \(outputPath)")
+        // The picture's earliest *raw* packet time, which is what decides whether ffmpeg
+        // will rebase the whole output to lift the picture to zero. A negative value here
+        // is not a defect in the input — it is an encoder's reorder delay, which the source
+        // container cancelled with an edit list — but it is the cause of a silent A/V
+        // desync in Matroska, so it is worth stating before the mux rather than deducing
+        // from the offset afterwards.
+        let videoStartOffset = (try? AudioMuxer.probeMinPTS(
+            at: URL(fileURLWithPath: videoPath))) ?? 0
+        if videoStartOffset < 0 {
+            // Stated as a fact about the input, not a promise about the output: whether it
+            // is compensated for depends on the container, and that is the mux's answer to
+            // give. The outcome line below says what was actually applied.
+            log(String(format: "rebase : picture packets start %.1f ms below zero — an encoder "
+                        + "reorder delay the source container carried as an edit list",
+                        -videoStartOffset * 1000))
+        }
+        for track in info.audioTracks { log("         \(track)") }
+        log("plan   : \(plan.summary)")
+        if let aligned = request.audioStart {
+            log(String(format: "seek   : %.6f s (aligned from %.6f)", aligned, start ?? 0))
+        }
+
+        let outcome = try AudioMuxer().mux(request)
+        log(String(format: "muxed  : %.2f MB", Double(outcome.bytes) / 1e6))
+        log("result : \(outcome.summary)")
+        if outcome.audioOffset < 0 {
+            log(String(format: "         audio offset %.1f ms, cancelling the picture's rebase",
+                       -outcome.audioOffset * 1000))
+        }
+        if let streams = outcome.streams {
+            log("         \(streams)")
+            if let offset = outcome.offset {
+                log(String(format: "         A/V offset %.1f ms", offset * 1000))
+            }
+        }
+        if !outcome.isClean {
+            for problem in outcome.problems { log("  problem: " + problem) }
+            exit(1)
+        }
+        exit(0)
+    } catch {
+        fail("\(error)")
+    }
+}
+
 // ---------------------------------------------------------------- convert
 
 // The batch converter, end to end, on a real file. Everything here is assembly —
@@ -472,6 +632,7 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     var start: Double? = nil
     var overwrite = false
     var force = false
+    var audioPolicy: AudioMuxPolicy? = nil
 
     let rest = Array(CommandLine.arguments.dropFirst(4))
     var k = 0
@@ -483,6 +644,20 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                 fail("--policy needs standard or sixty")
             }
             policy = named
+        case "--container":
+            k += 1
+            guard k < rest.count, let named = AudioMuxPolicy.named(rest[k]) else {
+                fail("--container needs mp4 or mkv")
+            }
+            audioPolicy = named
+        case "--audio":
+            k += 1
+            guard k < rest.count,
+                  let handling = AudioMuxPolicy.Handling(rawValue: rest[k]) else {
+                fail("--audio needs automatic, copy, transcode or drop")
+            }
+            audioPolicy = AudioMuxPolicy(container: (audioPolicy ?? .default).container,
+                                         handling: handling)
         case "--bitrate":
             k += 1
             guard k < rest.count, let value = Int(rest[k]) else {
@@ -519,7 +694,8 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
         maximumSourceFrames: limit,
         startSeconds: start,
         overwrite: overwrite,
-        convertWhenAlreadyAtTarget: force)
+        convertWhenAlreadyAtTarget: force,
+        audio: audioPolicy)
 
     log("input  : \(inputPath)")
     log("output : \(outputPath)")
@@ -547,6 +723,31 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                    + "%.1f s of video",
                    Double(result.bytes) / 1e6, result.megabitsPerSecond,
                    result.bitsPerPixelPerFrame, result.outputSeconds))
+        // The audio decision is printed in full, including what was passed over. A
+        // silently transcoded soundtrack is indistinguishable from a copied one until
+        // someone listens on a good system.
+        log("audio  : \(result.audioPolicy.label)")
+        for track in info.audioTracks {
+            log("         source: \(track)"
+                + (track.isLossless ? "  (lossless)" : "")
+                + (track.isDefault ? "  [default]" : ""))
+        }
+        if let audio = result.audio {
+            log("         \(audio.summary)")
+            if audio.audioOffset < 0 {
+                log(String(format: "         audio offset %.1f ms, cancelling the picture's rebase",
+                           -audio.audioOffset * 1000))
+            }
+            if let streams = audio.streams {
+                log("         \(streams)")
+                if let offset = audio.offset {
+                    log(String(format: "         A/V offset %.1f ms",
+                               offset * 1000))
+                }
+            }
+        } else {
+            log("         none (the source has no audio, or it was dropped)")
+        }
         // Cost per source frame is the number that projects. 2 h at 23.976 is 172 627
         // source frames; at 4K it is the difference between an evening and a night.
         let throughput = result.wallSeconds > 0

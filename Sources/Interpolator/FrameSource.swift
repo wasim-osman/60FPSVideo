@@ -226,7 +226,7 @@ public final class PackedFileFrameSource: FrameSource, @unchecked Sendable {
             pixelFormat: format == .p010 ? "p010le" : "nv12", format: format,
             colorPrimaries: nil, transferFunction: nil, colorSpace: nil,
             colorRange: nil, masteringDisplay: nil, contentLightLevel: nil,
-            audioCodec: nil, audioChannels: nil)
+            audioTracks: [], chapterCount: 0)
     }
 
     public func read(into destination: UnsafeMutableRawPointer) throws -> Bool {

@@ -72,6 +72,13 @@ public struct BatchConverter: Sendable {
         /// extra generation of quality loss is accepted.
         public var convertWhenAlreadyAtTarget: Bool
 
+        /// How to bring the audio across.
+        ///
+        /// `nil` derives one from the output's extension — `.mkv` gets a bit-perfect
+        /// copy of the disc's own track, anything else gets the MP4 policy. Naming one
+        /// explicitly is how you ask for the other, or for the audio to be dropped.
+        public var audio: AudioMuxPolicy?
+
         public init(input: URL,
                     output: URL,
                     policy: OutputRatePolicy = .default,
@@ -81,7 +88,8 @@ public struct BatchConverter: Sendable {
                     maximumSourceFrames: Int? = nil,
                     startSeconds: Double? = nil,
                     overwrite: Bool = false,
-                    convertWhenAlreadyAtTarget: Bool = false) {
+                    convertWhenAlreadyAtTarget: Bool = false,
+                    audio: AudioMuxPolicy? = nil) {
             self.input = input
             self.output = output
             self.policy = policy
@@ -92,6 +100,7 @@ public struct BatchConverter: Sendable {
             self.startSeconds = startSeconds
             self.overwrite = overwrite
             self.convertWhenAlreadyAtTarget = convertWhenAlreadyAtTarget
+            self.audio = audio
         }
     }
 
@@ -114,10 +123,18 @@ public struct BatchConverter: Sendable {
         /// Pipeline failures and sink failures together, plus anything the read-back
         /// check found. An empty list is the only definition of a clean run.
         public let problems: [String]
+        /// What happened to the audio. `nil` when there was nothing to mux.
+        public let audio: AudioMuxer.Outcome?
+        /// The audio policy that was actually applied — the request's, or the one the
+        /// output's extension implied.
+        public let audioPolicy: AudioMuxPolicy
 
         public var isClean: Bool { problems.isEmpty }
         public var cutCount: Int { report.cutCount }
         public var outputFrames: Int { report.outputFrames }
+
+        /// The container the file ended up in.
+        public var container: AudioMuxPolicy.Container { audioPolicy.container }
 
         /// The duration the written frames represent, derived from the rate rather
         /// than read back from a container that may not have been finalised.
@@ -184,6 +201,14 @@ public struct BatchConverter: Sendable {
     /// a GPU, which is where the bugs that matter here actually live.
     public var makeEngine: @Sendable (FrameRate, FrameRate, Int) throws -> InterpolationEngine
 
+    /// The audio stage. Injectable so a test can drive the whole converter — ordering,
+    /// count check, cleanup, and the decision to mux or not — without ffmpeg.
+    ///
+    /// A closure rather than an `AudioMuxer` value, so a test can read the *request* the
+    /// converter built. Asserting on the plan the converter decided is the point; going
+    /// through ffmpeg's argument list to infer it back is not.
+    public var mux: @Sendable (MuxRequest) throws -> AudioMuxer.Outcome
+
     /// The shipping configuration: ffprobe, ffmpeg, `VTFrameProcessor`, and an
     /// `AVAssetWriter`.
     public init() {
@@ -198,16 +223,21 @@ public struct BatchConverter: Sendable {
         self.makeEngine = { source, output, depth in
             VTFrameProcessorEngine(source: source, output: output, depth: depth)
         }
+        self.mux = { try AudioMuxer().mux($0) }
     }
 
     public init(probe: @escaping @Sendable (URL) throws -> MediaInfo,
                 makeSource: @escaping @Sendable (URL, MediaInfo, Double?, Int?) throws -> FrameSource,
                 makeSink: @escaping @Sendable (URL, VideoEncodeSettings) throws -> FrameCountingSink,
-                makeEngine: @escaping @Sendable (FrameRate, FrameRate, Int) throws -> InterpolationEngine) {
+                makeEngine: @escaping @Sendable (FrameRate, FrameRate, Int) throws -> InterpolationEngine,
+                mux: @escaping @Sendable (MuxRequest) throws -> AudioMuxer.Outcome = {
+                    try AudioMuxer().mux($0)
+                }) {
         self.probe = probe
         self.makeSource = makeSource
         self.makeSink = makeSink
         self.makeEngine = makeEngine
+        self.mux = mux
     }
 
     // MARK: - Run
@@ -230,18 +260,40 @@ public struct BatchConverter: Sendable {
             throw Failure.outputExists(request.output.path)
         }
 
+        // The audio decision is made *before* any work happens, so a request that
+        // cannot be honoured — "copy the DTS into MP4" — fails in a second rather than
+        // after a two-hour render.
+        let audioPolicy = request.audio ?? AudioMuxPolicy.forOutput(request.output)
+        // Whether this render cuts the audio at a point that is not the start of the
+        // stream. It changes what is possible: a compressed stream can only be cut at a
+        // packet boundary, so a cut means a re-encode.
+        let cutting = (request.startSeconds ?? 0) > 0 || request.maximumSourceFrames != nil
+        let audioPlan = try audioPolicy.plan(for: info, cutting: cutting)
+
         // Beside the destination, so the final move is a rename inside one volume — and
         // so that a crashed job leaves something obviously unfinished. It also keeps
         // `AssetWriterSink.begin`, which deletes its own output path, away from the
         // user's file.
+        //
+        // Two intermediates now, because the audio stage sits between them: the video
+        // is written to `staging`, muxed into `temporary`, and only `temporary` is ever
+        // renamed into place. `staging` is always `.mp4` — that is what `AVAssetWriter`
+        // writes, and ffmpeg's demuxer picks its reader from the extension.
+        let staging = Self.stagingURL(beside: request.output)
         let temporary = Self.temporaryURL(beside: request.output)
+        try? manager.removeItem(at: staging)
         try? manager.removeItem(at: temporary)
 
         var placed = false
-        defer { if !placed { try? manager.removeItem(at: temporary) } }
+        defer {
+            // The staging file is an intermediate and never a deliverable, so it goes
+            // whatever happened.
+            try? manager.removeItem(at: staging)
+            if !placed { try? manager.removeItem(at: temporary) }
+        }
 
         let settings = VideoEncodeSettings.forSource(info, bitRate: request.bitRate)
-        let sink = try makeSink(temporary, settings)
+        let sink = try makeSink(staging, settings)
         let source = try makeSource(request.input, info,
                                     request.startSeconds, request.maximumSourceFrames)
         let engine = try makeEngine(info.frameRate, resolution.output, request.depth)
@@ -265,22 +317,62 @@ public struct BatchConverter: Sendable {
             throw Failure.shortOutput(expected: report.outputFrames, written: written)
         }
 
+        // How long the picture is, derived from the rate rather than read back from a
+        // container that has not been finalised. This is the number the audio has to
+        // agree with, and it is exact: `written` frames at a rational rate.
+        let videoSeconds = resolution.output.doubleValue > 0
+            ? Double(written) / resolution.output.doubleValue : 0
+
+        var problems: [String] = []
+
         // `moveItem` refuses an existing destination, so a replacement has to be
         // explicit — without this, `overwrite` would run the whole film and then throw
         // at the last step, which is the most expensive possible way to fail. Removing
         // first leaves a window where neither file exists; that is the safe direction,
         // because a crash there loses the old output and leaves an obvious `.partial-`
         // file rather than producing something half of each.
-        if request.overwrite, manager.fileExists(atPath: request.output.path) {
-            try manager.removeItem(at: request.output)
+        func place(_ url: URL) throws {
+            if request.overwrite, manager.fileExists(atPath: request.output.path) {
+                try manager.removeItem(at: request.output)
+            }
+            try manager.moveItem(at: url, to: request.output)
+            placed = true
         }
-        try manager.moveItem(at: temporary, to: request.output)
-        placed = true
+
+        var audio: AudioMuxer.Outcome?
+        if audioPlan.isSilent {
+            // Nothing to mux, so the staged video *is* the answer.
+            try place(staging)
+        } else {
+            let outcome = try mux(MuxRequest(
+                video: staging,
+                source: request.input,
+                output: temporary,
+                plan: audioPlan,
+                // Snapped to the frame grid, because that is where the picture starts:
+                // `-ss` discards frames until the requested instant, so the first frame
+                // out is the first one at or *after* the seek. Seeking the audio to the
+                // raw request would put it up to a frame early on every conversion.
+                audioStart: request.startSeconds.map {
+                    AudioMuxer.alignedStart($0, rate: info.frameRate)
+                },
+                videoSeconds: videoSeconds,
+                // A partial render must not produce a file whose audio outlives its
+                // picture. A full one keeps the audio's own length, because a score
+                // legitimately runs past the last frame.
+                boundAudio: request.maximumSourceFrames != nil,
+                frameTolerance: 1.0 / info.frameRate.doubleValue,
+                sourceChapters: info.chapterCount))
+            audio = outcome
+            problems += outcome.problems
+            try place(temporary)
+        }
 
         let size = (try? manager.attributesOfItem(atPath: request.output.path))?[.size]
         let bytes = (size as? NSNumber)?.int64Value ?? 0
 
-        var problems = report.problems + sink.problems
+        problems += report.problems
+        problems += sink.problems
 
         // Read the finished file back, rather than trusting the objects that wrote it.
         // The in-process count proves frames were *placed*; only the container proves
@@ -302,7 +394,9 @@ public struct BatchConverter: Sendable {
                       written: written,
                       bytes: bytes,
                       wallSeconds: report.wallSeconds,
-                      problems: problems)
+                      problems: problems,
+                      audio: audio,
+                      audioPolicy: audioPolicy)
     }
 
     // MARK: - Helpers
@@ -334,5 +428,18 @@ public struct BatchConverter: Sendable {
         let unique = String(UUID().uuidString.prefix(8)).lowercased()
         return output.deletingLastPathComponent()
             .appendingPathComponent("\(stem).partial-\(unique).\(ext)")
+    }
+
+    /// The video-only intermediate, between the encoder and the mux.
+    ///
+    /// Always `.mp4`: that is what `AVAssetWriter` writes, and ffmpeg's demuxer picks
+    /// its reader from the extension, so naming it `.mkv` would hand it a Matroska
+    /// reader for an MP4 file. The `video-` marker keeps it distinct from the
+    /// `partial-` file, which is the one that is nearly a deliverable.
+    static func stagingURL(beside output: URL) -> URL {
+        let stem = output.deletingPathExtension().lastPathComponent
+        let unique = String(UUID().uuidString.prefix(8)).lowercased()
+        return output.deletingLastPathComponent()
+            .appendingPathComponent("\(stem).video-\(unique).mp4")
     }
 }

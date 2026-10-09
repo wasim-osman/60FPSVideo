@@ -164,7 +164,7 @@ struct AssetWriterSinkTests {
             colorPrimaries: "bt2020", transferFunction: "smpte2084",
             colorSpace: "bt2020nc", colorRange: "tv",
             masteringDisplay: mastering, contentLightLevel: light,
-            audioCodec: nil, audioChannels: nil)
+            audioTracks: [], chapterCount: 0)
 
         let settings = VideoEncodeSettings.forSource(info)
         #expect(settings.masteringDisplay == mastering.seiPayload)
@@ -181,7 +181,7 @@ struct AssetWriterSinkTests {
             colorPrimaries: "bt709", transferFunction: "bt709",
             colorSpace: "bt709", colorRange: "tv",
             masteringDisplay: nil, contentLightLevel: nil,
-            audioCodec: nil, audioChannels: nil)
+            audioTracks: [], chapterCount: 0)
         let sdrSettings = VideoEncodeSettings.forSource(sdr)
         #expect(sdrSettings.masteringDisplay == nil)
         #expect(sdrSettings.contentLightLevel == nil)

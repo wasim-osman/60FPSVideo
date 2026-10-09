@@ -38,7 +38,7 @@ final class SyntheticFrameSource: FrameSource, @unchecked Sendable {
             pixelFormat: format == .p010 ? "p010le" : "nv12", format: format,
             colorPrimaries: nil, transferFunction: nil, colorSpace: nil,
             colorRange: nil, masteringDisplay: nil, contentLightLevel: nil,
-            audioCodec: nil, audioChannels: nil)
+            audioTracks: [], chapterCount: 0)
     }
 
     /// The pattern for one frame, as packed bytes. Deterministic, so a test can
@@ -546,7 +546,7 @@ final class CutFrameSource: FrameSource, @unchecked Sendable {
             pixelFormat: "nv12", format: format,
             colorPrimaries: nil, transferFunction: nil, colorSpace: nil,
             colorRange: nil, masteringDisplay: nil, contentLightLevel: nil,
-            audioCodec: nil, audioChannels: nil)
+            audioTracks: [], chapterCount: 0)
     }
 
     func packedFrame(_ index: Int) -> [UInt8] {

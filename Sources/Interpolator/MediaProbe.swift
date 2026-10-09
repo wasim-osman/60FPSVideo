@@ -53,9 +53,32 @@ public struct MediaInfo: Sendable {
     public let masteringDisplay: MasteringDisplay?
     public let contentLightLevel: ContentLightLevel?
 
-    /// First audio stream's codec, for deciding whether it can be passed through.
-    public let audioCodec: String?
-    public let audioChannels: Int?
+    /// Every audio stream, in the container's order.
+    ///
+    /// All of them rather than the first, because the *first* is frequently not the
+    /// useful one. Measured on the reference disc: stream 1 is DTS-HD MA + DTS:X 7.1
+    /// and stream 2 is an AC-3 5.1 compatibility track. The 7.1 is the one worth
+    /// keeping and the 5.1 is the only one that can go into an MP4 bit-perfect, so a
+    /// decision made from `first` alone gets *both* halves wrong — it would transcode
+    /// a track it could have copied, or copy one it should have kept in full.
+    public let audioTracks: [AudioTrack]
+
+    /// How many chapter marks the container states.
+    ///
+    /// Worth carrying because it is a thing that vanishes without a word. ffmpeg's MP4
+    /// muxer writes the source's chapters as a QuickTime chapter track — a `text`
+    /// track referenced by the video track's `tref`, which `ffprobe` reports as an
+    /// extra `bin_data` stream nobody asked for. That is correct and desirable (the
+    /// film keeps its chapter marks), but it is also exactly the kind of thing a later
+    /// `-map_metadata -1` would silently delete, so the count is read back and
+    /// compared rather than assumed.
+    public let chapterCount: Int
+
+    /// The first audio stream's codec. Convenience for callers that only need
+    /// "is there audio, and roughly what".
+    public var audioCodec: String? { audioTracks.first?.codec }
+    public var audioChannels: Int? { audioTracks.first?.channels }
+    public var hasAudio: Bool { !audioTracks.isEmpty }
 
     /// True when the transfer function is a high-dynamic-range one. This is the
     /// switch that decides whether the pipeline runs 8-bit or 10-bit.
@@ -65,8 +88,8 @@ public struct MediaInfo: Sendable {
             .contains(transferFunction)
     }
 
-    /// A copy with the audio stream's details filled in.
-    public func withAudio(codec: String?, channels: Int?) -> MediaInfo {
+    /// A copy with the audio streams and chapter count filled in.
+    public func withAudio(_ tracks: [AudioTrack], chapters: Int) -> MediaInfo {
         MediaInfo(url: url, width: width, height: height, frameRate: frameRate,
                   frameCount: frameCount, duration: duration,
                   pixelFormat: pixelFormat, format: format,
@@ -74,21 +97,112 @@ public struct MediaInfo: Sendable {
                   colorSpace: colorSpace, colorRange: colorRange,
                   masteringDisplay: masteringDisplay,
                   contentLightLevel: contentLightLevel,
-                  audioCodec: codec, audioChannels: channels)
+                  audioTracks: tracks, chapterCount: chapters)
     }
 
-    /// Audio codecs that can be copied into an MP4/MOV container unchanged.
+    /// Audio codecs an MP4/MOV container can carry.
     ///
-    /// The reference disc carries DTS-X 7.1, which is exactly the case this exists
-    /// for: it cannot go into MP4, and silently dropping it would be worse than
-    /// saying so.
+    /// ## Why this is a list we keep, and not something ffmpeg decides
+    ///
+    /// The original justification here was that "DTS cannot be copied into MP4 at
+    /// all". **That is false, and it was measured.** `ffmpeg -c:a copy -f mp4` writes a
+    /// DTS track without complaint — the only diagnostic is a benign
+    /// `codec frame size is not set`, and the file comes out at the full 1.7 MB. What
+    /// actually happens is worse than a refusal: **macOS cannot open the result**
+    /// (`AudioFileOpenURL failed` on a file that ffmpeg reports as a valid MP4 with a
+    /// valid DTS stream). DTS is not in the MP4 registry; ffmpeg will write the
+    /// non-standard fourcc anyway and most players will then refuse it.
+    ///
+    /// So the rule is not "ffmpeg will stop us" — it is that **the container's codec
+    /// registry is a policy this app states**, because a file that is technically
+    /// writable and practically unplayable is the exact failure mode this project
+    /// keeps having to design against. Measured on the same clip: AC-3 5.1 copies into
+    /// MP4 and macOS opens it; AAC 7.1 transcodes to a real 8-channel 7.1 track at
+    /// ~636 kbps and macOS opens that too.
     public static let audioPassThroughCodecs: Set<String> =
         ["aac", "ac3", "eac3", "alac", "mp3"]
+
+    /// Codecs a Matroska container can carry unchanged. Everything the MP4 set holds,
+    /// plus the ones a BluRay actually ships with.
+    public static let matroskaAudioCodecs: Set<String> =
+        audioPassThroughCodecs.union(["dts", "truehd", "flac", "opus", "vorbis", "pcm_s16le",
+                                      "pcm_s24le", "pcm_bluray", "pcm_dvd"])
 
     /// Whether the audio can be copied into an MP4/MOV container unchanged.
     public var audioCanPassThroughToMP4: Bool {
         guard let audioCodec else { return true }
         return MediaInfo.audioPassThroughCodecs.contains(audioCodec)
+    }
+}
+
+/// One audio stream, as the container states it.
+///
+/// The fields are the ones a decision actually needs. `index` is ffmpeg's own stream
+/// index in the source, which is what `-map` takes — so a plan can name the track it
+/// chose without re-deriving the mapping later and getting it wrong.
+public struct AudioTrack: Sendable, Equatable, CustomStringConvertible {
+
+    /// ffmpeg's stream index in the source file. `-map 1:<index>` in the mux.
+    public let index: Int
+    public let codec: String
+    /// e.g. `DTS-HD MA + DTS:X`. Needed to tell lossless DTS from the lossy core,
+    /// which the codec name alone cannot express.
+    public let profile: String?
+    public let channels: Int?
+    /// ffmpeg's name for it: `7.1`, `5.1(side)`, `stereo`, …
+    public let channelLayout: String?
+    public let sampleRate: Int?
+    public let bitRate: Int?
+    /// The container's own default disposition.
+    public let isDefault: Bool
+
+    public init(index: Int, codec: String, profile: String? = nil,
+                channels: Int? = nil, channelLayout: String? = nil,
+                sampleRate: Int? = nil, bitRate: Int? = nil,
+                isDefault: Bool = false) {
+        self.index = index
+        self.codec = codec
+        self.profile = profile
+        self.channels = channels
+        self.channelLayout = channelLayout
+        self.sampleRate = sampleRate
+        self.bitRate = bitRate
+        self.isDefault = isDefault
+    }
+
+    /// Whether the *stream itself* is lossless.
+    ///
+    /// DTS is the case that needs the profile: plain DTS core is lossy, and DTS-HD MA
+    /// — which is what a BluRay actually carries — is not. Reading the codec name
+    /// alone would call a lossless track lossy, which is the difference between
+    /// "copy this, it is the master" and "transcode it, it is already degraded".
+    public var isLossless: Bool {
+        switch codec {
+        case "truehd", "mlp", "flac", "alac":
+            return true
+        case "dts":
+            let profile = self.profile ?? ""
+            return profile.contains("MA") || profile.contains("X")
+        default:
+            return codec.hasPrefix("pcm_")
+        }
+    }
+
+    public var description: String {
+        // A profile frequently restates the codec — `dts` with profile
+        // `DTS-HD MA + DTS:X` — and printing both gives "DTS DTS-HD MA + DTS:X",
+        // which reads like a different track from the one the file has.
+        let name = codec.uppercased()
+        var parts: [String] = []
+        if let profile, !profile.isEmpty {
+            parts.append(profile.uppercased().hasPrefix(name) ? profile : "\(name) \(profile)")
+        } else {
+            parts.append(name)
+        }
+        if let channelLayout { parts.append(channelLayout) }
+        else if let channels { parts.append("\(channels) ch") }
+        if let bitRate { parts.append("\(bitRate / 1000) kbps") }
+        return parts.joined(separator: " ")
     }
 }
 
@@ -273,22 +387,59 @@ public enum MediaProbe {
         // `v:0` excludes the audio stream rather than describing it. The batch
         // converter needs the codec to decide whether the audio can be copied into
         // an MP4, and "cannot" has to be known before the job starts rather than
-        // discovered when the mux fails at the end.
-        if let audio = try? audioStream(url) {
-            info = info.withAudio(codec: audio.codec, channels: audio.channels)
+        // discovered when the mux fails at the end. *Every* audio stream is read,
+        // because on the reference disc the usable one is the second. Chapters ride
+        // along on the same call — they are metadata, so it costs nothing to ask.
+        if let extra = try? trackInfo(url) {
+            info = info.withAudio(extra.tracks, chapters: extra.chapters)
         }
         return info
     }
 
-    static func audioStream(_ url: URL) throws -> (codec: String?, channels: Int?) {
+    /// Every audio stream, and the chapter count, in one ffprobe call.
+    ///
+    /// No `-select_streams` filter: it filters *out* rather than describing, so the
+    /// unfiltered stream list is the only way to see all of them at once. The video
+    /// streams are dropped on the `codec_type` field, which is cheap.
+    static func trackInfo(_ url: URL) throws -> (tracks: [AudioTrack], chapters: Int) {
         let json = try run([
-            "-v", "error", "-select_streams", "a:0",
-            "-show_streams", "-of", "json", url.path,
+            "-v", "error",
+            "-show_streams", "-show_chapters", "-of", "json", url.path,
         ])
-        guard let root = try JSONSerialization.jsonObject(with: json) as? [String: Any],
-              let streams = root["streams"] as? [[String: Any]],
-              let stream = streams.first else { return (nil, nil) }
-        return (stream["codec_name"] as? String, stream["channels"] as? Int)
+        guard let root = try JSONSerialization.jsonObject(with: json) as? [String: Any] else {
+            return ([], 0)
+        }
+        let streams = root["streams"] as? [[String: Any]] ?? []
+
+        let tracks: [AudioTrack] = streams.compactMap { stream in
+            guard stream["codec_type"] as? String == "audio",
+                  let index = stream["index"] as? Int,
+                  let codec = stream["codec_name"] as? String else { return nil }
+            // ffprobe reports numeric stream fields as strings when they come from
+            // the container rather than the decoder, so both forms are accepted —
+            // invariant 29, learned the expensive way on `nb_frames`.
+            let disposition = stream["disposition"] as? [String: Any]
+            return AudioTrack(
+                index: index,
+                codec: codec,
+                profile: stream["profile"] as? String,
+                channels: intValue(stream["channels"]),
+                channelLayout: stream["channel_layout"] as? String,
+                sampleRate: intValue(stream["sample_rate"]),
+                bitRate: intValue(stream["bit_rate"]),
+                isDefault: intValue(disposition?["default"]) == 1)
+        }
+        let chapters = (root["chapters"] as? [[String: Any]])?.count ?? 0
+        return (tracks, chapters)
+    }
+
+    /// An ffprobe field that may be a JSON number or a numeric string.
+    ///
+    /// Both happen, for the same field, depending on whether the value came from the
+    /// container or from the decoder — `nb_frames` was silently nil for every file
+    /// because only the number form was accepted (invariant 29).
+    static func intValue(_ any: Any?) -> Int? {
+        (any as? Int) ?? (any as? String).flatMap(Int.init)
     }
 
     /// Probe only the stream, without decoding a frame. Faster, but the HDR10
@@ -411,8 +562,7 @@ public enum MediaProbe {
             colorRange: stream["color_range"] as? String,
             masteringDisplay: mastering,
             contentLightLevel: lightLevel,
-            audioCodec: nil,
-            audioChannels: nil)
+            audioTracks: [], chapterCount: 0)
     }
 
     /// ffprobe reports the mastering display as rationals like `"34000/50000"`.
