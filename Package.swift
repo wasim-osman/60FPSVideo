@@ -12,10 +12,12 @@ let package = Package(
     products: [
         .library(name: "Interpolator", targets: ["Interpolator"]),
         .executable(name: "interp-harness", targets: ["interp-harness"]),
+        .executable(name: "60FPS", targets: ["InterpolatorApp"]),
     ],
     targets: [
         .target(name: "Interpolator"),
         .executableTarget(name: "interp-harness", dependencies: ["Interpolator"]),
+        .executableTarget(name: "InterpolatorApp", dependencies: ["Interpolator"]),
         .testTarget(name: "InterpolatorTests", dependencies: ["Interpolator"]),
     ]
 )

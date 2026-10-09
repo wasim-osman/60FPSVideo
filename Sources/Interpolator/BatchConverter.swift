@@ -197,6 +197,64 @@ public struct BatchConverter: Sendable {
         }
     }
 
+    // MARK: - Progress
+
+    /// Where a job has got to.
+    ///
+    /// Reported through ``progress``, which is a seam and defaults to doing nothing. It exists
+    /// because a 4K job on a feature film runs for **hours** — 3.8 h measured for a 2 h film —
+    /// and a user interface with no progress for four hours is a spinner, which is
+    /// indistinguishable from a hang.
+    public struct Progress: Sendable, Equatable {
+        public enum Stage: Sendable, Equatable, CustomStringConvertible {
+            /// Reading the file's properties. The only stage that is instant.
+            case probing
+            /// Interpolating and encoding. The long one.
+            case rendering
+            /// Putting the sound back.
+            case muxing
+            /// Joining the pieces into one file.
+            case joining
+            /// Moving the finished file into place.
+            case finishing
+
+            public var description: String {
+                switch self {
+                case .probing: "reading the file"
+                case .rendering: "interpolating"
+                case .muxing: "restoring the audio"
+                case .joining: "joining the pieces"
+                case .finishing: "finishing"
+                }
+            }
+        }
+
+        public let stage: Stage
+        /// How far through the stage, 0...1 — or `nil` when the stage has no unit to
+        /// measure. Muxing a two-hour film has none: ffmpeg reports nothing back and
+        /// guessing from the file size would be a progress bar that moves for its own
+        /// sake, which is worse than an honest indeterminate one.
+        public let fraction: Double?
+        /// The piece being worked on, when the job is segmented.
+        public let piece: Int?
+        /// How many pieces the job has.
+        public let pieces: Int?
+        /// A line for a status label.
+        public let detail: String
+
+        public init(stage: Stage,
+                    fraction: Double? = nil,
+                    piece: Int? = nil,
+                    pieces: Int? = nil,
+                    detail: String) {
+            self.stage = stage
+            self.fraction = fraction
+            self.piece = piece
+            self.pieces = pieces
+            self.detail = detail
+        }
+    }
+
     // MARK: - Failure
 
     public enum Failure: Error, CustomStringConvertible {
@@ -279,6 +337,20 @@ public struct BatchConverter: Sendable {
     /// order and writes down what it did.
     public var makeJoiner: @Sendable () -> SegmentJoiner
 
+    /// Where the job has got to.
+    ///
+    /// A stored property rather than a `run` parameter, and defaulted to nothing, so that
+    /// every existing call site is unchanged: `var converter = BatchConverter();
+    /// converter.progress = { … }`. Nothing here depends on it, which is deliberate — a
+    /// progress callback that could change what the converter does would be a second way to
+    /// get the output wrong.
+    ///
+    /// It is called **on the thread running the job**, which is not the main thread, and it
+    /// is called often — once per interval, so 172 627 times for a 2 h 23.976 film. A
+    /// callback that hops to a user interface on every call spends more time scheduling than
+    /// the interpolation does, so throttling belongs in the callback rather than here.
+    public var progress: @Sendable (Progress) -> Void = { _ in }
+
     /// The shipping configuration: ffprobe, ffmpeg, `VTFrameProcessor`, and an
     /// `AVAssetWriter`.
     public init() {
@@ -316,6 +388,8 @@ public struct BatchConverter: Sendable {
     // MARK: - Run
 
     public func run(_ request: Request) throws -> Result {
+        progress(Progress(stage: .probing,
+                          detail: "reading \(request.input.lastPathComponent)"))
         let info = try probe(request.input)
         let resolution = request.policy.resolve(source: info.frameRate)
 
@@ -401,7 +475,11 @@ public struct BatchConverter: Sendable {
                                  sceneDetection: request.sceneDetection,
                                  maximumSourceFrames: request.maximumSourceFrames,
                                  expectedOutputFrameCount: Self.expectedOutputFrames(
-                                    request: request, info: info, resolution: resolution)))
+                                    request: request, info: info, resolution: resolution),
+                                 progress: Self.intervalReporter(
+                                    progress: progress,
+                                    intervals: Self.estimatedIntervals(request: request,
+                                                                       info: info))))
 
         // The pipeline calls `sink.finish()` itself, at the end of `run`.
         let report = try pipeline.run(into: sink)
@@ -436,8 +514,12 @@ public struct BatchConverter: Sendable {
         var audio: AudioMuxer.Outcome?
         if audioPlan.isSilent {
             // Nothing to mux, so the staged video *is* the answer.
+            progress(Progress(stage: .finishing, fraction: nil,
+                              detail: "no audio to restore"))
             try place(staging)
         } else {
+            progress(Progress(stage: .muxing, fraction: nil,
+                              detail: audioPlan.summary))
             let outcome = try mux(MuxRequest(
                 video: staging,
                 source: request.input,
@@ -462,6 +544,8 @@ public struct BatchConverter: Sendable {
             try place(temporary)
         }
 
+        progress(Progress(stage: .finishing, fraction: nil,
+                          detail: "checking \(request.output.lastPathComponent)"))
         let size = (try? manager.attributesOfItem(atPath: request.output.path))?[.size]
         let bytes = (size as? NSNumber)?.int64Value ?? 0
 
@@ -495,6 +579,46 @@ public struct BatchConverter: Sendable {
     }
 
     // MARK: - The segmented path
+
+    /// Turn the pipeline's per-interval callback into a percentage.
+    ///
+    /// The total is an **estimate**, and it is allowed to be: Matroska does not state a frame
+    /// count (`nb_frames=N/A`), so the length comes from the duration, rounded up. The
+    /// consequence is a bar that reaches 100% slightly *before* the film ends and, on a job
+    /// whose estimate overshoots, one that stops just short and then jumps. Both are honest.
+    /// What would not be honest is a fraction above 1, which is why it is clamped rather
+    /// than trusted — a progress bar that reads 104% is a progress bar that lied.
+    ///
+    /// ## Why the count is intervals and not frames
+    ///
+    /// Interval `i` is the pair of frames `(i, i + 1)`, so a film of `n` frames has `n − 1`
+    /// intervals — and the pipeline's last announced interval is `n − 2`, not `n − 1`.
+    /// Dividing by the frame count therefore leaves the bar parked at `(n − 1)/n` for the
+    /// whole of the last interval: measured at **0.909** on a twelve-frame fixture, and
+    /// 99.99% on a feature film, which reads as a job that hung. The fraction is
+    /// `(interval + 1) / intervals`, which is "how many intervals have been started" and is
+    /// exactly 1 on the last one.
+    ///
+    /// With no total to divide by, the callback is not installed at all. An indeterminate bar
+    /// is better than one computed from a made-up number.
+    static func intervalReporter(progress: @escaping @Sendable (Progress) -> Void,
+                                 intervals: Int?) -> @Sendable (Int) -> Void {
+        guard let intervals, intervals > 0 else { return { _ in } }
+        let divisor = Double(intervals)
+        return { interval in
+            progress(Progress(stage: .rendering,
+                              fraction: min(1, max(0, Double(interval + 1) / divisor)),
+                              detail: "interval \(interval + 1) of about \(intervals)"))
+        }
+    }
+
+    /// How many intervals the film has: one fewer than its frames.
+    ///
+    /// `nil` when the length is not known at all, which is the signal to report progress
+    /// without a fraction rather than to invent a denominator.
+    static func estimatedIntervals(request: Request, info: MediaInfo) -> Int? {
+        estimatedSourceFrames(request: request, info: info).map { max(0, $0 - 1) }
+    }
 
     /// How many source frames the plan should cover.
     ///
@@ -589,6 +713,18 @@ public struct BatchConverter: Sendable {
         var cutCount = 0
         var wallSeconds = 0.0
 
+        // A resumed job starts its bar where the manifest says it is, not at zero. A bar
+        // that restarts at 0% on a job that is 90% finished is the one reading that makes a
+        // user think their work was thrown away.
+        let pieces = plan.segments.count
+        var piecesDone = finished.count
+        if piecesDone > 0 {
+            progress(Progress(stage: .rendering,
+                              fraction: Double(piecesDone) / Double(pieces),
+                              piece: piecesDone, pieces: pieces,
+                              detail: "resuming after \(piecesDone) of \(pieces) pieces"))
+        }
+
         for segment in plan.segments where !finished.contains(segment.index) {
             let file = directory.appendingPathComponent(
                 JobManifest.segmentFileName(index: segment.index,
@@ -597,6 +733,11 @@ public struct BatchConverter: Sendable {
             // half of one; those two are indistinguishable from the outside, and the
             // manifest is the only thing that says which.
             try? manager.removeItem(at: file)
+
+            progress(Progress(stage: .rendering,
+                              fraction: Double(piecesDone) / Double(pieces),
+                              piece: segment.index + 1, pieces: pieces,
+                              detail: "piece \(segment.index + 1) of \(pieces)"))
 
             let report = try render(segment: segment, of: plan, request: request,
                                     info: info, resolution: resolution, to: file)
@@ -627,6 +768,12 @@ public struct BatchConverter: Sendable {
             // crash leaves the previous record intact rather than a half-written one.
             try working.write(to: directory)
             problems += report.problems
+
+            piecesDone += 1
+            progress(Progress(stage: .rendering,
+                              fraction: Double(piecesDone) / Double(pieces),
+                              piece: segment.index + 1, pieces: pieces,
+                              detail: "piece \(segment.index + 1) of \(pieces) finished"))
         }
 
         // Everything that is finished, in the film's order. The plan's own order, so the
@@ -643,6 +790,9 @@ public struct BatchConverter: Sendable {
         // The join is a container operation over bitstreams that are already correct —
         // no second generation of loss — and it is checked against what the plan says
         // the film has, because a lost boundary is not an error to ffmpeg.
+        progress(Progress(stage: .joining, fraction: nil,
+                          piece: files.count, pieces: pieces,
+                          detail: "joining \(files.count) pieces"))
         let joiner = makeJoiner()
         let joined = try joiner.join(files: files, output: staging,
                                      expectedFrames: working.segments.reduce(0) { $0 + $1.frames },
@@ -662,12 +812,15 @@ public struct BatchConverter: Sendable {
 
         var audio: AudioMuxer.Outcome?
         if audioPlan.isSilent {
+            progress(Progress(stage: .finishing, fraction: nil,
+                              detail: "no audio to restore"))
             try place(staging)
         } else {
             // The audio is muxed once, over the joined picture, and never segmented. A
             // compressed stream can only be cut at a packet boundary, so cutting it per
             // segment would mean re-encoding the DTS-HD MA master that the whole point
             // of the MKV path is to keep bit for bit.
+            progress(Progress(stage: .muxing, fraction: nil, detail: audioPlan.summary))
             let outcome = try mux(MuxRequest(
                 video: staging,
                 source: request.input,
@@ -685,6 +838,8 @@ public struct BatchConverter: Sendable {
             try place(temporary)
         }
 
+        progress(Progress(stage: .finishing, fraction: nil,
+                          detail: "checking \(request.output.lastPathComponent)"))
         let size = (try? manager.attributesOfItem(atPath: request.output.path))?[.size]
         let bytes = (size as? NSNumber)?.int64Value ?? 0
 

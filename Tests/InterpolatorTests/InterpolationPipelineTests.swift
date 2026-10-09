@@ -788,6 +788,128 @@ struct InterpolationPipelineTests {
         #expect(sink.ordered.map(\.index) == Array(0..<plan.outputFrameCount),
                 "a batch run must produce a contiguous output")
     }
+
+    // MARK: - Progress
+
+    /// Collects the interval numbers the pipeline announces.
+    ///
+    /// A class with a lock rather than an array captured by a closure, because the callback is
+    /// `@Sendable` and arrives on the driving thread — which in these tests is the test's own
+    /// thread, but the compiler is right not to take that on trust.
+    private final class ProgressLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var numbers: [Int] = []
+        func note(_ interval: Int) { lock.lock(); numbers.append(interval); lock.unlock() }
+        var seen: [Int] { lock.lock(); defer { lock.unlock() }; return numbers }
+    }
+
+    @Test("progress names every interval the run reads, in order, and none twice")
+    func progressCoversEveryInterval() throws {
+        let frames = 47
+        let log = ProgressLog()
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let report = try InterpolationPipeline(
+            source: makeSource(frames: frames),
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                    maximumInterpolationsPerInterval: 5, depth: 2,
+                                    readDelayMicroseconds: 0),
+            configuration: .init(sceneDetection: false,
+                                 progress: { log.note($0) }))
+            .run(into: sink)
+
+        // Every interval of the film, once each, ascending. Not "one per output frame" — a
+        // progress bar that counted output frames would run at 2.5× the speed of the work.
+        #expect(log.seen == Array(0..<(frames - 1)),
+                "got \(log.seen.count) callbacks: \(log.seen.prefix(8))…")
+        #expect(report.outputFrames > log.seen.count,
+                "output frames outnumber intervals on 23.976 -> 59.94")
+    }
+
+    /// The property that makes the callback usable on a resumed job: the numbers are the
+    /// **film's**, so dividing by the film's length gives the same answer whether the run
+    /// starts at the beginning or at piece 37. A run-local number would start at zero every
+    /// time and a resumed job's bar would restart.
+    @Test("a windowed run announces the film's interval numbers, not its own")
+    func progressUsesTheFilmsNumbering() throws {
+        let frames = 200
+        let plan = try #require(SegmentPlan(sourceFrameCount: frames,
+                                            source: Self.sourceRate,
+                                            output: Self.outputRate,
+                                            targetSourceFrames: 30))
+        // A middle segment, so both a lead-in and a non-zero start are exercised.
+        let segment = plan.segments[2]
+        let log = ProgressLog()
+        let engine = RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                     maximumInterpolationsPerInterval: 5, depth: 2,
+                                     readDelayMicroseconds: 0)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        _ = try InterpolationPipeline(
+            source: makeSource(frames: segment.readCount, firstFrame: segment.readStart),
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: engine,
+            configuration: .init(sceneDetection: false,
+                                 maximumSourceFrames: segment.readCount,
+                                 expectedOutputFrameCount: segment.outputCount,
+                                 window: .init(segment: segment),
+                                 progress: { log.note($0) }))
+            .run(into: sink)
+
+        let seen = log.seen
+        #expect(seen.first == segment.sourceStart,
+                "the first announced interval is the segment's own, not its lead-in")
+        #expect(seen.last == segment.intervalEnd - 1)
+        #expect(seen == Array(segment.sourceStart..<segment.intervalEnd),
+                "ascending and contiguous")
+        // The lead-in is read but is not the segment's to render, so it must not be announced:
+        // a bar that counted it would show work the job never does.
+        #expect(segment.leadIn > 0,
+                "this segment must have a lead-in for the test to mean anything")
+    }
+
+    /// Progress is announced **before** the interval's work, and the reason is the last
+    /// interval of the film: a run ends because the source ran out, so a callback fired on
+    /// completion has nothing to fire from after the final interval, and a bar that stops at
+    /// 99.4% for the length of the final segment reads as a job that hung.
+    @Test("progress reaches the film's last interval, which a completion callback could not")
+    func progressReachesTheLastInterval() throws {
+        let frames = 12
+        let log = ProgressLog()
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        _ = try InterpolationPipeline(
+            source: makeSource(frames: frames),
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                    maximumInterpolationsPerInterval: 5, depth: 2,
+                                    readDelayMicroseconds: 0),
+            configuration: .init(sceneDetection: false, progress: { log.note($0) }))
+            .run(into: sink)
+
+        #expect(log.seen.last == frames - 2,
+                "the last interval of a \(frames)-frame source is \(frames - 2)")
+        #expect(log.seen.count == frames - 1)
+    }
+
+    /// A player has no progress bar — its progress is the clock, and it already has one — so
+    /// the default must cost nothing and change nothing.
+    @Test("with no progress callback the run is unchanged")
+    func noProgressCallbackIsFine() throws {
+        let frames = 20
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let report = try InterpolationPipeline(
+            source: makeSource(frames: frames),
+            sourceRate: Self.sourceRate,
+            outputRate: Self.outputRate,
+            engine: RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                    maximumInterpolationsPerInterval: 5, depth: 2,
+                                    readDelayMicroseconds: 0),
+            configuration: .init(sceneDetection: false)).run(into: sink)
+        #expect(report.outputFrames == sink.count)
+        #expect(report.problems.isEmpty)
+    }
 }
 
 /// A source that changes abruptly at a chosen frame, so there is a real cut to find.

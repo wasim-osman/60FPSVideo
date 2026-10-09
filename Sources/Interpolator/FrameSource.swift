@@ -81,9 +81,15 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
     ///   - startSeconds: seek here first. Input seeking, so it lands on a keyframe
     ///     and is fast; the frames before the requested time are skipped.
     ///   - frameLimit: stop after this many frames. `nil` for the whole file.
+    ///   - scale: ask ffmpeg to resize. `info` must already describe the *scaled* size —
+    ///     see ``MediaInfo/scaled(toWidth:height:)`` — because the pipeline sizes every
+    ///     buffer from it. Playback's downscale toggle, and the one thing that makes 4K
+    ///     source material playable in real time on a machine that cannot interpolate it:
+    ///     the interpolation cost is per-pixel, so a 1080p frame is a quarter of the work.
     public init(url: URL, info: MediaInfo,
                 startSeconds: Double? = nil,
-                frameLimit: Int? = nil) throws {
+                frameLimit: Int? = nil,
+                scale: Bool = false) throws {
         let executable = MediaProbe.ffmpegPath
         guard FileManager.default.isExecutableFile(atPath: executable) else {
             throw FrameSourceError.ffmpegMissing
@@ -98,6 +104,13 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
             arguments += ["-ss", String(format: "%.6f", startSeconds)]
         }
         arguments += ["-i", url.path, "-map", "0:v:0"]
+        // Scaling goes through ffmpeg's own filter, which is a *decode-side* conversion and
+        // therefore free of the pipeline's colour-range rule (invariant 16) only because it
+        // happens before the pipeline sees anything: what arrives is already the format the
+        // probe says it is.
+        if scale {
+            arguments += ["-vf", "scale=\(info.width):\(info.height):flags=bicubic"]
+        }
         if let frameLimit { arguments += ["-frames:v", String(frameLimit)] }
         // The pixel format is chosen by the probe, not by ffmpeg. Asking for the
         // format the source already is means no colour conversion happens here at

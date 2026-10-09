@@ -43,17 +43,30 @@ public final class PlaybackController: @unchecked Sendable {
         public var leadSeconds: Double
         /// Where to begin, in seconds.
         public var startSeconds: Double
+        /// Scale the picture down before interpolating.
+        ///
+        /// The downscale toggle the 4K decision was recorded with, and the only thing that
+        /// makes 4K material play in real time on a machine that cannot interpolate it:
+        /// interpolation is per-pixel, so 1080p is a quarter of the work. The measured 4K
+        /// result is half the intervals skipped and a constant ~150 ms lag; this is how a
+        /// user buys that back, at the cost of the resolution.
+        ///
+        /// Ignored when the source is already at or below 1080p — upscaling would be work
+        /// spent to lose information.
+        public var downscaleTo1080p: Bool
 
         public init(outputRate: FrameRate,
                     depth: Int = 2,
                     sceneDetection: Bool = true,
                     leadSeconds: Double = 1.0,
-                    startSeconds: Double = 0) {
+                    startSeconds: Double = 0,
+                    downscaleTo1080p: Bool = false) {
             self.outputRate = outputRate
             self.depth = depth
             self.sceneDetection = sceneDetection
             self.leadSeconds = leadSeconds
             self.startSeconds = startSeconds
+            self.downscaleTo1080p = downscaleTo1080p
         }
     }
 
@@ -280,6 +293,11 @@ public final class PlaybackController: @unchecked Sendable {
 
         let outputRate = configuration.outputRate
         let sourceRate = info.frameRate
+        // What the pipeline will actually be handed. The downscale is decided here, once,
+        // and everything downstream — the buffers, the sink, the presentation size — is
+        // built from this rather than from the file's own dimensions.
+        let presentation = Self.presentationSize(for: info,
+                                                 downscale: configuration.downscaleTo1080p)
         let planner = IntervalPlanner(source: sourceRate, output: outputRate)
 
         // Which source frame to start from, and therefore which output frame the run's
@@ -298,10 +316,11 @@ public final class PlaybackController: @unchecked Sendable {
         let source: FFmpegFrameSource
         do {
             source = try FFmpegFrameSource(
-                url: url, info: info,
+                url: url, info: presentation,
                 startSeconds: Self.seekSeconds(forFrame: startInterval - leadIn,
                                                rate: sourceRate),
-                frameLimit: nil)
+                frameLimit: nil,
+                scale: presentation.width != info.width)
         } catch {
             throw Failure.source("\(error)")
         }
@@ -309,8 +328,9 @@ public final class PlaybackController: @unchecked Sendable {
         let queue = PlaybackBuffer(
             capacity: PlaybackPacer(outputRate: outputRate,
                                     leadSeconds: configuration.leadSeconds).leadFrames)
-        let sink = DisplayFrameSink(queue: queue, width: info.width, height: info.height,
-                                    format: info.format)
+        let sink = DisplayFrameSink(queue: queue, width: presentation.width,
+                                    height: presentation.height,
+                                    format: presentation.format)
         let pacer = PlaybackPacer(outputRate: outputRate,
                                   leadSeconds: configuration.leadSeconds)
 
@@ -428,6 +448,19 @@ public final class PlaybackController: @unchecked Sendable {
     /// `SceneChangeDetector.Config.historyLength` is 30, and the tracker needs the history
     /// before it can judge an interval the way the whole-film render would.
     static let leadInIntervals = 31
+
+    /// The size the pipeline will be handed, after any downscale.
+    ///
+    /// Height is forced **even**. 4:2:0 chroma is subsampled by two in both directions, so an
+    /// odd height is not a slightly wrong picture — it is a frame the pixel format cannot
+    /// describe, and the failure arrives far from here as a buffer that will not allocate.
+    /// 3840×1632 halves to 1920×816, which happens to be even; a 2160-high source would not.
+    static func presentationSize(for info: MediaInfo, downscale: Bool) -> MediaInfo {
+        guard downscale, info.width > 1920 else { return info }
+        let factor = 1920.0 / Double(info.width)
+        let height = max(2, Int((Double(info.height) * factor).rounded()) & ~1)
+        return info.scaled(toWidth: 1920, height: height)
+    }
 
     /// The seek instant that lands on a given frame.
     ///

@@ -150,18 +150,42 @@ public final class InterpolationPipeline: @unchecked Sendable {
         /// The closure is called once per interval, on the driving thread, in order.
         public var rendersInterval: (@Sendable (Int) -> Bool)?
 
+        /// Called once per interval this run reads in its render range, on the driving
+        /// thread, in order, with the **film's own** interval number.
+        ///
+        /// ## Why an interval and not a frame
+        ///
+        /// An interval is the unit of work — it is what costs 104.7 ms at 4K — so it is the
+        /// unit that a progress bar has to move in. A per-frame callback would fire two and a
+        /// half times per interval on 23.976 → 59.94 and tell the caller nothing the interval
+        /// number does not.
+        ///
+        /// ## Why the film's number and not the run's
+        ///
+        /// A windowed run reads a lead-in before the interval it renders, so a run-local
+        /// number would start negative and a resumed job would start its percentage over.
+        /// The film's number is the one the output frames were numbered against (invariant 33),
+        /// so a caller can divide it by the film's length and get something that means the same
+        /// thing on a first run and on a resumed one.
+        ///
+        /// The batch converter turns this into a percentage; playback leaves it `nil`, because
+        /// a player's progress is the clock and it already has one.
+        public var progress: (@Sendable (Int) -> Void)?
+
         public init(depth: Int = 2,
                     sceneDetection: Bool = true,
                     maximumSourceFrames: Int? = nil,
                     expectedOutputFrameCount: Int? = nil,
                     window: Window? = nil,
-                    rendersInterval: (@Sendable (Int) -> Bool)? = nil) {
+                    rendersInterval: (@Sendable (Int) -> Bool)? = nil,
+                    progress: (@Sendable (Int) -> Void)? = nil) {
             self.depth = depth
             self.sceneDetection = sceneDetection
             self.maximumSourceFrames = maximumSourceFrames
             self.expectedOutputFrameCount = expectedOutputFrameCount
             self.window = window
             self.rendersInterval = rendersInterval
+            self.progress = progress
         }
     }
 
@@ -385,6 +409,13 @@ public final class InterpolationPipeline: @unchecked Sendable {
                 // global index. Comparing it against the local one silently wrote the far
                 // frame of every passthrough in every segment but the first.
                 let globalInterval = readBase + interval
+                // Announced **before** the work, not after. A callback fired on completion
+                // would never see the film's last interval — the run ends by the source
+                // running out, so there is nothing after the last interval to fire from — and a
+                // percentage that stops at 99.4% for the length of the final segment reads as a
+                // job that hung. `isCut` for this interval has already been decided, three
+                // lines above, so nothing downstream is being guessed at.
+                configuration.progress?(globalInterval)
                 let planned = planner.output(forInterval: globalInterval)
                 // The cut rule is not restated here — `CutResolution` is the same code
                 // `PhasePlan.resolvingCuts` runs. A second copy is how a cut ends up

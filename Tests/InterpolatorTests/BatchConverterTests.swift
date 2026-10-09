@@ -992,6 +992,187 @@ struct BatchConverterTests {
         // And it is not fewer than the frames the duration describes.
         #expect(counted ?? 0 >= Int((5.0 * rate.doubleValue).rounded(.down)))
     }
+
+    // MARK: - Progress
+
+    @Test("a job announces its stages in order, and reaches the end")
+    func progressNamesEveryStage() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let box = SinkBox()
+        defer { box.value?.closeFile() }
+
+        let log = ProgressLog()
+        var converter = makeConverter(input: input, info: makeInfo(frames: 12),
+                                      outputFrameCount: nil, box: box)
+        converter.progress = { log.note($0) }
+        _ = try converter.run(.init(input: input, output: output, sceneDetection: false))
+
+        let stages = log.stages
+        #expect(stages.first == .probing, "\(stages)")
+        #expect(stages.contains(.rendering), "\(stages)")
+        #expect(stages.last == .finishing, "\(stages)")
+        // Never backwards. A bar that jumped back is a bar the user stops believing, and a
+        // stage machine that can go back is a stage machine with two ways to be wrong.
+        let order: [BatchConverter.Progress.Stage] =
+            [.probing, .rendering, .muxing, .joining, .finishing]
+        let ranks = stages.compactMap { order.firstIndex(of: $0) }
+        #expect(ranks == ranks.sorted(), "\(stages)")
+    }
+
+    @Test("the rendering fraction rises to one and is never above it")
+    func progressFractionReachesOne() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let box = SinkBox()
+        defer { box.value?.closeFile() }
+
+        let log = ProgressLog()
+        var converter = makeConverter(input: input, info: makeInfo(frames: 12),
+                                      outputFrameCount: nil, box: box)
+        converter.progress = { log.note($0) }
+        _ = try converter.run(.init(input: input, output: output, sceneDetection: false))
+
+        let fractions = log.fractions
+        #expect(!fractions.isEmpty, "a film's worth of intervals announced nothing")
+        #expect(fractions.allSatisfy { $0 >= 0 && $0 <= 1 }, "\(fractions)")
+        #expect(fractions == fractions.sorted(), "the fraction went backwards: \(fractions)")
+        #expect(fractions.last == 1, "ended at \(String(describing: fractions.last))")
+    }
+
+    /// The arithmetic on its own, because the total is an **estimate** — Matroska does not
+    /// state a frame count — and an estimate that overshoots must not produce a bar that
+    /// reads 104%.
+    @Test("a total smaller than the intervals seen clamps instead of exceeding one")
+    func fractionIsClamped() {
+        let log = ProgressLog()
+        let report = BatchConverter.intervalReporter(progress: { log.note($0) }, intervals: 10)
+        for interval in 0..<25 { report(interval) }
+        #expect(log.fractions.count == 25)
+        #expect(log.fractions.allSatisfy { $0 <= 1 })
+        // Ten intervals means the tenth one is the last, so it is the one that reads 1.
+        #expect(log.fractions[9] == 1)
+        #expect(log.fractions[24] == 1, "an overshooting estimate must not read 2.5")
+    }
+
+    /// With no total there is nothing to divide by, and a made-up denominator is worse than
+    /// an indeterminate bar.
+    @Test("no total means no callback at all, rather than a guess")
+    func noTotalInstallsNothing() {
+        let log = ProgressLog()
+        BatchConverter.intervalReporter(progress: { log.note($0) }, intervals: nil)(7)
+        BatchConverter.intervalReporter(progress: { log.note($0) }, intervals: 0)(7)
+        #expect(log.entries.isEmpty, "\(log.entries)")
+        // One interval is a real, if tiny, film — and its only interval is the whole of it.
+        BatchConverter.intervalReporter(progress: { log.note($0) }, intervals: 1)(0)
+        #expect(log.fractions == [1])
+    }
+
+    /// A film of `n` frames has `n − 1` intervals, and the pipeline's last announced interval
+    /// is `n − 2`. Dividing by the *frame* count therefore parks the bar at `(n − 1)/n` for
+    /// the whole of the last interval — 0.909 on this fixture, 99.99% on a feature film — which
+    /// reads as a job that hung. The conversion is what this checks.
+    @Test("the frame count is converted to an interval count, not used as one")
+    func framesBecomeIntervals() {
+        let info = makeInfo(frames: 12)
+        let request = BatchConverter.Request(input: URL(fileURLWithPath: "/dev/null"),
+                                            output: URL(fileURLWithPath: "/dev/null"))
+        #expect(BatchConverter.estimatedSourceFrames(request: request, info: info) == 12)
+        #expect(BatchConverter.estimatedIntervals(request: request, info: info) == 11)
+        // A source with no stated count and no duration has no length to divide by.
+        let unknown = MediaInfo(url: URL(fileURLWithPath: "/dev/null"),
+                                width: Self.width, height: Self.height,
+                                frameRate: .twentyFourNTSC, frameCount: nil, duration: 0,
+                                pixelFormat: "nv12", format: .nv12,
+                                colorPrimaries: nil, transferFunction: nil, colorSpace: nil,
+                                colorRange: nil, masteringDisplay: nil,
+                                contentLightLevel: nil, audioTracks: [], chapterCount: 0)
+        #expect(BatchConverter.estimatedSourceFrames(request: request, info: unknown) == nil)
+        #expect(BatchConverter.estimatedIntervals(request: request, info: unknown) == nil)
+    }
+
+    /// The reading that makes a resume believable: a bar that restarts at 0% on a job that is
+    /// almost finished is the one reading that makes a user think their work was thrown away.
+    @Test("a resumed job starts its bar where the manifest says it is")
+    func resumedJobStartsPartWay() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let info = makeInfo(frames: 120)
+
+        // One full run that keeps its pieces, so a manifest exists.
+        let firstLog = JoinLog()
+        let first = try makeSegmentedConverter(input: input, info: info,
+                                               outputFrameCount: nil, log: firstLog)
+            .run(.init(input: input, output: output, sceneDetection: false,
+                       segmentSeconds: 1.0, keepSegments: true))
+        let plan = try #require(first.segments).plan
+        let total = plan.segments.count
+        #expect(total > 2, "the plan is too short to show a partial resume")
+
+        // Take the last piece away. The manifest still claims it, but the file is gone, and
+        // `completed` trusts the file rather than the record — which is the whole point of
+        // resume being discard-not-trust.
+        let pieces = JobManifest.directory(beside: output)
+        let last = plan.segments[total - 1]
+        let lastFile = pieces.appendingPathComponent(
+            JobManifest.segmentFileName(index: last.index, of: total))
+        try FileManager.default.removeItem(at: lastFile)
+
+        let log = ProgressLog()
+        var converter = makeSegmentedConverter(input: input, info: info,
+                                               outputFrameCount: nil, log: JoinLog())
+        converter.progress = { log.note($0) }
+        let second = try converter.run(.init(input: input, output: output,
+                                             sceneDetection: false, overwrite: true,
+                                             segmentSeconds: 1.0, keepSegments: true))
+        #expect(try #require(second.segments).resumed.count == total - 1)
+
+        // The first thing the resumed job says about rendering is that it is not at zero.
+        let firstRendering = try #require(log.entries.first { $0.stage == .rendering })
+        #expect(firstRendering.detail.contains("resuming"),
+                "the resume was not announced: \(firstRendering.detail)")
+        #expect(firstRendering.fraction == Double(total - 1) / Double(total),
+                "\(String(describing: firstRendering.fraction)) of \(total)")
+        // And it only ever renders the one piece that was missing.
+        let piecesRendered = Set(log.entries
+            .filter { $0.stage == .rendering && !$0.detail.contains("resuming") }
+            .compactMap(\.piece))
+        #expect(piecesRendered == [total], "\(piecesRendered)")
+        #expect(log.fractions.last == 1)
+    }
+
+    @Test("a segmented job counts its pieces and reaches the end")
+    func segmentedProgressCountsPieces() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+        let info = makeInfo(frames: 120)
+
+        let log = ProgressLog()
+        var converter = makeSegmentedConverter(input: input, info: info,
+                                               outputFrameCount: nil, log: JoinLog())
+        converter.progress = { log.note($0) }
+        let result = try converter.run(.init(input: input, output: output,
+                                             sceneDetection: false,
+                                             segmentSeconds: 1.0))
+        let total = try #require(result.segments).plan.segments.count
+
+        // Every piece is named, in order, once.
+        let announced = log.entries.filter { $0.stage == .rendering }.compactMap(\.piece)
+        #expect(Set(announced) == Set(1...total), "\(announced)")
+        #expect(announced.contains(1) && announced.contains(total))
+        #expect(log.entries.filter { $0.stage == .rendering }.allSatisfy { $0.pieces == total })
+        // The join is announced before it happens, because it is not instant either.
+        #expect(log.stages.contains(.joining), "\(log.stages)")
+        #expect(log.stages.last == .finishing)
+    }
 }
 
 /// A one-shot flag two closures can share.
@@ -1001,4 +1182,26 @@ final class Flag: @unchecked Sendable {
 
     func set() { lock.lock(); flag = true; lock.unlock() }
     var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+}
+
+/// Collects what the converter reported.
+///
+/// A locked class rather than an array captured by the closure: the callback is `@Sendable`
+/// and is documented to arrive on the thread running the job, which in these tests is the
+/// test's own thread — but the compiler is right not to accept that on trust, and a test that
+/// only works because of where the job happens to run is a test that will break the day the
+/// converter gets a worker pool.
+final class ProgressLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var all: [BatchConverter.Progress] = []
+
+    func note(_ progress: BatchConverter.Progress) {
+        lock.lock()
+        all.append(progress)
+        lock.unlock()
+    }
+
+    var entries: [BatchConverter.Progress] { lock.lock(); defer { lock.unlock() }; return all }
+    var stages: [BatchConverter.Progress.Stage] { entries.map(\.stage) }
+    var fractions: [Double] { entries.compactMap(\.fraction) }
 }

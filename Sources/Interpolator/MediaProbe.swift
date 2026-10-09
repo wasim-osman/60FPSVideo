@@ -100,6 +100,28 @@ public struct MediaInfo: Sendable {
                   audioTracks: tracks, chapterCount: chapters)
     }
 
+    /// A copy describing the same film at a different size.
+    ///
+    /// Playback's downscale, and the reason it is a *description* rather than a transform:
+    /// the frame geometry is what the pipeline reads to size its buffers and what the sink
+    /// reads to build its output, so a source that scales its frames has to say so in the
+    /// same place everything else looks. Passing the original `MediaInfo` alongside a
+    /// scaling decoder would size every buffer for 4K and then fill it with 1080p rows.
+    ///
+    /// The colour fields are carried through untouched: scaling does not change primaries,
+    /// transfer function or range, and pretending otherwise is how a 10-bit HDR frame
+    /// acquires an SDR description.
+    public func scaled(toWidth width: Int, height: Int) -> MediaInfo {
+        MediaInfo(url: url, width: width, height: height, frameRate: frameRate,
+                  frameCount: frameCount, duration: duration,
+                  pixelFormat: pixelFormat, format: format,
+                  colorPrimaries: colorPrimaries, transferFunction: transferFunction,
+                  colorSpace: colorSpace, colorRange: colorRange,
+                  masteringDisplay: masteringDisplay,
+                  contentLightLevel: contentLightLevel,
+                  audioTracks: audioTracks, chapterCount: chapterCount)
+    }
+
     /// Audio codecs an MP4/MOV container can carry.
     ///
     /// ## Why this is a list we keep, and not something ffmpeg decides
