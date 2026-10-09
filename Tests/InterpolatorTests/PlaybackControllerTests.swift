@@ -1,3 +1,5 @@
+import AVFoundation
+import CoreMedia
 import Foundation
 import Testing
 @testable import Interpolator
@@ -98,5 +100,66 @@ struct PlaybackControllerTests {
                 "the 4K deficit is \(needed) intervals per render, not the recorded ~2.5")
         // Which is the recorded "about two intervals in five".
         #expect(abs(1.0 / needed - 0.4) < 0.01)
+    }
+
+    // MARK: - Which counters a status carries
+
+    /// **The bug, as a test.** `lastReport` is only assigned when a run *ends*, so reading the
+    /// counters from it returns nothing for the whole of a film. The app did exactly that and
+    /// reported "0.0 fps of 59.94 presented" over a film that was playing correctly.
+    ///
+    /// With a live presenter, the live counters win — even when a report from a previous run is
+    /// sitting there saying something else, which is the case this asserts, because that is the
+    /// shape the bug actually had.
+    @Test("the live counters win over the report of a run that has ended")
+    func liveCountersWin() {
+        let queue = PlaybackBuffer(capacity: 4)
+        let clock = PlaybackClock()
+        let presenter = DisplayPresenter(
+            queue: queue,
+            display: NullDisplay(),
+            clock: clock,
+            pacer: PlaybackPacer(outputRate: rate("60000/1001"), leadSeconds: 0.1),
+            outputRate: rate("60000/1001"))
+
+        // A report left over from the previous session, saying 0 frames — which is exactly what
+        // `lastReport` holds while a new run is in progress.
+        let stale = DisplayPresenter.Report(shown: 0, dropped: 0, pacedSeconds: 0,
+                                            endedByAbandon: false, problems: [])
+        let counters = PlaybackController.counters(live: presenter, report: stale)
+        #expect(counters.shown == 0 && counters.dropped == 0,
+                "a presenter that has shown nothing reports nothing")
+
+        // And the same choice with a report that disagrees in the other direction: the live
+        // count is what the picture is doing now, and it is what a player must show.
+        let optimistic = DisplayPresenter.Report(shown: 9_999, dropped: 0, pacedSeconds: 0,
+                                                 endedByAbandon: false, problems: [])
+        let again = PlaybackController.counters(live: presenter, report: optimistic)
+        #expect(again.shown == 0, "the stale report leaked through: \(again.shown)")
+    }
+
+    @Test("with no session the report is the only record left")
+    func reportIsTheFallback() {
+        let report = DisplayPresenter.Report(shown: 1_156, dropped: 42, pacedSeconds: 3.5,
+                                             endedByAbandon: false, problems: [])
+        let counters = PlaybackController.counters(live: nil, report: report)
+        #expect(counters.shown == 1_156)
+        #expect(counters.dropped == 42)
+    }
+
+    @Test("with neither, zero rather than a guess")
+    func nothingIsZero() {
+        let counters = PlaybackController.counters(live: nil, report: nil)
+        #expect(counters.shown == 0)
+        #expect(counters.dropped == 0)
+    }
+
+    /// A display that takes everything and remembers nothing. The counters above are the
+    /// presenter's own, so the display does not have to do anything for this to be meaningful.
+    private final class NullDisplay: VideoDisplay, @unchecked Sendable {
+        var isReadyForMoreMediaData: Bool { true }
+        var requiresFlushToResumeDecoding: Bool { false }
+        func enqueue(_ sampleBuffer: CMSampleBuffer) {}
+        func discardQueuedFrames() {}
     }
 }

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The identity the system files everything under: window positions, the soundtrack
+	     cache's parent directory, TCC prompts, and the LaunchServices record that decides
+	     whether double-clicking a film offers this app. Changing it orphans all of them. -->
+	<key>CFBundleIdentifier</key>
+	<string>com.sixtyfps.video</string>
+
+	<key>CFBundleName</key>
+	<string>60FPS</string>
+	<key>CFBundleDisplayName</key>
+	<string>60FPS</string>
+	<key>CFBundleExecutable</key>
+	<string>60FPS</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+
+	<!-- Where VTFrameRateConversionConfiguration landed. Stated here as well as in
+	     Package.swift, because this is the copy the system reads: it is what turns "the app
+	     crashed on an older Mac" into "the App Store told you before you installed it". -->
+	<key>LSMinimumSystemVersion</key>
+	<string>15.4</string>
+
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.video</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT licensed. Ad-hoc signed: this build is not notarised by Apple, so the first launch has to be allowed in System Settings › Privacy &amp; Security › Open Anyway.</string>
+
+	<!-- What double-clicking a film does.
+	     Rank "Alternate" and not "Owner" on purpose: this app should appear in "Open With" and
+	     must not take MP4 and MOV away from QuickTime. A video converter that silently becomes
+	     the default player for every film on the machine is a converter that gets deleted. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Film</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.matroska</string>
+				<string>public.mpeg-4</string>
+				<string>com.apple.m4v-video</string>
+				<string>com.apple.quicktime-movie</string>
+				<string>public.avi</string>
+				<string>public.mpeg-2-transport-stream</string>
+				<string>public.avchd-mpeg-2-transport-stream</string>
+				<string>org.webmproject.webm</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- No UTImportedTypeDeclarations.
+	     Measured on macOS 15+: every extension above already resolves to a declared type, so
+	     declaring them again would be noise at best and a conflict with whatever app did declare
+	     them at worst. `FileChooser.filterTypes` checks at run time and copes with the ones that
+	     are missing, rather than this file asserting that none of them are. -->
+</dict>
+</plist>

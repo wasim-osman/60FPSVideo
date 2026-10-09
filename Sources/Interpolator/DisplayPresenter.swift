@@ -21,22 +21,58 @@ public protocol VideoDisplay: AnyObject {
     func enqueue(_ sampleBuffer: CMSampleBuffer)
     /// Drop everything queued. Used by a seek, where the queued frames belong to a position
     /// the film is no longer at.
-    func flush()
+    ///
+    /// Named for what it does rather than `flush`, because `AVSampleBufferDisplayLayer.flush()`
+    /// was deprecated in macOS 15 in favour of `sampleBufferRenderer.flush()` — and a protocol
+    /// requirement called `flush` would be satisfied by the deprecated method, silently, with a
+    /// warning the only sign of it.
+    func discardQueuedFrames()
 }
 
 /// The shipping display.
 ///
-/// `@preconcurrency` because the SDK marks `AVSampleBufferDisplayLayer` main-actor-isolated,
-/// and this presenter deliberately does not run on the main actor: it blocks on the queue,
-/// and a player that blocks the main thread is a player with a frozen window.
+/// ## Why this conforms to the renderer and not to the layer
 ///
-/// The annotation is a statement that the isolation does not apply here, and it is only true
-/// because of how the presenter is built rather than because of anything the compiler can
-/// see: **the presenter is the layer's only owner and calls it from exactly one thread**.
-/// There is no second accessor to race with, which is what the main-actor rule exists to
-/// prevent. A window controller that also drew into this layer would make the annotation a
-/// lie, so it must not.
-extension AVSampleBufferDisplayLayer: @preconcurrency VideoDisplay {}
+/// The obvious target is `AVSampleBufferDisplayLayer`, and it is the wrong one twice over.
+///
+/// **It is main-actor isolated.** The SDK marks the class `NS_SWIFT_UI_ACTOR`, so
+/// `isReadyForMoreMediaData`, `enqueue` and `flush` are all main-actor members. This presenter
+/// deliberately does not run on the main actor — it blocks on the queue, and a player that
+/// blocks the main thread is a player with a frozen window — so a conformance to the layer
+/// needs `@preconcurrency` to compile. `@preconcurrency` silences the *compiler*, and nothing
+/// else: the witness thunk Swift generates for an isolated member still asserts the executor at
+/// run time. Measured, on the real film, the first time the shell ran:
+///
+/// ```
+/// EXC_BREAKPOINT (SIGTRAP) — dispatch_assert_queue_fail
+///   _checkExpectedExecutor(_filenameStart:…:executor:)
+///   protocol witness for VideoDisplay.isReadyForMoreMediaData.getter
+///     in conformance AVSampleBufferDisplayLayer
+///   DisplayPresenter.waitUntilReady() → DisplayPresenter.run()
+/// ```
+///
+/// A crash the compiler was told to keep quiet about is the worst kind: it compiles clean, it
+/// passes every test that uses a double, and it fires on the first frame of the first real film.
+///
+/// **And every member of the layer is deprecated anyway.** In macOS 15 `enqueueSampleBuffer:`,
+/// `flush`, `status`, `error`, `requiresFlushToResumeDecoding` and `readyForMoreMediaData` on
+/// the layer are all deprecated with the same message — *use `sampleBufferRenderer`'s instead*.
+/// The annotation and the deprecation are one instruction, not two: the layer is the UI object,
+/// and the renderer is the part that does the work.
+///
+/// `AVSampleBufferVideoRenderer` is a plain `NSObject` with no actor annotation, so conforming
+/// to it needs no `@preconcurrency` and no runtime assertion. The presenter holds the renderer
+/// and the view holds the layer, which is exactly the split Apple's deprecation describes.
+///
+/// The isolation the annotation existed to protect is still the presenter's job: **it is the
+/// renderer's only owner and calls it from exactly one thread.** Nothing else in this app
+/// touches the renderer — not the view, not the model — which is what the main-actor rule
+/// exists to guarantee, achieved by construction instead.
+extension AVSampleBufferVideoRenderer: VideoDisplay {
+    public func discardQueuedFrames() {
+        flush()
+    }
+}
 
 /// Turns queued output frames into timed samples, and paces them.
 ///
@@ -248,7 +284,7 @@ public final class DisplayPresenter: @unchecked Sendable {
         // but a window that was closed and reopened, or a display that lost its connection
         // to a screen, arrives in this state.
         if display.requiresFlushToResumeDecoding {
-            display.flush()
+            display.discardQueuedFrames()
         }
     }
 

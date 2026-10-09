@@ -48,6 +48,14 @@ __pycache__/
 *.pyc
 
 # ---------------------------------------------------------------------------
+# Packaging output
+# ---------------------------------------------------------------------------
+# 60FPS.app, its icon and the .dmg. All three are products of scripts/bundle.sh and
+# scripts/make-icon.py, and the icon is drawn from code rather than checked in as a blob —
+# so the only thing worth committing is the recipe.
+build/
+
+# ---------------------------------------------------------------------------
 # macOS
 # ---------------------------------------------------------------------------
 .DS_Store

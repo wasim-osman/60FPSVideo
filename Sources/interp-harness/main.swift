@@ -831,7 +831,7 @@ private final class CountingDisplay: VideoDisplay, @unchecked Sendable {
 
     var isReadyForMoreMediaData: Bool { true }
     var requiresFlushToResumeDecoding: Bool { false }
-    func flush() {}
+    func discardQueuedFrames() {}
 
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
         let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))

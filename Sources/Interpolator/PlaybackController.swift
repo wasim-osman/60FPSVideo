@@ -295,16 +295,54 @@ public final class PlaybackController: @unchecked Sendable {
         clock.stop()
     }
 
+    /// Which frame counters a status should carry.
+    ///
+    /// Extracted and tested on its own because the bug it fixes was a **choice between two
+    /// sources**, and a choice is testable without a decoder while neither source is.
+    static func counters(live: DisplayPresenter?,
+                         report: DisplayPresenter.Report?) -> (shown: Int, dropped: Int) {
+        guard let live else {
+            return (report?.shown ?? 0, report?.dropped ?? 0)
+        }
+        return (live.shown, live.dropped)
+    }
+
+    /// Where the film is, and what the picture has done so far.
+    ///
+    /// ## Why the counters come from the presenter and not from the report
+    ///
+    /// `lastReport` is assigned in `finish(_:session:)` — the handler for a run that has
+    /// **ended**. Reading `shown` from it means reading `nil` for the whole of a film, and `0`
+    /// is what `nil` becomes. So `status.shown` was structurally zero during playback: a caller
+    /// polling it to find out whether playback was keeping up was told, every time, that
+    /// nothing had been shown.
+    ///
+    /// Measured: the app played the real 4K film correctly — picture advancing, skip counter
+    /// climbing, sound in sync — while its rate readout said **"0.0 fps of 59.94 presented"**
+    /// from the first frame to the last. `DisplayPresenter.shown` exists precisely for this and
+    /// says so in its own documentation ("readable *during* a run, which is the only way a
+    /// player can show a live drop rate"); the controller was simply not asking it.
+    ///
+    /// The report stays as the fallback, for the state after a run has ended and its session
+    /// released — where the live counters are gone and the report is the only record left.
     public var status: Status {
         lock.lock()
         let report = lastReport
+        let presenter = session?.presenter
         let skipped = session?.skipped.count ?? lastSkipped
         lock.unlock()
+
+        // Read outside the controller's lock, because `DisplayPresenter.shown` takes the
+        // presenter's own. Taking one lock while holding the other is how two correct pieces of
+        // code deadlock when they are put together, and it would be a deadlock that only shows
+        // up under a poll from another thread — which is exactly how this is used.
+        let counters = Self.counters(live: presenter, report: report)
+
         return Status(state: clock.state,
                       position: clock.mediaTime,
                       duration: info.duration,
-                      shown: report?.shown ?? 0,
-                      dropped: report?.dropped ?? 0,
+                      shown: counters.shown,
+                      dropped: counters.dropped,
                       skippedIntervals: skipped)
     }
 

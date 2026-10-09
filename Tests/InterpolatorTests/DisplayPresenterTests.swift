@@ -36,7 +36,7 @@ struct DisplayPresenterTests {
             lock.lock(); samples.append(sampleBuffer); lock.unlock()
         }
 
-        func flush() {
+        func discardQueuedFrames() {
             lock.lock(); flushCount += 1; lock.unlock()
         }
 
@@ -385,8 +385,11 @@ struct DisplayPresenterTests {
 
         // And the timestamp itself, so this is checked against the arithmetic rather than
         // against another copy of the offset.
-        let first = try? #require(display.enqueued.first)
-        if let first {
+        //
+        // `if let` rather than `try? #require`: `#require` on an expression the compiler can
+        // already see is non-optional is a redundant unwrap, and the count is asserted two
+        // lines above, so the binding here is a guard rather than the check.
+        if let first = display.enqueued.first {
             let pts = CMSampleBufferGetPresentationTimeStamp(first)
             #expect(pts.value == Int64(outputStart) * 1001, "\(pts)")
             #expect(pts.timescale == 60000)
@@ -416,5 +419,75 @@ struct DisplayPresenterTests {
                                          pacer: pacer, outputRate: rate)
         _ = run { presenter.run() }
         #expect(display.enqueued.map(index(of:)) == [0])
+    }
+
+    // MARK: - The counters, while the film is still playing
+
+    /// `shown` has to be readable **during** a run, because that is the only moment a player
+    /// has anything to report.
+    ///
+    /// `PlaybackController.status` reads its counters from here — see `counters(live:report:)`
+    /// — and it read them from the end-of-run report instead for a while, which made the app's
+    /// rate readout structurally zero for the whole of a film. The fix depends entirely on this
+    /// property, so it is asserted rather than assumed: the run is observed *in progress*, and
+    /// the count is required to have advanced strictly between zero and the total while it was
+    /// still going.
+    @Test("the shown count advances while the run is still going")
+    func shownIsReadableDuringARun() {
+        let queue = PlaybackBuffer(capacity: 16)
+        let display = FakeDisplay()
+        let clock = PlaybackClock()
+        // A tenth of a second of lead per frame, so a six-frame run takes long enough to be
+        // observed in the middle of rather than only after.
+        let pacer = PlaybackPacer(outputRate: rate, leadSeconds: 0.1)
+        let count = 6
+        for index in 0..<count {
+            _ = queue.push(.init(index: index, buffer: makeBuffer().buffer))
+        }
+        queue.finish()
+
+        let presenter = DisplayPresenter(queue: queue, display: display, clock: clock,
+                                         pacer: pacer, outputRate: rate)
+
+        let box = ReportBox()
+        let done = Flag()
+        Thread.detachNewThread {
+            box.value = presenter.run()
+            done.raise()
+        }
+        clock.play()
+
+        // Sample while it runs. `shown` must be a live reading: it has to be observed strictly
+        // between zero and the total, and it must never go backwards.
+        var seenMidRun = false
+        var previous = 0
+        var wentBackwards = false
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline, !done.isSet {
+            let now = presenter.shown
+            if now < previous { wentBackwards = true }
+            if now > 0, now < count { seenMidRun = true }
+            previous = now
+            usleep(1_000)
+        }
+
+        // The run's own report is the final answer; the last sample in the loop is taken
+        // whenever the loop happened to notice, which is one frame early as often as not.
+        #expect(!wentBackwards, "the count went backwards")
+        #expect(box.value?.shown == count, "the run reported \(box.value?.shown as Any)")
+        #expect(presenter.shown == count, "the live count ended at \(presenter.shown)")
+        #expect(seenMidRun,
+                "the count was never observed part-way through the run, so it is not live")
+        #expect(previous > 0, "the count was still zero at the last sample")
+    }
+
+    /// A one-way flag, because a semaphore's signal is consumed by whoever waits for it and
+    /// a poll that eats the signal leaves the next wait to time out — which is how a test
+    /// that should take a tenth of a second takes twenty.
+    private final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+        func raise() { lock.lock(); value = true; lock.unlock() }
     }
 }
