@@ -26,16 +26,26 @@ final class SyntheticFrameSource: FrameSource, @unchecked Sendable {
     /// read start, so its "first frame" is not the film's — which is exactly the
     /// distinction ``InterpolationPipeline/Window`` exists to carry.
     private let firstFrame: Int
+    /// The film-wide number after which the picture changes completely.
+    ///
+    /// The default pattern is a diagonal ramp that shifts seven code values per frame — a
+    /// smooth pan, which is exactly what the scene detector should *not* call a cut. Setting
+    /// this inverts the ramp from that frame on, which is a hard discontinuity in both the
+    /// histogram and the grid, so the detector calls it. Tests need that because a cut is
+    /// the one thing that makes the pipeline skip an interval outright, and the submission
+    /// order depends on it.
+    private let cutAfter: Int?
     private var framesRead = 0
     private var closed = false
 
     init(width: Int, height: Int, format: FrameFormat, frameRate: FrameRate,
-         totalFrames: Int, firstFrame: Int = 0) {
+         totalFrames: Int, firstFrame: Int = 0, cutAfter: Int? = nil) {
         self.width = width
         self.height = height
         self.format = format
         self.totalFrames = totalFrames
         self.firstFrame = firstFrame
+        self.cutAfter = cutAfter
         self.frameByteSize = format.packedByteSize(width: width, height: height)
         self.info = MediaInfo(
             url: URL(fileURLWithPath: "/dev/null"),
@@ -60,8 +70,11 @@ final class SyntheticFrameSource: FrameSource, @unchecked Sendable {
             let base = raw.baseAddress!
             for y in 0..<height {
                 for x in 0..<width {
-                    // A diagonal ramp that shifts by one pixel per frame, wrapped.
-                    let value = (x + y + index * 7) % range
+                    // A diagonal ramp that shifts by one pixel per frame, wrapped. Past
+                    // `cutAfter` the ramp is inverted, which is a discontinuity the scene
+                    // detector reads as a cut.
+                    let ramp = (x + y + index * 7) % range
+                    let value = (cutAfter.map { index > $0 } ?? false) ? range - 1 - ramp : ramp
                     let code = lumaCode + value
                     if sampleWidth == 1 {
                         (base + y * width + x).storeBytes(of: UInt8(code), as: UInt8.self)
@@ -134,6 +147,7 @@ final class RecordingEngine: InterpolationEngine, @unchecked Sendable {
     private let semaphore = DispatchSemaphore(value: 0)
     private var firstError: Error?
     private var prepared = false
+    private var recordedOrder: SubmissionOrder?
 
     init(width: Int, height: Int, format: FrameFormat,
          maximumInterpolationsPerInterval: Int, depth: Int,
@@ -144,6 +158,18 @@ final class RecordingEngine: InterpolationEngine, @unchecked Sendable {
         self.maximumInterpolationsPerInterval = maximumInterpolationsPerInterval
         self.depth = depth
         self.readDelayMicroseconds = readDelayMicroseconds
+    }
+
+    /// Recorded rather than ignored, because getting this wrong is silent: the run
+    /// completes, the frame count is right, and the picture is wrong. A double that
+    /// swallows it cannot fail the test that catches that.
+    func setSubmissionOrder(_ order: SubmissionOrder) {
+        lock.lock(); recordedOrder = order; lock.unlock()
+    }
+
+    var submissionOrder: SubmissionOrder? {
+        lock.lock(); defer { lock.unlock() }
+        return recordedOrder
     }
 
     func prepare(width: Int, height: Int) throws {
@@ -983,4 +1009,212 @@ final class CutFrameSource: FrameSource, @unchecked Sendable {
     }
 
     func close() { closed = true }
+}
+
+// MARK: - The pool
+
+/// A pool of sessions, and the one statement that has to be true about it.
+///
+/// This suite exists because the first version of the pool was **wrong in a way nothing
+/// reported**. Four sessions were given a stride — 0, 4, 8, … — while each was told its
+/// submissions followed one another "without jump or skip". The SDK's `SubmissionMode` is a
+/// statement of fact that the processor acts on by keeping internal caches, so a false one
+/// produces wrong pixels rather than slow ones. Measured on the real 4K HDR film, the run
+/// completed cleanly, wrote the right number of frames, and differed from a sequential run
+/// by a mean of **36 dB** (min 17 dB, 894 of 1198 frames below 40 dB) against a **58 dB**
+/// control for two runs of the identical configuration.
+///
+/// So the order is asserted here rather than left to the call site to remember, and the
+/// distribution is asserted so that "the pool is used" is a fact about the run and not a
+/// hope about the code.
+///
+/// **The same mistake was in the single-session path, and had been since before the pool
+/// existed.** The first version of this suite asserted that one session driving a whole film
+/// *is* sequential, on the grounds that it is fed the intervals in order and the faster mode
+/// is worth 11%. The reasoning was wrong: the pipeline never submits an interval whose frames
+/// are all passthrough, and a scene cut forces exactly that, so the session's submissions have
+/// a gap in them however many sessions there are. Comparing the app's own output at one
+/// session against four is what made it visible — the two frames after every cut came back as
+/// a plain cross-fade. That is now invariant 44.
+@Suite("InterpolationPipeline — a pool of sessions")
+struct InterpolationPipelinePoolTests {
+
+    private static let width = 128
+    private static let height = 96
+    private static let sourceRate = FrameRate.parse("23.976")!
+    private static let outputRate = FrameRate.parse("59.94")!
+
+    private func makeSource(frames: Int) -> SyntheticFrameSource {
+        SyntheticFrameSource(width: Self.width, height: Self.height, format: .nv12,
+                             frameRate: Self.sourceRate, totalFrames: frames)
+    }
+
+    private func makeEngines(_ count: Int, depth: Int = 2) -> [RecordingEngine] {
+        (0..<count).map { _ in
+            RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                            maximumInterpolationsPerInterval: 5, depth: depth,
+                            readDelayMicroseconds: 0)
+        }
+    }
+
+    @Test("the work is spread across every session in the pool")
+    func workIsSpreadAcrossThePool() throws {
+        let frames = 40
+        let engines = makeEngines(4)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let pipeline = InterpolationPipeline(source: makeSource(frames: frames),
+                                             sourceRate: Self.sourceRate,
+                                             outputRate: Self.outputRate,
+                                             engines: engines,
+                                             configuration: .init(engines: 4,
+                                                                  sceneDetection: false))
+        let report = try pipeline.run(into: sink)
+        #expect(report.problems.isEmpty)
+
+        // Every interval is accounted for, exactly once, across the whole pool — which is
+        // also the assertion that every session was drained. A pipeline that drained the
+        // first session and returned would leave holes here.
+        let counts = engines.map(\.submittedCount)
+        let total = counts.reduce(0, +)
+        #expect(total == report.engineCalls,
+                "the pool saw \(total) intervals, the run reported \(report.engineCalls)")
+        #expect(!counts.contains(0), "a session was never used: \(counts)")
+
+        // Round robin, so the shares differ by at most one.
+        #expect(counts.max()! - counts.min()! <= 1,
+                "the work is not spread evenly: \(counts)")
+
+        // And no interval was given to two sessions at once.
+        let all = engines.flatMap { $0.observed.map(\.interval) }.sorted()
+        #expect(all == Array(Set(all)).sorted(), "an interval was submitted twice")
+    }
+
+    @Test("a session that is one of a pool is told its submissions are not sequential")
+    func aPoolIsNotSequential() throws {
+        let engines = makeEngines(3)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let pipeline = InterpolationPipeline(source: makeSource(frames: 24),
+                                             sourceRate: Self.sourceRate,
+                                             outputRate: Self.outputRate,
+                                             engines: engines,
+                                             configuration: .init(engines: 3,
+                                                                  sceneDetection: false))
+        _ = try pipeline.run(into: sink)
+        for (index, engine) in engines.enumerated() {
+            #expect(engine.submissionOrder == .random,
+                    "session \(index) was told \(String(describing: engine.submissionOrder)) while being fed every third interval")
+        }
+    }
+
+    @Test("one session driving a whole film is still not sequential — a cut skips an interval")
+    func aSingleSessionIsStillNotSequential() throws {
+        // This test used to assert the opposite, and it was wrong.
+        //
+        // The reasoning was: one session, no `rendersInterval` filter, so the intervals
+        // arrive in presentation order and `.sequential` is true — and it is worth 13.4
+        // against 12.0 source frames/s, so keep it. What that missed is the *second* way the
+        // sequence breaks, and it is the one that needs no pool and no filter: **an interval
+        // whose frames are all passthrough is never submitted**, and a scene cut forces
+        // exactly that. Both frames either side of a cut become passthroughs, the interval is
+        // skipped, and the session's next submission is a jump.
+        //
+        // Measured on the real 4K HDR film, the cost of that lie is visible: the two output
+        // frames after every cut came back as a plain cross-fade — a double exposure — while
+        // the same session told `.random` produced correct motion-compensated frames.
+        let frames = 40
+        let engine = RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                     maximumInterpolationsPerInterval: 5, depth: 2,
+                                     readDelayMicroseconds: 0)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let source = SyntheticFrameSource(width: Self.width, height: Self.height, format: .nv12,
+                                          frameRate: Self.sourceRate, totalFrames: frames,
+                                          cutAfter: frames / 2)
+        let pipeline = InterpolationPipeline(source: source,
+                                             sourceRate: Self.sourceRate,
+                                             outputRate: Self.outputRate,
+                                             engine: engine,
+                                             configuration: .init(sceneDetection: true))
+        let report = try pipeline.run(into: sink)
+
+        // The mechanism first, so this is not a test of a constant. A cut was found…
+        #expect(report.cutCount >= 1, "the synthetic cut was not detected: \(report.decisions)")
+        // …and the interval it landed in was skipped rather than submitted, which is what
+        // makes the stream non-contiguous. `frames - 1` intervals exist; a run that
+        // submitted every one of them would be genuinely sequential.
+        #expect(report.engineCalls < frames - 1,
+                "no interval was skipped (\(report.engineCalls) calls for \(frames - 1) intervals), so this test is no longer exercising the case it was written for")
+
+        // And so the order is stated honestly.
+        #expect(engine.submissionOrder == .random,
+                "a single session over a film with a cut was told \(String(describing: engine.submissionOrder))")
+    }
+
+    @Test("a run that skips intervals is not sequential either")
+    func aSkippingRunIsNotSequential() throws {
+        // Playback's case. The pacer hands the pipeline a filter, the filter skips the
+        // intervals the clock has already passed, and the submissions that reach the
+        // session have gaps — so "without jump or skip" is not true of them.
+        let engine = RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                     maximumInterpolationsPerInterval: 5, depth: 2,
+                                     readDelayMicroseconds: 0)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let pipeline = InterpolationPipeline(source: makeSource(frames: 24),
+                                             sourceRate: Self.sourceRate,
+                                             outputRate: Self.outputRate,
+                                             engine: engine,
+                                             configuration: .init(
+                                                sceneDetection: false,
+                                                rendersInterval: { $0 % 2 == 0 }))
+        _ = try pipeline.run(into: sink)
+        #expect(engine.submissionOrder == .random)
+    }
+
+    @Test("the pool never asks a session for more than its depth")
+    func eachSessionRespectsItsDepth() throws {
+        let engines = makeEngines(3, depth: 2)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let pipeline = InterpolationPipeline(source: makeSource(frames: 36),
+                                             sourceRate: Self.sourceRate,
+                                             outputRate: Self.outputRate,
+                                             engines: engines,
+                                             configuration: .init(depth: 2, engines: 3,
+                                                                  sceneDetection: false))
+        _ = try pipeline.run(into: sink)
+        for (index, engine) in engines.enumerated() {
+            #expect(engine.peakConcurrentRequests <= 2,
+                    "session \(index) had \(engine.peakConcurrentRequests) in flight, depth 2")
+        }
+    }
+
+    @Test("a pool writes exactly the frames the plan calls for")
+    func aPoolProducesTheSameOutputAsOneSession() throws {
+        // The property the whole change rests on: four sessions are a way of going faster,
+        // not a way of producing something different. A single session's output is the
+        // reference; the pool has to match it frame for frame.
+        let frames = 47
+        let single = RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                     maximumInterpolationsPerInterval: 5, depth: 2,
+                                     readDelayMicroseconds: 0)
+        let singleSink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let singlePipeline = InterpolationPipeline(source: makeSource(frames: frames),
+                                                   sourceRate: Self.sourceRate,
+                                                   outputRate: Self.outputRate,
+                                                   engine: single,
+                                                   configuration: .init(sceneDetection: false))
+        _ = try singlePipeline.run(into: singleSink)
+
+        let engines = makeEngines(4)
+        let poolSink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let poolPipeline = InterpolationPipeline(source: makeSource(frames: frames),
+                                                 sourceRate: Self.sourceRate,
+                                                 outputRate: Self.outputRate,
+                                                 engines: engines,
+                                                 configuration: .init(engines: 4,
+                                                                      sceneDetection: false))
+        _ = try poolPipeline.run(into: poolSink)
+
+        #expect(poolSink.count == singleSink.count)
+        #expect(poolSink.ordered.map(\.index) == singleSink.ordered.map(\.index))
+        #expect(poolSink.ordered.map(\.bytes) == singleSink.ordered.map(\.bytes))
+    }
 }

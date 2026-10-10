@@ -47,21 +47,34 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Quality") {
+            Section("Speed") {
+                Stepper("Sessions in parallel: \(model.settings.workerLabel)",
+                        value: $model.settings.workers, in: 0...8)
+                Text(workerExplanation)
+                    .font(.caption)
+                    .foregroundStyle(model.settings.workerCount > RenderWorkers.optimum
+                                     ? .orange : .secondary)
+
                 Stepper("Requests in flight: \(model.settings.depth)",
                         value: $model.settings.depth, in: 1...8)
                 Text(model.settings.depth < 2
                      ? "Depth 1 fails outright on 23.976 → 59.94 — measured, dropping to 56.7 fps."
-                     : "Two is the minimum that works and the point where more stops helping.")
+                     : "Two is the minimum that works, and past it this does nothing at all: "
+                       + "at 4K, depths 2, 4 and 8 all give 13.4–13.5 source frames/s. It is "
+                       + "not a speed control — the sessions above are.")
                     .font(.caption)
                     .foregroundStyle(model.settings.depth < 2 ? .orange : .secondary)
+            }
 
+            Section("Quality") {
                 Toggle("Detect scene cuts", isOn: $model.settings.sceneDetection)
                 Text("Both engines double-expose across a cut, so the interpolations there are "
                      + "turned into held frames. Off only to see why it is needed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            folderAccessSection
 
             Section("Container and audio") {
                 Picker("Write", selection: $model.settings.container) {
@@ -159,6 +172,105 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(minWidth: 520, minHeight: 640)
+        // Reports what the app already knows; asks nothing. A probe here would raise a system
+        // prompt for every folder macOS has never been answered about — measured, one dialog
+        // at a time, Desktop then Documents then Downloads. The row offers to ask instead.
+        .task { model.refreshFolderAccess() }
+    }
+
+    // MARK: - Speed
+
+    /// Why the session count is what it is, in the numbers it was decided by.
+    private var workerExplanation: String {
+        let chosen = model.settings.workerCount
+        var text = "One session cannot be hurried — `VTFrameProcessor` runs its requests one "
+            + "at a time, and asking it for more at once changes nothing. Separate sessions do "
+            + "overlap. Measured on real 4K HDR film, whole conversions: "
+            + "1 session 13.4 source frames/s, 2 sessions 21.5, 4 sessions 23.8 — a 1.78× "
+            + "speed-up, or 2.0 h instead of 3.5 for a two-hour film. "
+        if chosen > RenderWorkers.optimum {
+            text += "Six sessions measured **17.0** — slower than four. Past the knee the "
+                + "sessions fight over the same unit and the losers just queue, so this "
+                + "setting is set above what the machine wants."
+        } else if model.settings.workers == 0 {
+            text += "This machine asks for \(chosen)."
+        }
+        return text
+    }
+
+    // MARK: - Folder access
+
+    /// The status line, and the one thing that can be done about it.
+    ///
+    /// macOS gates Desktop, Documents, Downloads and removable volumes, and it remembers one
+    /// answer per app. A refusal is silent from then on: films do not open, the file chooser
+    /// lists nothing, and no error says why. So the row states what macOS has actually said —
+    /// which it only knows from work already done — and when there is something to ask or
+    /// repair, the row itself is the button.
+    @ViewBuilder
+    private var folderAccessSection: some View {
+        let report = model.folderAccess
+        let actionable = report.needsAttention
+
+        Section("Folder access") {
+            Button {
+                model.fixFolderAccess()
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Image(systemName: symbol(for: report))
+                        .foregroundStyle(report.isClear ? Color.secondary : Color.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(report.headline)
+                            .foregroundStyle(actionable ? .primary : .secondary)
+                        if !report.detail.isEmpty {
+                            Text(report.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                    Spacer()
+                    if model.checkingFolderAccess {
+                        ProgressView().controlSize(.small)
+                    } else if actionable {
+                        Text(report.isClear ? "Ask…" : "Allow…").foregroundStyle(.tint)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            // Clickable exactly when clicking would do something, and a plain row otherwise —
+            // a settings line that offers to "fix" a working state is a line that teaches the
+            // user not to trust the others.
+            .buttonStyle(.plain)
+            .disabled(!actionable || model.checkingFolderAccess)
+
+            Text(folderExplanation(report))
+                .font(.caption)
+                .foregroundStyle(report.isClear ? Color.secondary : Color.orange)
+        }
+    }
+
+    private func symbol(for report: FolderAccess.Report) -> String {
+        if !report.isClear { return "exclamationmark.triangle.fill" }
+        return report.notAsked.isEmpty ? "checkmark.circle.fill" : "questionmark.circle"
+    }
+
+    private func folderExplanation(_ report: FolderAccess.Report) -> String {
+        if !report.isClear {
+            return "macOS has refused this app access. It will not ask again — a second attempt "
+                + "fails immediately and silently, which is why a film that will not open gives "
+                + "no error at all. Clicking opens the switch, in System Settings ▸ Privacy & "
+                + "Security ▸ Files and Folders."
+        }
+        if !report.notAsked.isEmpty {
+            return "Nothing has needed these folders yet, so macOS has not been asked. Clicking "
+                + "asks it — and because there is no way to read the answer without attempting "
+                + "the access, that raises one system prompt per folder. macOS remembers the "
+                + "answer for the whole app, and a refusal is silent: films simply stop opening."
+        }
+        return "Every folder the app uses has been read successfully, so nothing is being "
+            + "withheld. macOS remembers this per app, and it is not something the app can "
+            + "look up — this is the record of what it has actually been able to do."
     }
 }
 

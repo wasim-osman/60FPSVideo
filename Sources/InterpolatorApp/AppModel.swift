@@ -74,6 +74,25 @@ final class AppModel {
     private(set) var cacheBytes: Int64 = 0
     private(set) var cacheEntries = 0
 
+    // MARK: - Folder access
+
+    /// What macOS last said about the folders films live in.
+    ///
+    /// Filled in from work the user actually asked for, never from a probe on a screen that
+    /// merely opened. A check *is* the question — there is no way to read the answer without
+    /// attempting the access, and attempting it on a folder macOS has never been asked about
+    /// raises a prompt. Probing three folders to populate a status line therefore raises three
+    /// dialogs, measured one at a time; a settings screen that greets you with a queue of
+    /// system alerts is worse than a status line that says "not asked yet".
+    private(set) var folderAccess: FolderAccess.Report = FolderAccess.report()
+    private(set) var checkingFolderAccess = false
+
+    /// What real operations have proved, keyed by folder path.
+    ///
+    /// Evidence rather than a question: the app has just read a file here, or just been
+    /// refused one. Neither raises a prompt, which is the point.
+    private var knownFolderAccess: [String: FolderAccess.State] = [:]
+
     init(settings: AppSettings = .load()) {
         self.settings = settings
     }
@@ -98,9 +117,28 @@ final class AppModel {
             }.value
             let opened = Film(url: url, info: info)
             film = opened
+            // The film read. That is an answer macOS has already given about this folder, and
+            // recording it here is what lets the settings row say something true without ever
+            // asking a question of its own.
+            noteFolderAccess(for: url, succeeded: true)
             try await startSession(for: opened)
         } catch {
-            loadError = "\(error)"
+            // A film that will not open is the failure this app was worst at explaining: macOS
+            // refuses the read, the probe fails, and what the user sees is a message about the
+            // probe. If the folder is one macOS gates, say so and say where the switch is.
+            //
+            // Classifying the failure is safe here — the read has just been refused, so this
+            // returns immediately and cannot raise a prompt the user did not ask for.
+            var message = "\(error)"
+            let verdict = FolderAccess.classify(afterFailureIn: url)
+            knownFolderAccess[verdict.path] = verdict.state
+            refreshFolderAccess()
+            if verdict.state == .refused {
+                message += "\n\nmacOS is refusing this app access to "
+                    + "\(url.deletingLastPathComponent().lastPathComponent). "
+                    + "Open Settings ▸ Folder access to put that right."
+            }
+            loadError = message
         }
         loading = false
     }
@@ -426,9 +464,20 @@ final class AppModel {
             }.value
             job.info = info
             job.output = settings.outputURL(for: job.input)
+            noteFolderAccess(for: job.input, succeeded: true)
         } catch {
+            // A film added to the queue is read straight away — that is the point of probing at
+            // add time — so a refusal surfaces here, minutes before the job would have run, and
+            // is recorded rather than left to be discovered as a queue full of failures.
+            let verdict = FolderAccess.classify(afterFailureIn: job.input)
+            knownFolderAccess[verdict.path] = verdict.state
+            refreshFolderAccess()
             job.state = .failed
-            job.failure = "\(error)"
+            job.failure = verdict.state == .refused
+                ? "\(error)\n\nmacOS is refusing this app access to "
+                    + "\(job.input.deletingLastPathComponent().lastPathComponent). "
+                    + "See Settings ▸ Folder access."
+                : "\(error)"
         }
     }
 
@@ -483,8 +532,19 @@ final class AppModel {
             job.result = result
             job.state = .finished
             job.progress = nil
+            noteFolderAccess(for: job.input, succeeded: true)
         } catch {
-            job.failure = "\(error)"
+            // A conversion that cannot even read its input is the other half of the silent
+            // refusal: the batch queue shows a failure, and the reason is a folder macOS has
+            // stopped answering about. Classifying it here records the answer without asking.
+            let verdict = FolderAccess.classify(afterFailureIn: job.input)
+            knownFolderAccess[verdict.path] = verdict.state
+            refreshFolderAccess()
+            job.failure = verdict.state == .refused
+                ? "\(error)\n\nmacOS is refusing this app access to "
+                    + "\(job.input.deletingLastPathComponent().lastPathComponent). "
+                    + "See Settings ▸ Folder access."
+                : "\(error)"
             job.state = .failed
         }
         job.finished = Date()
@@ -511,6 +571,7 @@ final class AppModel {
             policy: settings.policy,
             bitRate: nil,
             depth: settings.depth,
+            workers: settings.workers,
             sceneDetection: settings.sceneDetection,
             maximumSourceFrames: settings.previewSeconds.map {
                 Int(($0 * sourceRate).rounded())
@@ -539,6 +600,73 @@ final class AppModel {
     func clearCache() {
         AudioCache.default.clear()
         refreshCacheSize()
+    }
+
+    // MARK: - Folder access
+
+    /// Refresh the status line from what is already known. **Asks nothing.**
+    ///
+    /// This is what the settings screen does when it opens. A probe here would raise a system
+    /// prompt for every folder macOS has never been asked about — three of them, one dialog at
+    /// a time — so the screen reports what the app has already proved and offers to ask.
+    func refreshFolderAccess() {
+        folderAccess = FolderAccess.report(known: knownFolderAccess, including: activeFolders)
+    }
+
+    /// Record what a real file operation just proved about the folder it touched.
+    ///
+    /// Called when a film opens and when one fails. A success is an answer macOS has already
+    /// given; a failure is classified by asking again, which is safe because the read has just
+    /// been refused and cannot raise a prompt the second time.
+    func noteFolderAccess(for url: URL, succeeded: Bool) {
+        let folder = url.deletingLastPathComponent()
+        knownFolderAccess[folder.path] = succeeded
+            ? .allowed
+            : FolderAccess.classify(afterFailureIn: url).state
+        refreshFolderAccess()
+    }
+
+    /// Every folder the app is currently working with.
+    private var activeFolders: [URL] {
+        var urls: [URL] = []
+        if let film { urls.append(film.url) }
+        urls.append(contentsOf: jobs.map(\.input))
+        if let directory = settings.outputDirectory { urls.append(URL(fileURLWithPath: directory)) }
+        return urls
+    }
+
+    /// Ask macOS — the row's action, and the only thing that can be done about a refusal.
+    ///
+    /// Two outcomes, in this order, because macOS has one answer per app:
+    ///
+    /// 1. **Ask.** For a folder it has never been answered about, this is the call that raises
+    ///    the system prompt, which is what "clickable so the prompt can be re-triggered" asks
+    ///    for.
+    /// 2. **If the answer is already no**, macOS does not ask again: a second attempt fails
+    ///    immediately and silently. The switch has to be moved by hand, so this opens the pane
+    ///    it lives in rather than leaving a button that appears to do nothing.
+    ///
+    /// Off the main thread, because step 1 blocks for as long as a system prompt is on screen
+    /// — blocking the main thread there would freeze the window the user is being asked about.
+    func fixFolderAccess() {
+        guard !checkingFolderAccess else { return }
+        checkingFolderAccess = true
+        let extra = activeFolders
+
+        Task.detached(priority: .userInitiated) {
+            let (report, known) = FolderAccess.probe(including: extra)
+            await MainActor.run {
+                self.knownFolderAccess.merge(known) { _, new in new }
+                self.folderAccess = report
+                self.checkingFolderAccess = false
+                // Only when it is still refusing. A granted check means the prompt was answered
+                // this time, and opening System Settings over a working app would be a
+                // confusing thing to do to someone who just clicked "Allow".
+                if !report.isClear {
+                    FolderAccess.openPrivacySettings()
+                }
+            }
+        }
     }
 }
 

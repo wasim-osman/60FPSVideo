@@ -53,7 +53,20 @@ public struct BatchConverter: Sendable {
         public var bitRate: Int?
 
         /// Requests kept in flight. 2 is the minimum that works (invariant 3).
+        ///
+        /// Not a speed control — see ``workers`` for that. Measured at 4K, depths 2, 4 and 8
+        /// all give 13.4–13.5 source frames/s.
         public var depth: Int
+
+        /// Interpolating sessions to run at once. `0` asks the machine.
+        ///
+        /// The lever that actually matters: one `VTFrameProcessor` session runs its requests
+        /// one at a time, and several sessions overlap each other's idle time. Measured at
+        /// 4K on real HDR film, 13.4 source frames/s with one and **23.8 with four** — a
+        /// 1.78× speed-up on the whole conversion. Past four it gets *worse*: six sessions
+        /// give 17.0. See ``RenderWorkers``.
+        public var workers: Int
+
         public var sceneDetection: Bool
 
         /// Stop after this many source frames. `nil` for the whole film.
@@ -109,6 +122,7 @@ public struct BatchConverter: Sendable {
                     policy: OutputRatePolicy = .default,
                     bitRate: Int? = nil,
                     depth: Int = 2,
+                    workers: Int = 0,
                     sceneDetection: Bool = true,
                     maximumSourceFrames: Int? = nil,
                     startSeconds: Double? = nil,
@@ -123,6 +137,7 @@ public struct BatchConverter: Sendable {
             self.policy = policy
             self.bitRate = bitRate
             self.depth = depth
+            self.workers = workers
             self.sceneDetection = sceneDetection
             self.maximumSourceFrames = maximumSourceFrames
             self.startSeconds = startSeconds
@@ -464,14 +479,21 @@ public struct BatchConverter: Sendable {
         let sink = try makeSink(staging, settings)
         let source = try makeSource(request.input, info,
                                     request.startSeconds, request.maximumSourceFrames)
-        let engine = try makeEngine(info.frameRate, resolution.output, request.depth)
+        let workers = RenderWorkers.resolve(request.workers)
+        // One session per worker, all driving the same source and the same sink. This is
+        // where the 1.78× lives: nothing else about the run changes, and with `workers` 1
+        // this is byte for byte the old behaviour.
+        let engines = try (0..<workers).map { _ in
+            try makeEngine(info.frameRate, resolution.output, request.depth)
+        }
 
         let pipeline = InterpolationPipeline(
             source: source,
             sourceRate: info.frameRate,
             outputRate: resolution.output,
-            engine: engine,
+            engines: engines,
             configuration: .init(depth: request.depth,
+                                 engines: workers,
                                  sceneDetection: request.sceneDetection,
                                  maximumSourceFrames: request.maximumSourceFrames,
                                  expectedOutputFrameCount: Self.expectedOutputFrames(
@@ -901,14 +923,22 @@ public struct BatchConverter: Sendable {
                                                      rate: info.frameRate,
                                                      base: request.startSeconds ?? 0),
                                     segment.readCount)
-        let engine = try makeEngine(info.frameRate, resolution.output, request.depth)
+        // Each piece gets the whole pool. Pieces are rendered one after another on purpose —
+        // they exist so that a crash costs one piece rather than three hours, and running
+        // them at once would give that up for nothing, because the parallelism is already
+        // inside the piece. Two levers pulling the same weight would only fight.
+        let workers = RenderWorkers.resolve(request.workers)
+        let engines = try (0..<workers).map { _ in
+            try makeEngine(info.frameRate, resolution.output, request.depth)
+        }
 
         let pipeline = InterpolationPipeline(
             source: source,
             sourceRate: info.frameRate,
             outputRate: resolution.output,
-            engine: engine,
+            engines: engines,
             configuration: .init(depth: request.depth,
+                                 engines: workers,
                                  sceneDetection: request.sceneDetection,
                                  maximumSourceFrames: segment.readCount,
                                  expectedOutputFrameCount: segment.outputCount,

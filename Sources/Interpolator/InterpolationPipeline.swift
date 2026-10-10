@@ -114,7 +114,29 @@ public final class InterpolationPipeline: @unchecked Sendable {
     public struct Configuration: Sendable {
         /// Requests kept in flight. **2 is the minimum that works**: depth 1 fails
         /// outright on 23.976 → 60, dropping to 56.7 fps (invariant 3).
+        ///
+        /// Past 2 this does nothing at all, which is measured rather than assumed: 2, 4 and
+        /// 8 all give 13.4–13.5 source frames/s at 4K. It is not a knob for speed. Use
+        /// ``engines`` for that.
         public var depth: Int
+
+        /// Interpolating sessions to run at once. **This is the knob for speed.**
+        ///
+        /// One session cannot be hurried, however many requests are queued at it, because
+        /// it runs them one at a time. Several sessions do overlap. Measured at 4K on the
+        /// real HDR film, one whole conversion per session:
+        ///
+        ///     sessions   aggregate   speed-up
+        ///        1        13.4/s      1.00x
+        ///        2        21.5/s      1.60x
+        ///        4        23.8/s      1.78x
+        ///        6        17.0/s      1.27x
+        ///
+        /// So the answer is four and not "as many as there are cores": at six the sessions
+        /// fight and the run is *slower* than it was with four. `RenderWorkers.suggested()`
+        /// picks a count for the machine; 1 leaves this exactly as it was before.
+        public var engines: Int
+
         /// Detect scene cuts and turn the interpolations across them into held
         /// frames. Off only for the A/B that demonstrates why it is needed.
         public var sceneDetection: Bool
@@ -173,6 +195,7 @@ public final class InterpolationPipeline: @unchecked Sendable {
         public var progress: (@Sendable (Int) -> Void)?
 
         public init(depth: Int = 2,
+                    engines: Int = 1,
                     sceneDetection: Bool = true,
                     maximumSourceFrames: Int? = nil,
                     expectedOutputFrameCount: Int? = nil,
@@ -180,6 +203,7 @@ public final class InterpolationPipeline: @unchecked Sendable {
                     rendersInterval: (@Sendable (Int) -> Bool)? = nil,
                     progress: (@Sendable (Int) -> Void)? = nil) {
             self.depth = depth
+            self.engines = max(1, engines)
             self.sceneDetection = sceneDetection
             self.maximumSourceFrames = maximumSourceFrames
             self.expectedOutputFrameCount = expectedOutputFrameCount
@@ -215,11 +239,20 @@ public final class InterpolationPipeline: @unchecked Sendable {
     private let source: FrameSource
     private let sourceRate: FrameRate
     private let outputRate: FrameRate
-    private let engine: InterpolationEngine
+    /// The interpolating sessions this run drives, in parallel.
+    ///
+    /// A pool rather than one engine because one engine cannot be made to go faster.
+    /// `VTFrameProcessor` serialises its own work: measured at 4K on real HDR film, asking
+    /// one session for 2, 4 or 8 requests in flight gave 13.4, 13.5 and 13.5 source
+    /// frames/s — identical. Separate sessions do run at the same time, because the unit
+    /// they queue behind is VideoToolbox's and not their own. See ``RenderWorkers`` for
+    /// the scaling curve and where it stops.
+    private let engines: [InterpolationEngine]
     private let configuration: Configuration
     private var hasRun = false
 
-    /// The shipping configuration: the real `VTFrameProcessor` engine.
+    /// The shipping configuration: real `VTFrameProcessor` sessions, `configuration.engines`
+    /// of them.
     public init(source: FrameSource,
                 sourceRate: FrameRate,
                 outputRate: FrameRate,
@@ -228,8 +261,10 @@ public final class InterpolationPipeline: @unchecked Sendable {
         self.sourceRate = sourceRate
         self.outputRate = outputRate
         self.configuration = configuration
-        self.engine = VTFrameProcessorEngine(source: sourceRate, output: outputRate,
-                                            depth: configuration.depth)
+        self.engines = (0..<max(1, configuration.engines)).map { _ in
+            VTFrameProcessorEngine(source: sourceRate, output: outputRate,
+                                   depth: configuration.depth)
+        }
     }
 
     /// Take the engine from the caller.
@@ -248,7 +283,30 @@ public final class InterpolationPipeline: @unchecked Sendable {
         self.sourceRate = sourceRate
         self.outputRate = outputRate
         self.configuration = configuration
-        self.engine = engine
+        self.engines = [engine]
+    }
+
+    /// Take a pool of engines from the caller.
+    ///
+    /// The same seam as the single-engine initialiser, for the same reason: a recording
+    /// engine can say which session each interval was given to, and how many were in
+    /// flight at once. Parallelism that is not observed is parallelism that is not there —
+    /// the failure mode is not a crash but a run that quietly uses one session and takes
+    /// exactly as long as it did before.
+    ///
+    /// The engines must all be built for the same rate pair and the same depth; the
+    /// pipeline sizes its slot ring from the largest of each.
+    public init(source: FrameSource,
+                sourceRate: FrameRate,
+                outputRate: FrameRate,
+                engines: [InterpolationEngine],
+                configuration: Configuration = Configuration()) {
+        precondition(!engines.isEmpty, "a pipeline needs at least one engine")
+        self.source = source
+        self.sourceRate = sourceRate
+        self.outputRate = outputRate
+        self.configuration = configuration
+        self.engines = engines
     }
 
     // MARK: - Run
@@ -286,17 +344,61 @@ public final class InterpolationPipeline: @unchecked Sendable {
                                                                output: outputRate)
         }
 
-        let engine = self.engine
-        try engine.prepare(width: width, height: height)
-        defer { engine.shutdown() }
+        let engines = self.engines
+
+        // What each session may assume about the order it is about to be fed.
+        //
+        // **`.random`, always — and this is not a conservative default, it is the true one.**
+        // The SDK defines `.sequential` as "the current submission follows presentation time
+        // order *without jump or skip*". This pipeline breaks that claim in two places, and the
+        // second one is unavoidable:
+        //
+        // - A pool is fed a **stride**. With four sessions, one of them receives intervals
+        //   0, 4, 8, … so every submission it gets is a jump from the one before.
+        // - **An interval whose frames are all passthrough is never submitted at all** (the
+        //   `resolved.isEmpty` branch below). A scene cut forces exactly that: both frames
+        //   either side of the cut become passthroughs, so the interval is skipped and the
+        //   sequence has a gap. Measured on the real film, that gap is not free: with the
+        //   session told `.sequential` the two output frames *after* every cut come back as a
+        //   plain cross-fade — a visible double exposure — because the optical flow it carries
+        //   forward describes an interval it was never given. Told `.random` instead, the same
+        //   session produces the correct motion-compensated frames, and its output matches a
+        //   four-session pool to **57.93 dB mean, 3 frames of 3068 below 40 dB**, against a
+        //   four-versus-four control of 58.42 dB and none. The `.sequential` run differs from
+        //   both at *every* cut: 17 frames below 40 dB.
+        //
+        // So the sequence is never one unbroken pass, and saying otherwise buys 11% of a single
+        // session's throughput with wrong pixels on the two frames after every cut. That is not
+        // a trade this project makes. At the shipping default of four sessions it costs nothing
+        // at all — measured 21.2 against 21.2 source frames/s, and 55.7 s wall in both of two
+        // runs.
+        //
+        // A caller that genuinely drives one contiguous run can still ask for `.sequential` at
+        // the engine. Nothing in this package does, because nothing in it can promise that.
+        let order: SubmissionOrder = .random
+        for engine in engines { engine.setSubmissionOrder(order) }
+
+        for engine in engines { try engine.prepare(width: width, height: height) }
+        defer { for engine in engines { engine.shutdown() } }
+
+        // Sized from the largest engine in the pool, so a caller that hands over engines
+        // built with different depths still gets a ring that is big enough for all of them
+        // rather than one that quietly reuses a slot a request is still holding.
+        let maximumInterpolations = engines.map(\.maximumInterpolationsPerInterval).max() ?? 3
+        let slotsPerEngine = engines.map(\.depth).max() ?? 2
+        // One ring of slots for the whole pool. A slot is handed to whichever session the
+        // round robin lands on, and the slot's own semaphore is what keeps a buffer from
+        // being reused while a request still holds it (invariant 17) — so the two do not
+        // have to be paired, only counted together.
+        let slotCount = engines.count * slotsPerEngine
 
         let pool = try PixelBufferPool(
             width: width, height: height, format: format,
-            capacity: engine.depth * (2 + engine.maximumInterpolationsPerInterval))
-        let slots: [Slot] = try (0..<engine.depth).map { _ in
+            capacity: slotCount * (2 + maximumInterpolations))
+        let slots: [Slot] = try (0..<slotCount).map { _ in
             Slot(a: try pool.makeBuffer(),
                  b: try pool.makeBuffer(),
-                 destinations: try (0..<engine.maximumInterpolationsPerInterval)
+                 destinations: try (0..<maximumInterpolations)
                      .map { _ in try pool.makeBuffer() })
         }
 
@@ -350,7 +452,7 @@ public final class InterpolationPipeline: @unchecked Sendable {
         }
 
         let problems = ProblemLog()
-        let slotFree = (0..<engine.depth).map { _ in DispatchSemaphore(value: 1) }
+        let slotFree = (0..<slotCount).map { _ in DispatchSemaphore(value: 1) }
 
         // Where this run sits in the film. Local interval `j` is the film's interval
         // `readBase + j`; only those in `[localRenderFrom, localRenderTo)` produce output.
@@ -431,7 +533,12 @@ public final class InterpolationPipeline: @unchecked Sendable {
                 let wanted = configuration.rendersInterval?(globalInterval) ?? true
 
                 if wanted, !resolved.isEmpty {
-                    let slotIndex = submitted % engine.depth
+                    let slotIndex = submitted % slotCount
+                    // Which session takes this interval. Slots are handed out in the same
+                    // rotation, so consecutive intervals land on consecutive sessions and a
+                    // pool of four gets four requests in flight before any session is asked
+                    // for its second.
+                    let engine = engines[slotIndex % engines.count]
                     // Invariant 17: acquired before the load, released in the completion.
                     slotFree[slotIndex].wait()
                     let slot = slots[slotIndex]
@@ -503,10 +610,14 @@ public final class InterpolationPipeline: @unchecked Sendable {
             decisions.append(contentsOf: tracker.finish())
         }
 
-        do {
-            try engine.drain()
-        } catch {
-            problems.record("engine drain: \(error)")
+        // Every session, not just one: a run that drained the first and returned would
+        // truncate the output while the other three were still writing into it.
+        for (index, engine) in engines.enumerated() {
+            do {
+                try engine.drain()
+            } catch {
+                problems.record("engine \(index) drain: \(error)")
+            }
         }
 
         try sink.finish()

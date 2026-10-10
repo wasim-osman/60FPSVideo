@@ -25,6 +25,9 @@ public final class VTFrameProcessorEngine: InterpolationEngine, @unchecked Senda
     /// Requests kept in flight. Public so the caller can size its buffer ring.
     public let depth: Int
 
+    /// See ``SubmissionOrder``. Not a hint — a statement that has to be true.
+    private var submissionMode: SubmissionOrder
+
     private var processor: VTFrameProcessor?
     private var sessionStarted = false
 
@@ -36,15 +39,30 @@ public final class VTFrameProcessorEngine: InterpolationEngine, @unchecked Senda
     /// - Parameters:
     ///   - depth: requests kept in flight. **2 is the minimum that works**: depth 1
     ///     fails outright on 23.976 → 60, dropping to 56.7 fps (invariant 3).
-    public init(source: FrameRate, output: FrameRate, depth: Int = 2) {
+    ///   - submissionMode: what this session may assume about the order it is fed. **Defaults
+    ///     to `.random`, which is the safe answer and, for anything in this package, the true
+    ///     one.** `.sequential` is a claim that the submissions follow presentation order
+    ///     *without jump or skip*, and every caller here breaks that claim: a pool is fed a
+    ///     stride, and any run that skips a scene cut's all-passthrough interval leaves a gap.
+    ///     A session told `.sequential` across such a gap carries an optical flow describing an
+    ///     interval it was never given, and the two frames after each cut come back as a plain
+    ///     cross-fade. See `InterpolationPipeline` for the measurement. Ask for `.sequential`
+    ///     only if you are the thing producing the stream *and* you know it is unbroken.
+    public init(source: FrameRate, output: FrameRate, depth: Int = 2,
+                submissionMode: SubmissionOrder = .random) {
         self.sourceRate = source
         self.outputRate = output
         self.depth = max(2, depth)
+        self.submissionMode = submissionMode
 
         // One interval can produce at most ceil(out/src) frames, plus slack for the
         // phase landing just either side of a boundary.
         let ratio = output.doubleValue / source.doubleValue
         self.maximumInterpolationsPerInterval = Int(ratio.rounded(.up)) + 2
+    }
+
+    public func setSubmissionOrder(_ order: SubmissionOrder) {
+        submissionMode = order
     }
 
     // MARK: - Session
@@ -128,7 +146,8 @@ public final class VTFrameProcessorEngine: InterpolationEngine, @unchecked Senda
                 nextFrame: nextFrame,
                 opticalFlow: nil,
                 interpolationPhase: phases,
-                submissionMode: .sequential,
+                submissionMode: submissionMode == .sequential
+                    ? .sequential : .random,
                 destinationFrames: destinationFrames
               )
         else {

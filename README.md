@@ -32,7 +32,9 @@ frames needing no interpolation at all**, against 76.8 fps and 0% at 60.000. Int
 setting with 59.94 as its default rather than a constant.
 
 Batch throughput scales to **~247 output fps aggregate with 4 concurrent workers** — a 2 h film in
-about 29 minutes at 1080p.
+about 29 minutes at 1080p. (That is the Phase-0 figure for four concurrent *processes*. The
+shipped converter uses four interpolating *sessions inside one job* instead, which is the same
+idea without the four sets of buffers — §26.)
 
 ## The app — built
 
@@ -42,7 +44,7 @@ films in a queue. Both are the same engine with two schedulers.
 
 ```bash
 swift build --disable-sandbox          # the library, the harness and the app
-swift test  --disable-sandbox          # 366 tests in 30 suites, zero warnings
+swift test  --disable-sandbox          # 379 tests in 32 suites, zero warnings
 
 scripts/bundle.sh                      # build 60FPS.app (ad-hoc signed)
 scripts/bundle.sh --dmg                # ... and 60FPS-1.0.0.dmg
@@ -57,17 +59,17 @@ directly, so a Finder launch works without a shell). MIT licensed.
 | Playback | 1080p real time. 4K **plays and drops**: ~19 fps presented, ~half the intervals not computed, the picture a fifth of a second behind the clock — permanently, and stated in the window rather than hidden. One click switches to 1080p. |
 | Sound | The soundtrack is the clock. MP4 + AAC by default, or MKV + a bit-for-bit copy of a real track off the disc. |
 | HDR | 10-bit P010 end to end, disc metadata carried through, tone-mapped by the system compositor. |
-| Batch | 4 workers, segments with resume, both containers, audio muxed once over the joined picture. |
+| Batch | **4 interpolating sessions per job** (§26) — measured 1.78× on the interpolator and 1.63× end to end, four separate runs at 55.7 s. Segments with resume, both containers, audio muxed once over the joined picture. |
 | Output rate | 59.94 (`OutputRatePolicy.standard`); `exactSixty` overrides. A policy is a *value*, so batch and playback cannot disagree. |
 
 The whole record — every measured trap with its numbers — is
-[`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md) §§0–25 and invariants 1–43.
+[`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md) §§0–27 and invariants 1–46.
 
 ## Read this first
 
-**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)** ⭐ **latest — §§0–25**
+**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)** ⭐ **latest — §§0–27**
 The index, and the one to read before touching the pipeline. The 14 decisions with measured
-effects and your recorded choices; **§§13–25 are what was built**; and **invariants 1–43** are
+effects and your recorded choices; **§§13–27 are what was built**; and **invariants 1–46** are
 every measured failure mode, each with the numbers that produced it. If you read one thing,
 read the invariants — they are the difference between a build that works and a build that looks
 like it works. §25 covers the shell: the four bugs that only running it could find, the bundle,
@@ -142,6 +144,25 @@ conversion, and the API resolution ceilings. *Partly superseded — see the corr
   for this graph. The ANE is worse still: 30× slower than the GPU.
 - **RIFE needs frame dimensions divisible by 64**, not 16: `IFBlock.conv0` runs two stride-2 convs
   at scale=16, so 544 silently restores to 576 and the warp breaks.
+- **One `VTFrameProcessor` session cannot be hurried; several overlap.** Requests in flight is
+  inert — at 4K, depths 2, 4 and 8 all give 13.4–13.5 source frames/s. Separate sessions do
+  overlap: 1 → 13.4/s, 2 → 21.5, 4 → **23.8 (1.78×)**, 6 → **17.0 — slower than four.** The
+  optimum is a knee, not a core count, which is what `RenderWorkers` encodes.
+- **`SubmissionMode` is a statement of fact, not a hint.** The SDK defines `.sequential` as
+  "without jump or skip" and acts on it by keeping internal caches. The first pool told four
+  strided sessions `.sequential` and produced **894 of 1198 frames below 40 dB** (mean 36 dB)
+  against a **58.2 dB control** for two runs of the identical configuration.
+- **The pipeline is never sequential, pool or no pool.** `if wanted, !resolved.isEmpty` skips
+  the interval a scene cut forces — all its frames are passthroughs — so the session's next
+  submission is a jump. Saying otherwise cost **two frames of plain cross-fade after every cut**
+  in the shipped code, since before the pool existed. Found only by comparing two *encoded*
+  conversions of the same film; no test had ever done that.
+- **In the app, that is 1.2 of 12 cores → 2.4, and half the GPU → 72%.** 55.7 s against 91.0 s
+  for the same 50 s of real 4K HDR film, reproducible to the tenth across four runs.
+- **A TCC permission check *is* the question.** There is no API to read macOS's answer: the
+  attempt is the query and the query is the prompt. It prompts one folder at a time, it remembers
+  one answer per app, and once the answer is no it never asks again — a second attempt fails
+  immediately and silently, which is why a refused film gives no error at all.
 
 ## Layout
 
@@ -151,13 +172,13 @@ conversion, and the API resolution ceilings. *Partly superseded — see the corr
 │   ├── Interpolator/                 the library: engine, pipeline, player, batch, audio
 │   ├── InterpolatorApp/              the SwiftUI shell (player, queue, settings, about)
 │   └── interp-harness/               headless measurement harness (--play, --convert, …)
-├── Tests/InterpolatorTests/          366 tests in 30 suites
+├── Tests/InterpolatorTests/          379 tests in 32 suites
 ├── packaging/Info.plist              the bundle's plist, read before the process exists
 ├── scripts/
 │   ├── bundle.sh                     assemble 60FPS.app, sign it ad-hoc, write the .dmg
 │   └── make-icon.py                  draw the icon from code
 ├── reports/
-│   ├── BUILD-DECISIONS.md            §§0–25, invariants 1–43 — read before touching the pipeline
+│   ├── BUILD-DECISIONS.md            §§0–27, invariants 1–46 — read before touching the pipeline
 │   ├── ENGINE-EQUIVALENCE.md         RIFE vs VTFrameProcessor, closed
 │   ├── REAL-CONTENT-AB.md            real 4K HDR film, both engines
 │   ├── PLAYBACK-AND-BATCH.md         feasibility + §12, what was actually built

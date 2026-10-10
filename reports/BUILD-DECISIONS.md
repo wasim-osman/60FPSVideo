@@ -1896,7 +1896,305 @@ about to ask for *before* the system asks.
 
 **366 tests in 30 suites, zero warnings** — including in the test target, where a redundant
 `#require` had been hiding because `swift build` does not compile tests and only `swift test`
-does. `swift build --disable-sandbox` and `swift test --disable-sandbox` are both clean.
+does. `swift build --disable-sandbox` and `swift test --disable-sandbox` are both clean. (The
+suite is **379 tests in 32 suites** as of §26; both passes were clean.)
+
+---
+
+## 26. All of the machine — the pool, and a lie that was already there
+
+**Your report**: *"while it was running samples, I have seen that the app was not utilizing all
+CPU and GPU cores to the fullest. It was leaving performance on the table, I would like it to
+utilize all available resources for fastest outputs."*
+
+It was right, and it was two things: one the pool fixes, and one that had been in the shipped
+code since before the pool existed — which comparing the two is what found.
+
+### What one session actually is
+
+`VTFrameProcessor` serialises its own work. Asking one session for more at once does nothing,
+and the numbers are flat enough to be worth writing down rather than describing. Real 4K HDR
+film, 480 source frames per run, release build:
+
+| requests in flight | source frames/s | CPU | GPU |
+| --- | --- | --- | --- |
+| 2 | 13.4 | 116% | 50% |
+| 4 | 13.5 | — | — |
+| 8 | 13.5 | — | — |
+
+Depth is not a speed control. It is a *correctness* floor — depth 1 fails outright on
+23.976 → 59.94 (invariant 3) — and past 2 it is inert. The setting stays in the panel because
+the minimum is real and someone will try it; it now says so.
+
+### What several sessions are
+
+Separate sessions *do* overlap, because the queue they wait in is VideoToolbox's, not their
+own. Same film, same 480 frames each, aggregate:
+
+| sessions | aggregate source frames/s | speed-up | CPU | GPU |
+| --- | --- | --- | --- | --- |
+| 1 | 13.4 | 1.00× | 116% | 50% |
+| 2 | 21.5 | 1.60× | — | — |
+| 3 | 23.5 | 1.75× | — | — |
+| **4** | **23.8** | **1.78×** | **234%** | **69%** |
+| 6 | 17.0 | 1.27× | 382% | — |
+
+**Six sessions are slower than four.** Past the knee they queue against the same unit and the
+losers cost more than they add. That is why the setting is not "every core" — it is
+`RenderWorkers`, which puts an 8-core machine at 2, a 10-core at 3, and this 12-core at 4, and
+which the recorded decision of §13 had already landed on by measurement.
+
+### The trap the pool walked into
+
+The first version of the pool was **wrong in a way nothing reported**. Four sessions were fed a
+stride — 0, 4, 8, … — and each was told its submissions followed one another "without jump or
+skip", because that is the mode the engine had always used and the SDK says it is the faster
+one. It is not a hint. The SDK's own words:
+
+> Use `Sequential` to indicate that the current submission follows presentation time order
+> **without jump or skip**… Use `Random` to indicate that the current submission has no relation
+> to the previous submission… **The processor clears internal caches.**
+
+The run completed cleanly, wrote the right number of frames, and looked right in a still. It
+differed from a sequential run by a mean of **36 dB** — min 17 dB, **894 of 1198 frames below
+40 dB** — against a **58.2 dB control** for two runs of the *identical* configuration. The
+control is the whole experiment: without it, 46 dB looks like a plausible number for an encoder
+that is not bit-reproducible. With it, 894 bad frames is a different picture. **Invariant 44.**
+
+Told the truth, the pool is output-neutral: `random 1` against `random 4` is **58.50 dB, min
+52.31, 0 of 1198 below 40**.
+
+### The trap that was already there
+
+Then the same question was asked of the app, on its own output, and the answer was worse.
+
+Two conversions of the same 50 s of real 4K HDR film, through the app bundle, one at a time:
+
+```
+1 session  vs  4 sessions      3068 frames   mean 56.69 dB   min 19.84 dB   14 below 40 dB
+```
+
+Fourteen is small. **Where** they are is not: they arrive as adjacent pairs —
+
+```
+(597,598) (719,720) (929,930) (1222,1223) (1917,1918) (2987,2988)
+```
+
+— and an adjacent pair is the signature of a scene cut, because a cut forces two output frames
+to be passthroughs. So the controls were run, both of them:
+
+```
+CONTROL  1 session vs 1 session   3068 frames   mean 56.95 dB   min 28.94 dB    5 below 40
+CONTROL  4 sessions vs 4 sessions 3068 frames   mean 58.42 dB   min 45.90 dB    0 below 40
+```
+
+Neither control has anything at the cuts. The 1-vs-4 difference is therefore **not** encoder
+noise, and it is **not** the pool: it is a real picture difference, in six places, at every cut
+in the clip.
+
+Pulled out at 1:1, the frames say what it is. Output frames 596 and 597, against the two source
+frames they should sit between:
+
+| | n=595 | n=596 | n=597 |
+| --- | --- | --- | --- |
+| 1 session | clean | **plain cross-fade — a double exposure** | **still ghosted** |
+| 4 sessions | clean | correct, motion-compensated | correct |
+
+A cross-fade is what an interpolator produces when its optical flow is useless. The flow was
+useless because **the interval it describes was never submitted**:
+
+```swift
+if wanted, !resolved.isEmpty {        // InterpolationPipeline.run
+```
+
+An interval whose frames are *all* passthrough is skipped entirely — no engine call, nothing to
+wait for, the slot released in place. A scene cut forces exactly that: both frames either side
+of the cut become passthroughs, so the interval is never submitted, and **the session's next
+submission is a jump**. `.sequential` says "without jump or skip". The pipeline cannot make that
+claim, and never could.
+
+**And it is not the pool's doing.** The skip logic is `if wanted, !resolved.isEmpty` **at HEAD,
+unchanged by this work**, and the engine hardcoded `.sequential` before the pool existed. HEAD
+was checked out into a worktree, built, and run on the same clip; its own report says the
+mechanism out loud —
+
+```
+frames : 1228 source -> 3068 output   (2440 interpolated, 628 passthrough, 20.5% free)
+cuts   : 7 detected across 1227 intervals, 1220 engine calls
+time   : 91.3s wall   13.4 source frames/s
+```
+
+— **1220 engine calls for 1227 intervals: seven intervals skipped, one per cut**, exactly as the
+analysis predicts. And the picture is the same ghost, frame for frame:
+
+| neighbour PSNR | 594→595 | 595→596 | 596→597 | 597→598 |
+| --- | --- | --- | --- | --- |
+| **HEAD, as shipped** | 71.48 | **17.54** | **19.54** | **20.37** |
+| 1 session, current build | 71.21 | **17.54** | **19.54** | **20.37** |
+| 4 sessions, current build | 68.06 | 38.50 | 38.49 | 38.56 |
+
+HEAD's frame 596 matches the 1-session run at **54.84 dB** and the four-session run at **17.54
+dB**. So the app had been double-exposing the two frames after every cut for as long as it had
+been converting films, and the reason it survived every test is that every test that compares
+output compares *packed frames from the same run* — where the pipeline's own passthroughs are
+byte-identical by construction — and no test had ever compared two *encoded* conversions of the
+same film against each other. **Invariant 45.**
+
+The fix is to stop making a claim that is not true:
+
+```swift
+let order: SubmissionOrder = .random
+```
+
+With that, a single session matches a four-session pool to **57.93 dB mean, 3 of 3068 frames
+below 40 dB** — as close as two runs of the same configuration are to each other — and against
+the `.sequential` run it differs at **every** cut, 17 frames below 40 dB. `SubmissionOrder`
+stays: it is the engine's interface, the SDK's contract has two halves, and a caller that
+genuinely drives one unbroken run may still ask for the faster half. Nothing in this package
+does, because nothing in it can promise that.
+
+**What it costs.** At one session, **91.0 s → 106.2 s** for the same clip: 17%, paid for correct
+pixels, which is not a trade this project makes in the other direction. At the shipping default
+of four sessions it costs **nothing** — 21.2 against 21.2 source frames/s in the harness, and
+**55.7 s wall in each of four separate runs** through the app.
+
+### The app, measured
+
+Same clip, same window, the app driven the way a user drives it — Convert tab, Add Films,
+Start — and the machine sampled every half second over the whole run:
+
+| setting | wall | CPU | GPU device | GPU renderer |
+| --- | --- | --- | --- | --- |
+| 1 session (the old behaviour) | 91.0 s / 96.1 s | 121–126% | 51–52% | 35–36% |
+| **automatic — 4** (the default) | **55.7 s** ×4 | **241–243%** | **71–72%** | **54–55%** |
+
+That is your complaint in one table: **1.2 of 12 cores and half the GPU**, which is exactly
+"leaving performance on the table". It is now 2.4 cores and 72% of the GPU, and a film converts
+**1.63× faster** against what shipped — **1.91×** against the same code producing correct pixels
+at one session.
+
+**Why the GPU is not at 100%, and why that is the honest answer.** The knee at four is not a
+tuning choice, it is the framework: six sessions measured *slower* than four, and adding more
+sessions past the knee adds queueing rather than throughput. The stages around the interpolator
+— ffmpeg's decode, the VideoToolbox encode, the audio mux — do not parallelise across the pool
+either, so they bound the end-to-end ratio below the interpolator's own 1.78×. On a 50 s clip
+that is 1.63×; on a whole film it converges upward, because those stages are fixed costs. The
+app uses all of the machine that this engine can be given.
+
+---
+
+## 27. The folder row — a status line that is also the question
+
+**Your request**: *"In the settings of the app, keep a line with a status whether or not the app
+has been given folder permission. If not, then make it clickable so that the prompt can be
+re-triggered by the user."*
+
+### Why it cannot simply read the answer
+
+macOS gates Desktop, Documents, Downloads and removable volumes with TCC, and **there is no
+public API for the answer.** The only way to know is to attempt the access — and the attempt is
+the thing that raises the prompt. A check *is* the question. Three consequences shaped the
+design, and each of them was measured rather than assumed:
+
+1. **It prompts one folder at a time.** Opening Settings with three unknown folders raised
+   *"'60FPS' would like to access files in your Desktop folder"*, then Documents, then
+   Downloads — three separate dialogs in a row.
+2. **The answer is per app, not per folder.** One decision covers all of them, and once it is
+   **no**, macOS never asks again: a second attempt fails immediately and silently.
+3. **A refusal is invisible.** The film will not open, the file chooser lists nothing, and no
+   error says why.
+
+The first version of the row probed on open. That is the design that produced the three-dialog
+greeting, and it was wrong: a settings screen that answers a question the user did not ask, with
+three system alerts, is worse than one that does not know. So the row was redesigned around a
+fourth state:
+
+```swift
+case allowed    // the directory listed
+case refused    // macOS said no; the switch is in System Settings
+case notAsked   // nobody has asked, so there is no answer to report
+case absent     // not on this machine
+```
+
+`notAsked` exists **so that a status line never has to prompt.** The row reports what real work
+has already proved — a film that opened, a read that was refused — calls everything else "not
+asked", and only asks when the user clicks. On open it asks nothing; measured, zero prompts.
+
+### What the row does
+
+```
+⚠  Desktop is not readable                    Allow…
+   Desktop: not allowed · Documents: not asked · Downloads: allowed
+   macOS has refused this app access. It will not ask again — a second attempt fails
+   immediately and silently, which is why a film that will not open gives no error at all.
+   Clicking opens the switch, in System Settings ▸ Privacy & Security ▸ Files and Folders.
+```
+
+and, once everything has been read successfully:
+
+```
+✓  Allowed to read 3 folders
+   Desktop: allowed · Documents: allowed · Downloads: allowed
+   Every folder the app uses has been read successfully, so nothing is being withheld.
+   macOS remembers this per app, and it is not something the app can look up — this is the
+   record of what it has actually been able to do.
+```
+
+The row is a button **exactly when clicking would do something** — `needsAttention`, meaning a
+folder is refused or has never been asked — and a plain line otherwise, because a settings row
+that offers to "fix" a working state teaches the user not to trust the rows that are. Clicking
+runs the probe off the main thread (it blocks for as long as a system prompt is on screen, and
+blocking there would freeze the window the user is being asked about), records the answers, and
+**only then** opens System Settings if it is still refusing — a granted check means the user
+just clicked Allow, and opening a settings pane over a working app is a confusing thing to do
+to someone who just said yes.
+
+The refusal is also wired into the work, not just the panel: a film that fails to open, or a
+queued job that fails to start, is classified — safe there, because the read has *just* been
+refused and cannot prompt a second time — so the failure says *"macOS is refusing this app
+access to Desktop. Open Settings ▸ Folder access to put that right."* instead of being a mystery.
+A refusal therefore surfaces when a film is **added**, minutes before the job would have run,
+rather than four hours into a queue.
+
+### Verified, on the final build
+
+1. Open Settings → **"Not asked yet"**, per-folder detail, a blue **"Ask…"** — and **no system
+   prompt**. The three-dialog greeting is gone.
+2. Click → the prompt appears: *"'60FPS' would like to access files in your Desktop folder"*,
+   with **Don't Allow** / **Allow**. This is the request, literally: the prompt re-triggered by
+   the user.
+3. Allow all three → the row reads **"Allowed to read 3 folders"** with per-folder detail, and
+   the row is no longer clickable, which is correct: there is nothing left to ask.
+
+**Invariant 46** — a permission check *is* the question; there is no way to read macOS's answer
+without attempting the access, and the attempt is what raises the prompt. A status line that
+probes is a status line that interrogates the user.
+
+---
+
+## Invariants 44–46
+
+**44. `SubmissionMode` is a statement of fact, not a hint.** The SDK defines `.sequential` as
+"without jump or skip" and acts on it by keeping internal caches. Telling it something false
+produces **wrong pixels, not slow ones** — measured at a mean of 36 dB against a 58.2 dB control
+for two runs of the identical configuration, 894 of 1198 frames below 40 dB. A pool is fed a
+stride; a filtered run has gaps; both are `.random`.
+
+**45. The pipeline never submits an interval whose frames are all passthrough — and that is what
+makes the whole stream non-sequential.** `if wanted, !resolved.isEmpty` skips the interval a
+scene cut forces, so the session's next submission is a jump, so `.sequential` is false for
+*every* configuration this package can be given, pool or no pool. The cost of the lie was two
+frames of plain cross-fade after every cut, in the shipped code, since before the pool existed.
+Found only by comparing two **encoded** conversions of the same film against each other — a
+comparison no test had ever made, because packed-frame comparisons from a single run cannot see
+it (the passthroughs are byte-identical by construction).
+
+**46. A permission check is the question, and a refusal is silent.** There is no API to read
+TCC's answer: the attempt *is* the query and the query *is* the prompt. It prompts one folder at
+a time, it remembers one answer per app, and once the answer is no, macOS never asks again — the
+second attempt fails immediately and silently, which is why a film that will not open gives no
+error at all. So a status row must report only what real work has already proved, and offer to
+ask rather than ask.
 
 ---
 

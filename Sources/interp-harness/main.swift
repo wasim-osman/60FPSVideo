@@ -643,6 +643,8 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     var bitRate: Int? = nil
     var limit: Int? = nil
     var start: Double? = nil
+    var depth = 2
+    var workers = 0
     var overwrite = false
     var force = false
     var audioPolicy: AudioMuxPolicy? = nil
@@ -680,6 +682,18 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                 fail("--bitrate needs a number of bits per second")
             }
             bitRate = value
+        case "--depth":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]), value >= 1 else {
+                fail("--depth needs a positive number of requests")
+            }
+            depth = value
+        case "--workers":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]), value >= 0 else {
+                fail("--workers needs a number (0 asks the machine)")
+            }
+            workers = value
         case "--max-frames":
             k += 1
             guard k < rest.count, let value = Int(rest[k]) else {
@@ -717,6 +731,8 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
         output: URL(fileURLWithPath: outputPath),
         policy: policy,
         bitRate: bitRate,
+        depth: depth,
+        workers: workers,
         maximumSourceFrames: limit,
         startSeconds: start,
         overwrite: overwrite,

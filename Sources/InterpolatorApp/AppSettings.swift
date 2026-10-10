@@ -18,6 +18,7 @@ import Interpolator
 /// | output rate | 59.94 (`OutputRatePolicy.standard`) | §20 |
 /// | interpolation resolution | **Full** | §13 — true 4K, accept the drops, with a one-click way out |
 /// | depth | 2 | invariant 3 — 1 fails outright |
+/// | sessions in parallel | **automatic** (4 on this machine) | §26 — measured 1.78×, six is worse than four |
 /// | scene detection | on | invariant 15 |
 /// | container + audio | MP4 + AAC | §20 — "both, as a setting" |
 /// | segments | off | §23 — for resuming a long job, not for speed |
@@ -38,8 +39,26 @@ struct AppSettings: Codable, Sendable, Equatable {
     /// at the source's resolution, because a delivered file is not a preview.
     var interpolateAtFullResolution = true
 
-    /// Requests in flight. 2 is the minimum that works (invariant 3).
+    /// Requests in flight. 2 is the minimum that works (invariant 3), and past it the knob is
+    /// inert — measured at 4K, depths 2, 4 and 8 all give 13.4–13.5 source frames/s.
     var depth = 2
+
+    /// Interpolating sessions to run at once for a conversion. `0` asks the machine.
+    ///
+    /// **This is the setting that decides how long a conversion takes.** One session cannot be
+    /// hurried; several overlap each other's idle time. Measured on the real 4K HDR film:
+    ///
+    ///     sessions   aggregate   speed-up
+    ///        1        13.4/s      1.00x
+    ///        2        21.5/s      1.60x
+    ///        4        23.8/s      1.78x
+    ///        6        17.0/s      1.27x
+    ///
+    /// Six sessions are *slower* than four, which is why the default is not "every core" but
+    /// whatever the machine is good for — see `RenderWorkers.suggested()`. Zero means that;
+    /// a positive number is honoured exactly.
+    var workers = 0
+
     var sceneDetection = true
 
     // MARK: - Container and audio
@@ -79,6 +98,18 @@ struct AppSettings: Codable, Sendable, Equatable {
 
     /// The resolution the player will interpolate at.
     var playbackDownscales: Bool { !interpolateAtFullResolution }
+
+    /// How many sessions a conversion will actually use, setting or machine's answer.
+    var workerCount: Int { RenderWorkers.resolve(workers) }
+
+    /// What the settings screen shows for it.
+    ///
+    /// The resolved number and not the raw setting, because "automatic" is only useful if it
+    /// says what it resolved to — a user who wants to know why a film is taking four hours
+    /// needs the number that is actually being used, not the word "automatic".
+    var workerLabel: String {
+        workers > 0 ? "\(workers)" : "\(RenderWorkers.suggested()) (automatic)"
+    }
 
     // MARK: - Persistence
 
