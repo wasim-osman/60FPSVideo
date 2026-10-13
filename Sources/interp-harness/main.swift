@@ -165,6 +165,8 @@ func parseOptions() -> Options {
                        --quality; the interpolation size is unchanged),
                        --fit | --fill (bars, or crop, when the shapes differ),
                        --workers N (0 asks the machine),
+                       --no-hwaccel (decode in software — the control arm for what
+                       the media engine is worth to a whole conversion; §36),
                        --activity (hold the app's no-throttling assertion),
                        --container mp4|mkv (default: from OUT's extension),
                        --audio automatic|copy|transcode|drop.
@@ -718,6 +720,7 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     var keepSegments = false
     var activity = false
     var showProgress = false
+    var hardwareDecode = true
 
     let rest = Array(CommandLine.arguments.dropFirst(4))
     var k = 0
@@ -799,6 +802,12 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
             start = value
         case "--overwrite":
             overwrite = true
+        case "--no-hwaccel":
+            // The control arm of the media-engine question. Decoding through VideoToolbox is
+            // 2.9× faster *at decoding*; this is how the harness asks whether that 2.9× is
+            // worth anything to a whole conversion, where the decoder is not the bottleneck.
+            // It overrides `makeSource` below rather than the library's default. See §36.
+            hardwareDecode = false
         case "--force":
             force = true
         case "--segment-seconds":
@@ -848,6 +857,7 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
 
     log("input  : \(inputPath)")
     log("output : \(outputPath)")
+    log("decode : \(hardwareDecode ? "VideoToolbox (media engine)" : "ffmpeg software — CONTROL ARM")")
     if case .fixed(let size) = outputTarget {
         log("deliver: \(size.label)  (\(fitMode.label.lowercased()) into it)")
     }
@@ -864,6 +874,17 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
 
         let result = try {
             var converter = BatchConverter()
+            if !hardwareDecode {
+                // Only the source factory differs; every other stage is the shipping converter,
+                // so the two arms differ in exactly one variable.
+                converter.makeSource = { request in
+                    try FFmpegFrameSource(url: request.url, info: request.info,
+                                          startSeconds: request.startSeconds,
+                                          frameLimit: request.frameLimit,
+                                          scale: request.scale,
+                                          hardwareDecode: false)
+                }
+            }
             if showProgress {
                 // The same two pieces the app uses: a throttle, because this is called once per
                 // interval (172 627 times for a two-hour film), and an estimator fed **only** the

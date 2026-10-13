@@ -243,4 +243,56 @@ struct FrameSourceTests {
             try MediaProbe.probe(url)
         }
     }
+
+    /// `hardwareDecode: false` is the control arm of §36 — the measurement of what the media
+    /// engine's decoder is worth to a *whole conversion*. That measurement only means anything
+    /// if the control arm decodes the same film, so this asserts the frames rather than the
+    /// argv. A flag that quietly changed the pixel format, the colour range or the frame count
+    /// would move the wall-clock number and leave it looking like a real effect — which is
+    /// invariant 35's failure mode wearing a different hat.
+    ///
+    /// Invariant 50 recorded that the two paths are bit-identical on the reference disc; this
+    /// keeps that true for the parameter that now selects between them.
+    ///
+    /// The two sources are read in lockstep rather than collected and compared, so a difference
+    /// fails on the frame it is on instead of after both streams have been buffered — 224 MB of
+    /// frames at 1080p, which is not a thing to accumulate twice inside a suite that runs in
+    /// parallel.
+    @Test("software decode returns the same frames as the media engine")
+    func softwareDecodeMatchesHardware() throws {
+        guard FileManager.default.fileExists(atPath: selfTestClip.path) else {
+            Issue.record("samples/test24.mp4 is missing")
+            return
+        }
+        let info = try MediaProbe.probe(selfTestClip)
+
+        let hardware = try FFmpegFrameSource(url: selfTestClip, info: info)
+        let software = try FFmpegFrameSource(url: selfTestClip, info: info, hardwareDecode: false)
+        defer { hardware.close(); software.close() }
+
+        #expect(hardware.frameByteSize == software.frameByteSize)
+        var a = [UInt8](repeating: 0, count: hardware.frameByteSize)
+        var b = [UInt8](repeating: 0, count: software.frameByteSize)
+
+        var frames = 0
+        while frames < 400 {
+            let moreA = try a.withUnsafeMutableBytes { try hardware.read(into: $0.baseAddress!) }
+            let moreB = try b.withUnsafeMutableBytes { try software.read(into: $0.baseAddress!) }
+            guard moreA == moreB else {
+                Issue.record("the two paths disagree on where the stream ends, at frame \(frames)")
+                return
+            }
+            guard moreA else { break }
+            guard a == b else {
+                Issue.record("frame \(frames) differs between the two decode paths")
+                return
+            }
+            frames += 1
+        }
+
+        // The floor that makes the comparison mean something: a pair of sources that both
+        // returned nothing would otherwise agree perfectly.
+        #expect(frames == info.frameCount, "decoded \(frames) frames, the probe says \(info.frameCount)")
+        #expect(frames > 0)
+    }
 }

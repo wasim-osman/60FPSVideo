@@ -44,7 +44,7 @@ films in a queue. Both are the same engine with two schedulers.
 
 ```bash
 swift build --disable-sandbox          # the library, the harness and the app
-swift test  --disable-sandbox          # 451 tests in 37 suites, zero warnings
+swift test  --disable-sandbox          # 452 tests in 37 suites, zero warnings
 
 scripts/bundle.sh                      # build 60FPS.app (ad-hoc signed)
 scripts/bundle.sh --dmg                # ... and 60FPS-1.0.0.dmg
@@ -65,13 +65,13 @@ directly, so a Finder launch works without a shell). MIT licensed.
 | Output rate | 59.94 (`OutputRatePolicy.standard`); `exactSixty` overrides. A policy is a *value*, so batch and playback cannot disagree. |
 
 The whole record — every measured trap with its numbers — is
-[`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md) §§0–35 and invariants 1–75.
+[`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md) §§0–36 and invariants 1–78.
 
 ## Read this first
 
-**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)** ⭐ **latest — §§0–35**
+**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)** ⭐ **latest — §§0–36**
 The index, and the one to read before touching the pipeline. The 14 decisions with measured
-effects and your recorded choices; **§§13–35 are what was built**; and **invariants 1–75** are
+effects and your recorded choices; **§§13–36 are what was built**; and **invariants 1–78** are
 every measured failure mode, each with the numbers that produced it. If you read one thing,
 read the invariants — they are the difference between a build that works and a build that looks
 like it works. §30 covers doing what SVP does: the resize lever, the calibration that holds real
@@ -249,6 +249,15 @@ conversion, and the API resolution ceilings. *Partly superseded — see the corr
   **"LG ULTRAGEAR — 3440 × 1440"** — which is `CGDisplayPixelsWide/High` and *not* the largest mode the
   display accepts (that is 3840×2160, a scaled mode, and using it would over-report by 38%). (§35,
   invariants 70–75)
+- **And "would the Apple Media Engine make conversions smaller?" now has a measured answer: no.** §36 ran
+  the shipping converter with the decoder forced onto the CPU — seven interleaved repetitions, 1200 frames
+  of the real film — and got **51.89 s with `-hwaccel videotoolbox` against 51.89 s without**: zero, to the
+  resolution of the measurement. The software decoder's extra 0.29 s of `read` is cancelled by 0.33 s less
+  `slotWait`. The media engine is already doing all the codec work there is (decode, and the HEVC encode),
+  and the one stage it cannot touch — interpolation — is the 89%. At 1080p it is a different regime and the
+  same A/B costs **+18%**, because the driver's own serial work is 83% of the wall there and there is no
+  pool slack left to absorb the decoder. The lever that moves conversion time is the width ladder, and it
+  moves it by **2.3×**. (§36, invariants 76–78)
 - **`Process.terminate()` does not end a child that is blocked writing into a full pipe — and a frame is
   bigger than a pipe.** **12,582,912 bytes** against **64 KB** means ffmpeg is *always* mid-write when a
   reader stops, so SIGTERM, SIGTERM twice, and SIGTERM with **764 MB drained past it** all left it alive

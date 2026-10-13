@@ -90,10 +90,16 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
     ///     buffer from it. Playback's downscale toggle, and the one thing that makes 4K
     ///     source material playable in real time on a machine that cannot interpolate it:
     ///     the interpolation cost is per-pixel, so a 1080p frame is a quarter of the work.
+    ///   - hardwareDecode: decode through VideoToolbox's media-engine decoder. On by
+    ///     default and it should stay on: it is 2.9× faster and hands nine cores back,
+    ///     bit-identically. It is a parameter **only so the claim can be falsified** —
+    ///     turning it off is how the harness measures what the media engine is worth to a
+    ///     whole conversion rather than to the decode stage alone. See §36.
     public init(url: URL, info: MediaInfo,
                 startSeconds: Double? = nil,
                 frameLimit: Int? = nil,
-                scale: Bool = false) throws {
+                scale: Bool = false,
+                hardwareDecode: Bool = true) throws {
         let executable = MediaProbe.ffmpegPath
         guard FileManager.default.isExecutableFile(atPath: executable) else {
             throw FrameSourceError.ffmpegMissing
@@ -114,7 +120,12 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
         // cannot decode it warns (`Failed setup for format videotoolbox_vld`) and decodes in
         // software anyway, exiting 0 with the full output. Measured on an MPEG-4 part 2 file,
         // which has no VideoToolbox decoder at all. So there is no fallback to write here.
-        arguments += ["-hwaccel", "videotoolbox"]
+        //
+        // `hardwareDecode: false` omits it, which forces ffmpeg's own decoder. That is the
+        // control arm of §36's experiment and is not a shipping configuration.
+        if hardwareDecode {
+            arguments += ["-hwaccel", "videotoolbox"]
+        }
         if let startSeconds, startSeconds > 0 {
             arguments += ["-ss", String(format: "%.6f", startSeconds)]
         }

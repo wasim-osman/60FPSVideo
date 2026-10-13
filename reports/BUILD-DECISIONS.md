@@ -3530,6 +3530,108 @@ across frames" has to prove it got different frames first.
 
 ---
 
+## 36. "Would using the Apple Media Engine make conversions smaller?" — the A/B, and the answer is no
+
+**The question.** The M-series media engine is the dedicated fixed-function codec block — H.264, HEVC,
+ProRes, and AV1 decode on M3 and later. It is the obvious place to look for a faster conversion. It is
+also the wrong one, and this section is the measurement rather than the argument.
+
+**What the media engine already does: two of the three stages.** Decode is `-hwaccel videotoolbox`,
+unconditional in `FFmpegFrameSource` (`FrameSource.swift:117`). Encode is `AVAssetWriter` →
+`VTCompressionSession`, HEVC. The stage it does **not** touch is interpolation — `VTFrameProcessor`,
+**89% of a 4K interval** (§34) — and a codec block has no frame-interpolation function to offer: generating
+intermediate frames is not a codec operation. So the real question is not "should the media engine be
+used". It is **"is the media engine the constraint"**, and that is measurable.
+
+**The instrument.** `FFmpegFrameSource` gained a `hardwareDecode` parameter, defaulted true so nothing
+changes anywhere else, and the harness's `--convert` mode gained `--no-hwaccel`, which overrides **only**
+the source factory. Every other stage is the shipping converter, so the two arms differ in exactly one
+variable. 1200 source frames of the real 4K HDR film from `-ss 900`, `--workers 4`, interleaved A/B so
+that drift lands on both arms instead of on whichever ran second.
+
+**First, the control arm is real — and it is not the bottleneck.**
+
+Decode alone, 600 frames of 4K HEVC 10-bit to P010, null muxer:
+
+| decode | wall | user CPU |
+| --- | --- | --- |
+| `-hwaccel videotoolbox` | **1.77 s** (339 fps) | **0.55 s** |
+| software | **3.82 s** (157 fps) | **36.76 s** |
+
+Software decode is 2.2× slower in wall and **67× the CPU** — and still **7× faster than the 23 fps the
+pipeline consumes**. That last number is the one that predicts the result.
+
+**At 4K — the shipping configuration — seven interleaved repetitions:**
+
+| | hardware | software | Δ |
+| --- | --- | --- | --- |
+| **wall** | **51.89 s** | **51.89 s** | **0.00 s (0.0%)** |
+| range | 51.7–52.4 | 51.6–52.1 | — |
+| `read` | 10.01 s | 10.30 s | +0.29 |
+| driver busy | 21.03 s | 21.37 s | +0.34 |
+| `slotWait` | 30.43 s | 30.10 s | **−0.33** |
+
+The decoder's extra work **appears** — `read` grows 0.29 s — and is then **exactly cancelled** by 0.33 s
+less time waiting on the pool. Not "small": zero, to the resolution of the measurement. The two arms
+totalled **363.2 s each** across the seven runs.
+
+**At 1080p it is not zero, and that is the more interesting half.** Same A/B, `--quality fast`:
+
+| | hardware | software | Δ |
+| --- | --- | --- | --- |
+| **wall** | 13.77 s | 16.23 s | **+2.47 s (+17.9%)** |
+| `read` | 2.73 s | 3.23 s | +0.50 |
+| `sign` | 7.93 s | 8.20 s | +0.27 |
+| driver busy | 11.47 s | 12.23 s | +0.76 |
+| `slotWait` | 2.13 s | 3.87 s | +1.74 |
+
+At 1080p the pool is 2.7× cheaper and stops being the ceiling: **driver busy is 11.5 s of a 13.8 s wall
+(83%)**, and there is no pool slack left to absorb the decoder. The same decode cost now lands on the wall.
+
+**Reading it.** The media engine's decode role is worth **0.0% of a 4K conversion** and **~18% of a 1080p
+one**, and both follow from one sentence: **the decoder is never the throughput bottleneck** — even in
+software it runs 7× faster than the pipeline consumes — so its cost shows up only as *contention* (CPU and
+memory traffic) landing on whichever stage is the ceiling. At 4K that is the pool, and the pool has slack.
+At 1080p it is the driver, and it does not.
+
+**So: no — and this is the whole budget.** Using the media engine more cannot make conversions smaller,
+because there is no codec work left for it to take. The 18% at 1080p is the price of *removing* it, not
+headroom that adding more could unlock. The lever that actually moves conversion time is the width ladder
+(§35), and it moves it by **2.3×** — 84.15 → 37.05 ms per interval.
+
+**What this does not show.** The two candidate mechanisms — CPU contention and memory-bandwidth contention
+— are not separated here, and neither is which silicon `VTFrameProcessor` actually lands on. Only the GPU's
+saturation is measured (§28: 75.7% mean / 98% peak, flat).
+
+**One contaminated repetition, and why the sweep was repeated.** The first run of this experiment came back
+**55.8 s against 51.6 s (+8.1%)** and read like a real effect. It was not: the first *sweep* then produced a
+repetition at 75.5 s and 78.5 s with `slotWait` at 52 s against the usual 30 — something else on the machine,
+inflating **both** arms. A single run would have shipped "+8.1%"; seven say 0.0%. Interleave, repeat, and
+distrust the first number.
+
+---
+
+## Invariants 76–78
+
+**76. The media engine's decode role is worth 0.0% of a 4K conversion — measured, not argued.** Seven
+interleaved repetitions of the shipping converter on 1200 frames of the real film: **51.89 s with
+`-hwaccel videotoolbox` and 51.89 s without** (363.2 s each). The software decoder's extra 0.29 s of `read`
+is cancelled by 0.33 s less `slotWait`. The interpolator is the wall, and nothing in the codec block can
+move it. A pipeline with 57% of its wall in `slotWait` has slack to absorb almost anything.
+
+**77. "X is free because the GPU is the bottleneck" is only true while the GPU is the bottleneck.** The
+same A/B at 1080p, where the driver's own serial work is 11.5 s of a 13.8 s wall, costs **+2.5 s (+18%)**.
+Decode cost is invisible while a stage with slack owns the wall, and lands in full the moment one does not.
+The 1080p figure is not a smaller version of the 4K figure; it is a different regime.
+
+**78. The decoder is never the throughput bottleneck, even in software.** 600 frames of 4K HEVC 10-bit to
+P010: **339 fps** hardware, **157 fps** software, against the **23 fps** the converter consumes. Software
+decode is 2.2× slower in wall and **67× the CPU** (0.55 s → 36.76 s user), and `read` moves 0.3 s in a
+51.9 s run. What a pipeline with this much slack needs from a decoder is not its *speed* — it is its *CPU
+and memory cost*, which is exactly what the media engine sells.
+
+---
+
 **All three answers are in — 2026-10-08.**
 
 1. ✅ **Drop the RIFE tier.** Confirmed. §16 is closed; decisions #2 and #3 are resolved and void.
