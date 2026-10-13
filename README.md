@@ -44,7 +44,7 @@ films in a queue. Both are the same engine with two schedulers.
 
 ```bash
 swift build --disable-sandbox          # the library, the harness and the app
-swift test  --disable-sandbox          # 452 tests in 37 suites, zero warnings
+swift test  --disable-sandbox          # 455 tests in 38 suites, zero warnings
 
 scripts/bundle.sh                      # build 60FPS.app (ad-hoc signed)
 scripts/bundle.sh --dmg                # ... and 60FPS-1.0.0.dmg
@@ -65,13 +65,13 @@ directly, so a Finder launch works without a shell). MIT licensed.
 | Output rate | 59.94 (`OutputRatePolicy.standard`); `exactSixty` overrides. A policy is a *value*, so batch and playback cannot disagree. |
 
 The whole record — every measured trap with its numbers — is
-[`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md) §§0–36 and invariants 1–78.
+[`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md) §§0–37 and invariants 1–81.
 
 ## Read this first
 
-**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)** ⭐ **latest — §§0–36**
+**→ [`reports/BUILD-DECISIONS.md`](reports/BUILD-DECISIONS.md)** ⭐ **latest — §§0–37**
 The index, and the one to read before touching the pipeline. The 14 decisions with measured
-effects and your recorded choices; **§§13–36 are what was built**; and **invariants 1–78** are
+effects and your recorded choices; **§§13–37 are what was built**; and **invariants 1–81** are
 every measured failure mode, each with the numbers that produced it. If you read one thing,
 read the invariants — they are the difference between a build that works and a build that looks
 like it works. §30 covers doing what SVP does: the resize lever, the calibration that holds real
@@ -258,6 +258,18 @@ conversion, and the API resolution ceilings. *Partly superseded — see the corr
   same A/B costs **+18%**, because the driver's own serial work is 83% of the wall there and there is no
   pool slack left to absorb the decoder. The lever that moves conversion time is the width ladder, and it
   moves it by **2.3×**. (§36, invariants 76–78)
+- **And there is no cheaper "drawing" mode to find — the dial has two positions and we are on the fast
+  one.** The framework's `qualityPrioritization` defines `.normal` and `.quality`; the engine has always
+  shipped `.normal`. Measured directly rather than read off the enum — because an *ignored* lever and a
+  lever already at its floor look identical — it is a real lever, but only upward: **79.01 → 90.42 ms**
+  per interval at 4K (**+14.4%**, 23σ) and **36.26 → 48.51 ms** at 1920 (**+33.8%**, 19σ). The 1080p row
+  is the decision: `.quality` takes that rung from **1.15× real time to 0.86×**, i.e. from holding the
+  film's rate to dropping frames. End to end the same change is **+11.1%** at one session and only
+  **+2.15%** at four — a cost a saturated machine absorbs is still being paid. And the picture difference
+  could not be measured at all: same-tier runs differ on **84.4%** of frames at 58.98 dB, *more* than the
+  tier comparison does (79.3% at 58.67 dB), so it sits below VideoToolbox's own run-to-run noise floor.
+  The trade this app actually offers is width — **3.91×** at a matched bitrate — and its price is almost
+  entirely the smaller picture (**1.4 dB**) rather than a worse drawing. (§37, invariants 79–81)
 - **`Process.terminate()` does not end a child that is blocked writing into a full pipe — and a frame is
   bigger than a pipe.** **12,582,912 bytes** against **64 KB** means ffmpeg is *always* mid-write when a
   reader stops, so SIGTERM, SIGTERM twice, and SIGTERM with **764 MB drained past it** all left it alive

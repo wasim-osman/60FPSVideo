@@ -3632,6 +3632,157 @@ and memory cost*, which is exactly what the media engine sells.
 
 ---
 
+## 37. "Could we draw it worse, not notice, and go faster?" — the dial has two positions and we are on the fast one
+
+The question was whether the interpolator has a quality setting that could be turned down to
+something nobody would see, and whether that would buy conversion time. It is a good question: it
+is the shape of the only real speed lever this project has found, and §30's width ladder is exactly
+that trade, worth **3.8×**.
+
+**First, what a "draw quality" dial would even be.** `VTFrameProcessor`'s frame-rate conversion has
+exactly one knob that changes what the interpolator *does*, as opposed to how large a frame it is
+handed — `VTFrameRateConversionConfiguration.qualityPrioritization` — and the SDK defines **two**
+values:
+
+```c
+typedef NS_ENUM(NSInteger, VTFrameRateConversionConfigurationQualityPrioritization) {
+	VTFrameRateConversionConfigurationQualityPrioritizationNormal  = 1,
+	VTFrameRateConversionConfigurationQualityPrioritizationQuality = 2,
+};
+```
+
+`Sources/Interpolator/VTFrameProcessorEngine.swift` has passed `.normal` since the engine was
+written, and this section did not change it. **`.normal` is the faster of the two. There is no third
+position and nothing below it**, so the literal answer is that the drawing is already turned down.
+
+**But "already down" is a claim worth testing, because a lever that is *ignored* looks exactly like a
+lever that is already at its floor** — both show no difference when moved. So the tier was measured
+rather than read off the enum. `--measure-widths` gained `--model-quality`, threading the tier into
+the same probe §29 used to find the width staircase: 40 intervals, warm-up discarded, depth 2, five
+interleaved repetitions.
+
+| interpolate at | `.normal` | `.quality` | Δ | against the 41.708 ms budget |
+| --- | --- | --- | --- | --- |
+| 3840×1632 | **79.01 ms** (sd 0.72) | **90.42 ms** (sd 0.85) | **+14.4%** (22.9σ) | 0.53× → 0.46× real time |
+| 1920×816 | **36.26 ms** (sd 0.41) | **48.51 ms** (sd 1.41) | **+33.8%** (18.7σ) | **1.15× → 0.86× real time** |
+
+The lever is real; it is not a label. And the 1080p row is the one with teeth: **`.quality` takes the
+1920 rung from comfortably inside the film's budget to outside it.** A player using it would go from
+holding 60 fps to dropping frames — the §13/§30 failure the ladder exists to prevent. `.normal` is
+not a timid default here; at 1080p it is the only tier the machine can afford.
+
+### The same A/B through the whole converter says something else
+
+1200 frames of the real 4K HDR film, four sessions, interleaved, five repetitions:
+
+| | `.normal` | `.quality` |
+| --- | --- | --- |
+| wall | 52.23 s (sd 1.05) | 53.35 s (sd 1.31) |
+
+**+1.12 s, +2.15%, 1.3σ — not resolvable.** A 14.4% engine effect that is invisible end to end.
+
+**Why is the second number so much smaller than the first, and how do we know that is the reason?**
+§28 already measured it: four sessions give only **1.9×** the throughput of one (12.3 → 23.3 source
+fps), so something shared saturates well before the engine's own compute is the limit. If that is the
+explanation, the 14.4% must reappear when there is **one** session and no shared saturation to hide
+behind. So it was run that way — 600 frames, `--workers 1`, three interleaved repetitions:
+
+| | `.normal` | `.quality` |
+| --- | --- | --- |
+| wall | 49.70 s (sd 0.56) | 55.20 s (sd 0.46) |
+
+**+5.50 s, +11.1%.** The prediction holds, so the mechanism is confirmed rather than assumed: the
+same engine cost is 11% of a one-session conversion and 2% of a four-session one. **A cost a
+saturated machine absorbs has not gone away — it is being paid somewhere the stopwatch cannot see.**
+
+### And the picture: this is the part that had to be retracted
+
+The first version of this measurement compared the encoded output of the two tiers and found 242 of
+598 frames differing by a mean of 57 dB, which reads as "the tiers differ imperceptibly". It was
+wrong, and the reason is invariant 18: **VideoToolbox is not reproducible run to run.** Running the
+*same* tier twice on the same 240 frames gives:
+
+| comparison | frames bit-identical | frames differing | mean PSNR over those |
+| --- | --- | --- | --- |
+| `.normal` vs `.normal` (control) | 93 (15.6%) | **505 (84.4%)** | **58.98 dB** |
+| `.normal` vs `.quality` | 124 (20.7%) | 474 (79.3%) | 58.67 dB |
+
+The control differs on *more* frames, by *more* dB, than the effect it was meant to validate. **The
+tier's effect on the picture sits below the engine's own reproducibility floor, so this instrument
+cannot measure it at all.** The honest statement is not "the tiers look the same" but "we do not
+know, and the thing we were using to find out was measuring noise."
+
+A synthetic frame pair does not rescue it either. Probing both tiers at 128, 256, 512, 1024, 1920 and
+2560 wide on generated content gave **identical output at 128, 1024, 1920 and 2560** and differing
+output at 256 and 512 — non-monotonic in size, and a different answer from real film. A test
+asserting "the tiers differ" would have been asserting something about *content and frame size*. The
+guard that was written instead sits at the seam that carries the decision: `prepare` now builds its
+configuration through `makeConfiguration(width:height:)`, and the test asserts the tier arrives in
+the framework's own object. Falsified by hardcoding `.normal` there — it fails at the right line
+while the other two tests still pass, so the guard is specific rather than a blanket failure.
+
+### The lever that does trade quality for speed is the one already built
+
+Width. 1200 frames, four sessions, same film, **bitrate matched at 20.7 Mbps so the encoder is held
+constant**: **51.6 s at 3840 against 13.2 s at 1920 — 3.91×**, confirming §30's 3.8× at four times
+the sample.
+
+Its picture cost, measured rather than asserted — the Fast output upscaled to 3840 with Lanczos and
+compared frame by frame against the Quality output:
+
+| frame class | frames | mean PSNR (10-bit) | ≈ 8-bit terms |
+| --- | --- | --- | --- |
+| passthrough — the downscale alone, no interpolation involved | 600 (20.0%) | **54.43 dB** | 42.4 dB |
+| interpolated — the whole Fast setting | 2398 | **53.05 dB** (min 30.96) | 41.0 dB |
+
+The split is worth more than either number. The interpolated frames are only **1.4 dB** worse than
+the frames containing no interpolation at all, so **almost all of what the Fast setting costs is the
+smaller picture, not a worse drawing** — the opposite of what one would worry about. The 20.0%
+passthrough share also falls out of the data on its own (the phase plan's free fifth, invariant 14),
+which is what confirms the split is the real one rather than an assumption.
+
+Two caveats, stated because they matter. A 10-bit PSNR reads about 12 dB above the 8-bit figure for
+the same relative error, so 53 dB here is roughly **41 dB** in the terms these numbers are usually
+quoted in. And the single worst frame is **30.96 dB** (≈ 19 dB in those terms) — one frame in 2998
+that is genuinely bad, and the reason the mean alone should not be trusted.
+
+**In one line.** There is no cheaper drawing mode to find: the framework defines two and this app has
+always shipped the faster one. The tier is a real lever — **+14.4% at 4K, +33.8% at 1080p** — but it
+only moves the wrong way, and at 1080p moving it would cost the film its real time. The one cost that
+*looked* like a picture difference turned out to be the engine's own run-to-run noise, now measured
+rather than assumed. The quality-for-speed trade this app actually offers is width, at **3.91×**, and
+its price is almost entirely resolution rather than interpolation.
+
+## Invariants 79–81
+
+**79. The interpolator's quality dial has exactly two positions and the app is already on the faster
+one.** `VTFrameRateConversionConfiguration.QualityPrioritization` defines `.normal` (1) and
+`.quality` (2); `VTFrameProcessorEngine` has passed `.normal` since it was written. So "turn the
+drawing down for speed" is not available — not because the win would be small, but because there is
+nothing below the setting in force. Measured rather than read off the enum, because an ignored lever
+and a lever already at its floor look identical: **79.01 → 90.42 ms** per interval at 3840 (+14.4%,
+23σ) and **36.26 → 48.51 ms** at 1920 (+33.8%, 19σ), five interleaved reps each. The 1080p row is the
+decision — `.quality` takes that rung from **1.15× real time to 0.86×**, i.e. from holding the film's
+rate to dropping frames.
+
+**80. A cost the machine absorbs is still being paid, and one session is how you see it.** The same
+tier change is **+11.1%** end to end at `--workers 1` (49.70 → 55.20 s, three interleaved reps, sd <
+0.6) and **+2.15%** at four sessions (52.23 → 53.35 s, 1.3σ — not resolved). §28's measurement that
+four sessions give only 1.9× the throughput of one says why: the shared resource saturates before the
+engine's own compute does, so per-engine cost is partly free at four sessions and fully visible at
+one. This is invariant 77 in a second costume — the four-session number is not a smaller version of
+the truth, it is a different question.
+
+**81. VideoToolbox's output is not reproducible run to run, and the noise is larger than the effect
+anyone would try to measure with it.** Same tier, same 240 frames, two runs: **505 of 598 output
+frames differ (84.4%), mean 58.98 dB.** That control is *worse* than the comparison it was meant to
+validate — `.normal` against `.quality` differs on 474 frames (79.3%) at 58.67 dB. So an
+encoded-output A/B cannot resolve a picture difference below roughly 59 dB, and the quality tier sits
+under that floor. Invariant 18 recorded that VT is not bit-exact; this is its size. Any future "does
+setting X change the picture?" question has to clear this bar, or be answered at a different seam.
+
+---
+
 **All three answers are in — 2026-10-08.**
 
 1. ✅ **Drop the RIFE tier.** Confirmed. §16 is closed; decisions #2 and #3 are resolved and void.

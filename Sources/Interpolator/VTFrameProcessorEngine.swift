@@ -28,6 +28,24 @@ public final class VTFrameProcessorEngine: InterpolationEngine, @unchecked Senda
     /// See ``SubmissionOrder``. Not a hint — a statement that has to be true.
     private var submissionMode: SubmissionOrder
 
+    /// The framework's own quality/performance tier for the conversion model.
+    ///
+    /// **There are exactly two, and this is the *only* knob in the pipeline that changes what
+    /// the interpolator does rather than how big a frame it is handed.** `.normal` (1) and
+    /// `.quality` (2) — see `VTFrameProcessor_FrameRateConversion.h`. `.normal` is the shipping
+    /// setting and has been since the engine was written; the parameter exists so that the
+    /// question "would turning the model down be cheaper, and would anyone see it?" can be
+    /// answered by measurement instead of by reading the enum. §37.
+    ///
+    /// It is deliberately *not* wired to a user setting. `.normal` is already the faster tier,
+    /// so there is nothing below it to offer a user who wants speed — the honest lever for that
+    /// is width, which is ``InterpolationWidth``.
+    ///
+    /// Public so the shipping default is *checkable* rather than merely written down: §37's
+    /// whole conclusion is "we are already on the fast tier", and a default that silently moved
+    /// would invalidate it without failing anything.
+    public let qualityPrioritization: VTFrameRateConversionConfiguration.QualityPrioritization
+
     private var processor: VTFrameProcessor?
     private var sessionStarted = false
 
@@ -48,12 +66,18 @@ public final class VTFrameProcessorEngine: InterpolationEngine, @unchecked Senda
     ///     interval it was never given, and the two frames after each cut come back as a plain
     ///     cross-fade. See `InterpolationPipeline` for the measurement. Ask for `.sequential`
     ///     only if you are the thing producing the stream *and* you know it is unbroken.
+    ///   - qualityPrioritization: the framework's model tier. **Defaults to `.normal`, the
+    ///     shipping setting**, so passing nothing reproduces every measurement in `reports/`.
+    ///     `.quality` is the slower tier and exists here only so the difference can be measured.
     public init(source: FrameRate, output: FrameRate, depth: Int = 2,
-                submissionMode: SubmissionOrder = .random) {
+                submissionMode: SubmissionOrder = .random,
+                qualityPrioritization: VTFrameRateConversionConfiguration.QualityPrioritization
+                    = .normal) {
         self.sourceRate = source
         self.outputRate = output
         self.depth = max(2, depth)
         self.submissionMode = submissionMode
+        self.qualityPrioritization = qualityPrioritization
 
         // One interval can produce at most ceil(out/src) frames, plus slack for the
         // phase landing just either side of a boundary.
@@ -67,18 +91,29 @@ public final class VTFrameProcessorEngine: InterpolationEngine, @unchecked Senda
 
     // MARK: - Session
 
-    public func prepare(width: Int, height: Int) throws {
-        guard !sessionStarted else { return }
-
+    /// The configuration this engine would start a session with.
+    ///
+    /// Split out of ``prepare(width:height:)`` so the one thing §37 depends on — that
+    /// ``qualityPrioritization`` actually reaches the framework's own object rather than being
+    /// accepted and dropped — can be checked without a GPU, a film, or a stopwatch. A tier that
+    /// stopped being passed through would leave every wall-clock measurement in §37 describing a
+    /// setting that was not in force, and nothing about the timings would look wrong.
+    func makeConfiguration(width: Int, height: Int) -> VTFrameRateConversionConfiguration? {
         // Invariant 6: leave usePrecomputedFlow off. Pre-computed flow measured 14%
         // *slower*, not faster.
-        guard let configuration = VTFrameRateConversionConfiguration(
+        VTFrameRateConversionConfiguration(
             frameWidth: width,
             frameHeight: height,
             usePrecomputedFlow: false,
-            qualityPrioritization: .normal,
+            qualityPrioritization: qualityPrioritization,
             revision: VTFrameRateConversionConfiguration.defaultRevision
-        ) else {
+        )
+    }
+
+    public func prepare(width: Int, height: Int) throws {
+        guard !sessionStarted else { return }
+
+        guard let configuration = makeConfiguration(width: width, height: height) else {
             throw InterpolatorError.unsupportedResolution(
                 width: width, height: height,
                 reason: "VTFrameRateConversionConfiguration returned nil")

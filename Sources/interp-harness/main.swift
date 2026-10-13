@@ -167,6 +167,8 @@ func parseOptions() -> Options {
                        --workers N (0 asks the machine),
                        --no-hwaccel (decode in software — the control arm for what
                        the media engine is worth to a whole conversion; §36),
+                       --model-quality normal|quality (the interpolator's own
+                       tier; normal is what ships, quality is the slower one; §37),
                        --activity (hold the app's no-throttling assertion),
                        --container mp4|mkv (default: from OUT's extension),
                        --audio automatic|copy|transcode|drop.
@@ -721,6 +723,9 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     var activity = false
     var showProgress = false
     var hardwareDecode = true
+    // The framework's model tier — `.normal` is the shipping one. Only two exist, and there is
+    // nothing below `.normal`, which is why this is a measurement hatch and not a user setting.
+    var modelQuality = VTFrameRateConversionConfiguration.QualityPrioritization.normal
 
     let rest = Array(CommandLine.arguments.dropFirst(4))
     var k = 0
@@ -741,6 +746,17 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                 fail("--quality needs quality or fast")
             }
             quality = named
+        case "--model-quality":
+            // The interpolator's own quality tier. `.normal` is what ships; `.quality` is the
+            // framework's slower tier. It exists so the question "is there a cheaper drawing
+            // mode nobody would notice?" is answered by a number rather than by the enum.
+            k += 1
+            guard k < rest.count else { fail("--model-quality needs normal or quality") }
+            switch rest[k] {
+            case "normal": modelQuality = .normal
+            case "quality": modelQuality = .quality
+            default: fail("--model-quality needs normal or quality")
+            }
         case "--output-size":
             // The delivered size, which is deliberately independent of `--quality`. It exists on
             // the harness so a screen-sized output can be measured on the real film — both its
@@ -858,6 +874,9 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     log("input  : \(inputPath)")
     log("output : \(outputPath)")
     log("decode : \(hardwareDecode ? "VideoToolbox (media engine)" : "ffmpeg software — CONTROL ARM")")
+    if modelQuality != .normal {
+        log("model  : .quality — the framework's slower tier (NOT the shipping setting)")
+    }
     if case .fixed(let size) = outputTarget {
         log("deliver: \(size.label)  (\(fitMode.label.lowercased()) into it)")
     }
@@ -883,6 +902,16 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                                           frameLimit: request.frameLimit,
                                           scale: request.scale,
                                           hardwareDecode: false)
+                }
+            }
+            if modelQuality != .normal {
+                // Same seam as `--no-hwaccel`: only the engine factory differs, so the arms
+                // differ in exactly the one variable under test. The tier is bound to a `let`
+                // because the factory is `@Sendable` and may not close over a mutable local.
+                let tier = modelQuality
+                converter.makeEngine = { source, output, depth in
+                    VTFrameProcessorEngine(source: source, output: output, depth: depth,
+                                           qualityPrioritization: tier)
                 }
             }
             if showProgress {
@@ -1071,11 +1100,23 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--measure-widt
     var startSeconds = 0.0
     var intervals = 20
     var widths: [Int] = []
+    var modelQuality = VTFrameRateConversionConfiguration.QualityPrioritization.normal
 
     let rest = Array(CommandLine.arguments.dropFirst(3))
     var k = 0
     while k < rest.count {
         switch rest[k] {
+        case "--model-quality":
+            // The tier, measured directly rather than through a whole conversion. The
+            // end-to-end wall is ±2% noisy, which cannot resolve a 2% effect; ms/interval over
+            // 20 intervals can. §37.
+            k += 1
+            guard k < rest.count else { fail("--model-quality needs normal or quality") }
+            switch rest[k] {
+            case "normal": modelQuality = .normal
+            case "quality": modelQuality = .quality
+            default: fail("--model-quality needs normal or quality")
+            }
         case "--start":
             k += 1
             guard k < rest.count, let value = Double(rest[k]) else {
@@ -1115,13 +1156,21 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--measure-widt
     log(String(format: "output  : %.2f frames per interval", perInterval))
     log(String(format: "probe   : %d intervals, warm-up 2, depth 2, start %.1f s",
                intervals, startSeconds))
+    log("model   : \(modelQuality == .normal ? ".normal (the shipping tier)" : ".quality")")
     log("")
     log("  width     scaled        ms/interval   engine fps   vs budget   spare")
+    // Bound to a `let` because `measure`'s engine factory is `@Sendable` and may not close
+    // over a mutable local.
+    let tier = modelQuality
     for width in widths {
         let scaled = InterpolationWidth.scaled(info, toWidth: width)
         guard let m = try? PlaybackCalibrator.measure(
             url: input, info: info, sourceRate: info.frameRate, outputRate: outputRate,
-            width: width, intervals: intervals, depth: 2, startSeconds: startSeconds) else {
+            width: width, intervals: intervals, depth: 2, startSeconds: startSeconds,
+            makeEngine: { source, output, depth in
+                VTFrameProcessorEngine(source: source, output: output, depth: depth,
+                                       qualityPrioritization: tier)
+            }) else {
             log(String(format: "  %5d     %4d x %-4d   unmeasurable",
                        width, scaled.width, scaled.height))
             continue
