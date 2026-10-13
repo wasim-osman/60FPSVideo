@@ -2172,7 +2172,211 @@ probes is a status line that interrogates the user.
 
 ---
 
-## Invariants 44–46
+## 28. What the machine is actually doing — and the 3.5× that was invisible
+
+**The question.** *"When I am converting something, the CPU usage is below 50% most of the time and the
+GPU is below 80%. I want to max out their usage."* Both halves of that are true, and they have
+different answers.
+
+**The instrument.** A conversion using a fifth of the CPU and three quarters of the GPU is not short of
+compute — it is *waiting* for something, and no activity monitor can say what. `InterpolationPipeline`
+now reports a `StageCosts`: the driving thread's time divided into `read` (blocked in the decoder),
+`signature`, `load` (packed frames into `CVPixelBuffer`s), `submit`, `passthrough`, and `slotWait`.
+
+`slotWait` is the discriminator, and it works because of invariant 17: a slot is taken *before* its
+frames are loaded and released *inside the engine's completion*, so time spent waiting for one is time
+the **pool** was the constraint, and the other five are time the **driver** was. The two partition the
+driver's own time, so they must sum to the wall — which is what makes this a measurement rather than a
+story, and it is asserted by a test.
+
+**Everything below is 1200 source frames — 50 s of the real 4K HDR film — from `-ss 900`.**
+
+| sessions | wall | source fps | driver busy | slotWait | GPU device mean / max | CPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 97.8 s | 12.3 | 21.2 s | 76.4 s | 52.1% / 91% | 132% of one core |
+| 2 | 59.4 s | 20.2 | 20.9 s | 38.2 s | — | — |
+| **4** | **51.6 s** | **23.3** | 21.6 s | 29.6 s | **75.7% / 98%** | 253% of one core |
+| 6 | 55.0 s | 21.8 | 23.8 s | 30.6 s | 68.8% / 93% | 272% of one core |
+| 2 processes × 4 sessions | 150.8 s each | 16.0 total | — | — | — | — |
+
+At four sessions the driver's 21.6 s is `read 10.2 · sign 7.7 · load 3.3 · submit 0.0 · pass 0.3`.
+
+**1 — The CPU cannot be maxed out, and that is not a defect.** The driver's own work is **21.6 s of a
+51.6 s run**, and it is *hidden*: the pool occupies the whole 51.6 s, so the driver's work happens
+underneath it and deleting all of it would not save a second. The CPU sits at 21% of the machine
+because the conversion is per-pixel video work on the GPU, and every CPU stage in the pipeline —
+decode, signature, load, sink copy — is behind it. No arrangement of this pipeline turns idle CPU into
+a faster film.
+
+**2 — The GPU is at the framework's ceiling, and it is a ceiling, not a bubble.** Device utilisation is
+**flat**: 75 of 97 samples land in the 70–79% band, max 92–98%, with no alternation between saturated
+and idle, so there are no pipeline bubbles to fill. The count that matters is sessions, and 1 → 2 → 4
+→ 6 measures **12.3 → 20.2 → 23.3 → 21.8**: the fourth session is worth 1.15× and the fifth and sixth
+are worth *less than nothing*. Six also *lowers* GPU utilisation, 68.8% against 75.7%. More sessions
+subtract; they do not add.
+
+**3 — It is not the decoder, the encoder, or the process model.**
+- **Decode**: 480 frames of this film to raw P010 in 4.11 s — **117 fps**, five times what the pipeline
+  consumes.
+- **Encode**: 4K HEVC through `hevc_videotoolbox` runs at **96–101 fps**, and encode-only costs
+  **16.8%** of the GPU. Scaled to the 58 output fps a conversion produces, the encoder is ~10% of the
+  GPU and the interpolator ~62%.
+- **Processes**: two whole conversions side by side at four sessions each measure **8.0 source fps
+  each, 16.0 together**, against 23.3 for one on its own. The cap is not per-process. This is the
+  measurement behind the queue's *"one at a time, deliberately"*, which until now rested on an
+  argument rather than a number.
+
+**4 — A policy macOS applies to the process is worth 3.5×, and nothing inside the process can see it.**
+The same conversion, same build, same machine, differing only in the policy applied from outside:
+
+| policy | wall | what the stages say |
+| --- | --- | --- |
+| default | **51.6 s** | `slotWait 29.6` — the pool, as always |
+| `taskpolicy -t 1` — utility | 53.7 s | ~4%, within noise |
+| `taskpolicy -b` — background | **180.5 s** | `read` 10.2 → **75.7 s**, `sign` 7.7 → **45.1 s** |
+
+The background figure is not the GPU and it is not a bubble: the driver's own work collapses, because
+its threads are demoted off the performance cores and its pipe is throttled. **This is the state App
+Nap exists for, and the converter has never had an assertion against it.** The player has had one since
+invariant 41 — where the film measurably *stalled* in the background while the same build in the
+foreground advanced normally — and `AppModel.run(_:)` called `beginActivity` never, while running the
+job at `.utility` priority.
+
+Both are now fixed: the job holds a `beginActivity(.userInitiated)` of its own for its whole length —
+**not** `.latencyCritical`, because a batch job has no frame to put on screen in 16.7 ms and claiming
+one is a lie the scheduler acts on — and the conversion task runs at `.userInitiated`, so the threads
+it creates are scheduled where the user's work belongs.
+
+**What the assertion does not do — and this was measured too.** It does not override an *explicitly
+forced* background policy. Under `taskpolicy -b` with the assertion held, the run takes **273.5 s**,
+with `read` at 197.9 s and `slotWait` at **0.2 s**: the pool idle and the driver pinned. `taskpolicy
+-b` forces the background **I/O** tier, which is a lever of its own and not the one the assertion
+pulls. So this is a correctness fix with a measured hazard behind it, **not a measured speed-up** — at
+default policy the assertion is neutral, **51.6 s against 51.6 s**, `slotWait 29.7` against 29.6. It
+costs nothing and it removes the risk; it does not make a conversion faster.
+
+**And it moves no pixels.** The check has to be PSNR against a control, not a hash, because the
+encoder is not bit-exact run to run (invariant 18) — so the control is *two runs that differ by
+nothing*, which sets the floor the comparison has to clear:
+
+| comparison | PSNR mean | min | frames below 40 dB |
+| --- | --- | --- | --- |
+| **control** — two identical runs | 56.41 dB | 49.86 | 0 |
+| with the assertion held | **56.43 dB** | 49.80 | **0** |
+| under forced background policy | 55.66 dB | — | 0 (nothing below 45) |
+
+The assertion's row is the control's own numbers to within its spread, and every one of these is the
+same 1200 frames of the same film. Background policy shifts rate control very slightly on a thrashed
+machine — 55.66 dB against 56.41 — but no frame comes near the 40 dB line that would mean a picture
+difference. The fix changes where the scheduler puts the threads, and nothing else.
+
+**What this leaves.** Nothing in the pipeline is leaving performance on the table. The conversion is
+interpolator-bound at 4K, four sessions is the measured optimum, and the only remaining lever on wall
+time is how many pixels get interpolated — which is the 4K/1080p choice, already one click away.
+
+---
+
+## 29. Why SVP plays this film at 60 fps and this app does not
+
+**The question, and the shape of the answer.** SVP 4 Mac plays the same 4K HDR film on this same
+machine at its output rate. This app presents **~19 fps** on it (§24: 18.5 fps presented, 450 of
+960 intervals skipped). Both are measured. The gap is not a defect in the player and it is not
+something a tuning pass closes — it is the engine, and it is worth stating exactly which part.
+
+**What SVP is doing.** Read from its own files rather than inferred —
+`~/Library/Application Support/SVP4/`:
+
+```
+logs/active.log      3840x1632 -> scaled -> 3384x1440 @ 59.94 [23.976 *5/2]
+settings/profiles.cfg  mv_grid: 12   mv_refine: 0   fi_auto: true   fi_auto_adjust: 30
+```
+
+Three things follow, and only one of them is the answer.
+
+**1. It resizes first — and the resize is worth nothing.** SVP interpolates at **3384×1440**, not
+3840×1632: 22% fewer pixels. If that were the mechanism, copying it would close the gap. It does
+not. Measured on our engine, same clip, same harness, release build:
+
+| | pixels | ms/interval | output fps |
+| --- | --- | --- | --- |
+| 3840×1632 — the source | 6.27 Mpx | ~105 (§24) | ~23 |
+| **3384×1440 — SVP's working resolution** | 4.87 Mpx | **81.55** | **31.3** |
+
+Adopting SVP's exact resize still leaves **81.55 ms per interval against the 41.7 ms the film
+spends on one — 1.96× too slow.** The resize buys 22% of the ~2.5× the gap actually is. It is a
+red herring, and a measurable one.
+
+**2. It matches motion on a coarse block grid — and that is the answer.** `mv_grid: 12` means SVP
+searches motion on a **12-pixel grid**: about **33,840 block vectors per frame** at its working
+resolution, and `mv_refine: 0` says it does not refine them. `VTFrameProcessor` computes **dense
+per-pixel optical flow** — **6,266,880 flow vectors per frame** at 4K. **185× as many motion
+estimates, every frame.** The API exposes exactly one motion model: there is no block-matching
+configuration, no grid parameter, no way to ask for `refine: 0`. This is the whole gap, and it is
+not tunable — it is what the framework is.
+
+**3. It is allowed to degrade; we are not.** `fi_auto: true` with `fi_auto_adjust: 30` lets SVP
+change its own settings mid-playback to hold the rate. It trades motion quality for frames — the
+exact trade our engine cannot make. Our engine returns a fixed-quality frame or an error. When the
+budget is missed we drop intervals; SVP lowers quality. That is a design difference, not a bug, and
+it is why SVP can promise a rate and this app cannot.
+
+**Cost is a step function of width, not a curve of pixels.** This is the part that decides what is
+possible, and it is not obvious. The same 192 source frames, the same 24000/1001 → 60000/1001,
+depth 2, release build:
+
+| resolution | pixels | ms/interval | output fps | × the 41.7 ms budget |
+| --- | --- | --- | --- | --- |
+| 1920×816 | 1.57 Mpx | **31.87** | **80.2** | **0.76** |
+| 1920×1088 | 2.09 Mpx | **40.73** | **62.8** | **0.98** |
+| 1984×844 | 1.67 Mpx | 52.01 | 49.1 | 1.25 |
+| 2048×870 | 1.78 Mpx | 50.96 | 50.2 | 1.22 |
+| 2560×816 | 2.09 Mpx | 78.53 | 32.5 | 1.88 |
+| 3384×1440 | 4.87 Mpx | 81.55 | 31.3 | 1.96 |
+| 3840×1632 | 6.27 Mpx | ~105 | ~23 | ~2.5 |
+
+Two rows are the proof. **2560×816 and 1920×1088 are the same number of pixels — 2,088,960 — and
+cost 78.53 against 40.73 ms: 1.93×.** Nothing about pixel count explains that. Width does. And the
+table is not even monotonic in pixels: 2048×870 (1.78 Mpx) is *faster* than 1984×844 (1.67 Mpx),
+and 1920×1088 (2.09 Mpx) is faster than both. Cost moves in steps at particular widths — 1920 →
+1984 is **+3.3% of width for +28% of cost** — because the engine partitions its work along width, so
+a few more columns crosses into another block of work. Now invariant 49.
+
+**What that means for the answer.** This film's budget is **41.7 ms per interval** (59.94 output fps
+÷ 2.5 output frames per interval). Exactly two resolutions in that table meet it, and both are
+**1920 wide**. Every resolution 1984 wide or wider misses it, and the miss grows with width until it
+saturates — 3840 wide is ~2.5× over budget, which is §24's 19 fps restated. So **4K at 60 fps is
+not reachable with this engine on this machine, and nothing inside the app changes that.** The lever
+is width, and the app already has it: the readout's one-click **Interpolate at 1080p**, measured
+here at **80.2 fps** — real-time with a third in hand, and the same answer §13.4 reached by a
+different route (75.9 fps).
+
+**The decode — real, but not this.** One further difference was found while looking, and it is a
+genuine defect even though it does not answer the question. The player decoded with plain ffmpeg —
+software — while mpv, under SVP, used the hardware decoder. Measured on 600 frames of the real 4K
+HEVC 10-bit film to raw P010:
+
+| | wall | CPU |
+| --- | --- | --- |
+| software | 4.40 s | 939% |
+| **`-hwaccel videotoolbox`** | **1.53 s** | **98%** |
+
+**2.9× faster and nine cores back**, and **bit-identical** — MD5 `f9429dee7f8afa88712ebe19b3774169`
+both ways. `FrameSource` now passes `-hwaccel videotoolbox` unconditionally; ffmpeg falls back by
+itself for codecs the decoder cannot take (verified on MPEG-4 part 2: `Failed setup for format
+videotoolbox_vld`, exit 0, full output), so no fallback logic was written.
+
+It does **not** speed up conversion, and that is worth recording so nobody expects it to. The same
+job went `read` 13.2 → 11.2 s and driver busy 25.4 → 23.0 s, but wall **53.7 → 53.5 s** — unchanged,
+because `slotWait` grew 26.8 → 28.9 s and absorbed exactly what was freed. §28's finding restated
+from the other side: at 4K the pool is the constraint, so freeing the reader only moves the idle.
+Now invariant 50.
+
+**In one line.** SVP is fast because it estimates motion 185× more coarsely and is permitted to
+lower quality to hold the rate; neither is available through `VTFrameProcessor`. What *is* available
+is width, and at 1920 wide this engine is already real-time — which is why the honest readout and
+the one-click 1080p path were the right things to build, and why they stay.
+
+## Invariants 44–50
 
 **44. `SubmissionMode` is a statement of fact, not a hint.** The SDK defines `.sequential` as
 "without jump or skip" and acts on it by keeping internal caches. Telling it something false
@@ -2196,9 +2400,1135 @@ second attempt fails immediately and silently, which is why a film that will not
 error at all. So a status row must report only what real work has already proved, and offer to
 ask rather than ask.
 
+**47. The scheduling policy macOS applies to a process is worth 3.5× on this workload, and nothing
+inside the process can see it — but the activity assertion does not override a *forced* background
+policy either.** The identical conversion, build and machine: **51.6 s** at default policy against
+**180.5 s** under background policy, with the driver's own work collapsing — `read` 10.2 → 75.7 s,
+`sign` 7.7 → 45.1 s — because its threads are demoted off the performance cores and its pipe is
+throttled. A `.utility` tier alone costs ~4% (53.7 s). A conversion is hours long, is started
+deliberately, and runs while the window is in the background: precisely the state App Nap exists for.
+The player has held `beginActivity` since invariant 41; the converter held none and ran at `.utility`.
+Assert it with `.userInitiated` — never `.latencyCritical`, which claims a deadline a batch job does
+not have. What it buys is *protection, not speed*: at default policy it is neutral (51.6 s against
+51.6 s), and under `taskpolicy -b` it does **not** help at all (273.5 s, `read` 197.9 s, `slotWait`
+0.2 s) because that forces the background **I/O** tier, which is a separate lever. It moves no pixels
+either: **56.43 dB** against a **56.41 dB** two-identical-runs control.
+
+**48. Frame-rate-conversion throughput is a property of the framework, and it scales with neither
+sessions nor processes.** At 4K on the real film: **1/2/4/6 sessions → 12.3 / 20.2 / 23.3 / 21.8
+source frames/s**, with GPU utilisation *falling* at six (68.8% against 75.7%); and **two conversions
+in two processes at four sessions each → 8.0 fps each, 16.0 together**, against 23.3 for one alone.
+Device utilisation is flat (75 of 97 samples in the 70–79% band) rather than duty-cycling, so there
+are no bubbles to fill. Four is the optimum, the driver's 21.6 s of serial work per 1200 intervals is
+entirely hidden behind it, and the only remaining lever on wall time is how many pixels get
+interpolated.
+
+**49. Frame-rate-conversion cost is a step function of frame *width*, not a function of pixel count
+— so two clips with identical pixel counts can differ by 1.9×, and a table sorted by megapixels is
+not monotonic.** Same 192 frames, same 24000/1001 → 60000/1001, depth 2, release build: **2560×816
+and 1920×1088 are both 2,088,960 px and cost 78.53 against 40.73 ms/interval — 1.93×.** Nor is cost
+monotonic in pixels: 2048×870 (1.78 Mpx) beats 1984×844 (1.67 Mpx), and 1920×1088 (2.09 Mpx) beats
+both. The steps fall at particular widths — 1920 → 1984 is **+3.3% width for +28% cost** — because
+the engine partitions its work along width. Two consequences: a resolution experiment must vary
+**width**, not megapixels, or it measures noise and calls it a curve; and "downscale it a bit" is
+not a smooth dial but a staircase, where only the 1920-wide tread meets this film's 41.7 ms budget.
+A corollary worth its own line: **the numbers must come from the release build.** A curve taken with
+the debug binary is uniformly 1.2–1.5× slower and silently disagrees with every historical
+measurement in this report.
+
+**50. `-hwaccel videotoolbox` is bit-identical, 2.9× faster, and falls back on its own — and it buys
+no wall time at all when the pool is the constraint.** 600 frames of the real 4K HEVC 10-bit film to
+raw P010: software **4.40 s / 939% CPU** against hardware **1.53 s / 98% CPU**, with the *same* MD5
+(`f9429dee7f8afa88712ebe19b3774169`) both ways — so the decode carries no quality risk and needs no
+verification gate, and it must be enabled unconditionally. For a codec the decoder cannot take,
+ffmpeg fails setup and falls back by itself (`Failed setup for format videotoolbox_vld`, exit 0,
+full output), so no fallback code is needed. **But it does not speed up a 4K conversion**: the same
+job moved `read` 13.2 → 11.2 s and driver busy 25.4 → 23.0 s while wall stayed **53.7 → 53.5 s**,
+because `slotWait` grew 26.8 → 28.9 s and absorbed the difference. Freeing a producer when the
+consumer is saturated only increases idle.
+
+## 30. Doing what SVP does — both of the levers that exist, and the one that does not
+
+§29 answered *why* SVP holds 60 fps here and this app did not. This section is the change that
+followed from it: playback that reaches real time on this machine, and a conversion that offers
+SVP's faster method beside the existing quality one.
+
+**First, the thing that is not available, because it is the thing one would reach for.** SVP's
+advantage is its motion model — block matching on a 12-pixel grid (`mv_grid: 12`, `mv_refine: 0`),
+roughly 185× coarser than dense per-pixel optical flow. So the obvious move was to find a block
+matcher we are *allowed* to use. ffmpeg has one, and this app already shells out to ffmpeg:
+
+| `minterpolate` (`me=epzs`, `mb_size=16`, `mc_mode=aobmc`, `vsbmc`) | wall | per interval |
+| --- | --- | --- |
+| 4K, 2 s of source (48 → 120 frames) | 100.43 s | **2.09 s** |
+| 4K, `-threads 8`, 1 s | 50.59 s | **1.02 s** |
+| 1920×816, 1 s | 12.27 s | **511 ms** |
+
+`user ≈ real` throughout, so it is single-threaded scalar C and `-threads` changes nothing. Against
+this engine's **31.87 ms** at the same 1920×816 that is **16× slower**; at 4K it is **20× slower**.
+ffmpeg's block matcher is not a fast path at any resolution. And there is no hardware escape: the
+VideoToolbox headers contain no `MotionEstimation` symbol at all. SVP's engine cannot be called (its
+licence forbids reverse engineering) and its motion model cannot be replicated (`VTFrameProcessor`
+exposes exactly one). Invariant 52.
+
+**What is left is width — and it is the same resize SVP performs.** SVP scales 3840×1632 → 3384×1440
+before interpolating. That lever *is* available: scale the source, interpolate the smaller frames,
+present the smaller frames. What it is worth is the point of invariant 51, and it is not the whole
+gap — 3384 wide still costs **81.55 ms** against the 41.7 ms budget, so SVP's own resize leaves it
+1.96× over. The resize buys 22% of a ~2.5× gap; the other 78% is the coarse motion model. §29 could
+easily be misread as "the lever is the resize", and that reading is wrong in a way that matters: it
+would predict that 3384 is enough. It is not. What the resize buys is not SVP's speed — it is *our*
+real time, because our engine happens to fall off a cliff between 1920 and 1984 (invariant 49).
+
+### Playback — measure the film, then choose
+
+`interpolateAtFullResolution: Bool` is replaced by `PlaybackResolutionPolicy` (`.source`,
+`.automatic`, `.p1080`), and **`.automatic` is the new default**. This reverses §13's recorded
+default of "true 4K, accept the drops", which was a fine *option* and a poor *default*: it made the
+app's first impression a 4K film juddering at ~19 fps on a machine that can hold 60.
+
+`.automatic` is SVP's `fi_auto: true` answer, taken once at load instead of continuously: probe the
+real pipeline, on the real film, at each rung of a width ladder widest-first, and take the first that
+fits. `PlaybackCalibrator` does this with the *real* source, engine, scene detector and depth — a
+cheaper probe would measure something the player does not do. Frames go to a sink that counts them
+and keeps nothing (at 4K, `MemoryFrameSink` would hold a gigabyte for a probe).
+
+The new `interp-harness --calibrate` runs it against the real film. The output is the whole decision:
+
+```
+budget  : 41.71 ms per interval   (one interval of film time)
+margin  : 0.90  ->  a rung must measure <= 37.54 ms
+ladder  : 3840 -> 2560 -> 1920 -> 960
+output  : 2.50 frames per interval
+
+  probe 1   3840 x 1632    83.08 ms/interval    30.1 output fps  0.50x real time  too slow
+  probe 2   2560 x 1088    81.21 ms/interval    30.8 output fps  0.51x real time  too slow
+  probe 3   1920 x 816     32.95 ms/interval    75.9 output fps  1.27x real time  fits
+
+choice  : 1920 x 816   32.95 ms/interval   75.9 output fps   1.27x real time   (3 probes)
+verdict : 1920 wide holds 60000/1001
+```
+
+**4.3 s, once per film, and the film holds its rate.** The output rate column is there because the
+interval rate is not the output rate — one interval yields 2.5 output frames, so "30/s" is not "30
+fps" and reading it that way makes the 1920 rung look like a 50% miss when it is a 27% surplus.
+
+**And it works, measured in the installed app.** The 4K HDR film, played from the DMG build, sampled
+three times twelve seconds apart:
+
+```
+13:02:55 | 0:00:24.1 | 59.4 fps of 59.94 presented | 1920x816 · measured | 0 of 1110 skipped
+13:03:07 | 0:00:36.3 | 59.6 fps of 59.94 presented | 1920x816 · measured | 0 of 1110 skipped
+13:03:20 | 0:00:46.1 | 56.6 fps of 59.94 presented | 1920x816 · measured | 0 of 1110 skipped
+```
+
+**1.0× real time — 24.1 → 36.3 → 46.1 across 12 s and 13 s of wall clock — at 59.4–59.6 fps of the
+59.94 asked for, with nothing skipped.** The readout now names the size it settled on, because a
+player that says it is keeping up should also say what it cost to keep up.
+
+### The four things the first version got wrong
+
+The first working calibration **fell back to 960×408 on a 4K film** — a four-times downscale to buy
+19% of time. Chasing that produced four separate defects, three of them in the calibration and one
+in the settings layer, and the diagnosis matters because the first two *looked* like a property of
+the film:
+
+**1. The probe was eight intervals long, and eight is noise, not measurement.** The same rung at the
+same film position reports figures that differ by more than 30% between runs, and the error is
+one-sided — 1920×816 measured **43.55 and 46.48 ms** at two positions over 8 intervals and **36.53 ms**
+at one of those positions over 30. That is what turned a 1920 answer into a 960 fallback. The default
+is now **20 intervals with 3 discarded for warm-up**, which reproduces. Invariant 54.
+
+**2. Two of the six rungs cost the same as the rung above them.** Probing the whole ladder at five
+film positions with 30 intervals gives **three treads, not six**: 3840 and 2560 at ~80–93 ms, 1920
+and 1600 and 1280 *all* at ~33–37 ms, and 960 at ~25–27 ms. So the ladder was spending its
+three-probe budget walking rungs that could not change the answer, and never reached 960 — which the
+fallback then selected *without ever having measured it*. The ladder is now one rung per tread:
+`[2560, 1920, 960]`, and the probe budget is four.
+
+**3. The fallback guessed.** "Nothing fitted, so take the narrowest" is a guess about a width no
+probe reached. It now takes **the fastest rung the walk actually measured**, which is the best thing
+the walk learned. On this film that is a measured 960 rather than a presumed one.
+
+**4. And the margin was 0.85 for a reason that does not survive checking.** It was meant to cover the
+work the probe cannot see, sized from a 4K figure where the app presented 18.5 fps against the
+engine's ~23. But the same report measured the app's own playback at **19.6 fps** against the
+harness's **18.5–19.0** for the same content — *two instruments, one number*, so presentation is
+nearly free and the 20% was never there. The margin's real job is to cover variance, and a
+20-interval probe leaves little. It is **0.9**, and at 0.85 this film's 1920 rung — 32.95 to 36.53 ms
+against a 41.708 ms budget — was rejected for being a few per cent over a line it clears in practice.
+
+**A fifth defect, unrelated to calibration but introduced by the same change.** `playbackResolution`
+and `conversionQuality` were added to `AppSettings` as non-optional properties. The stored JSON
+predated them, so decoding threw, and `load()` fell back to `AppSettings()` — resetting the volume,
+the playback speed, the output folder, the worker count, the depth and the container, **silently and
+with no way to tell it had happened**. Every field is now optional at the decoding layer.
+Invariant 55.
+
+### Conversion — both methods, side by side
+
+`ConversionQuality` (`.quality`, `.fast`) is offered in Settings, with **`.quality` as the default**
+so no existing behaviour or measurement changes. `.fast` interpolates at 1920 and **writes 1920**,
+not 4K upscaled: this machine's ffmpeg has no `zscale` and `scale_vt` fails `ENOSYS`, so upscaling
+would be a second full encode pass costing more than the interpolation saves.
+
+Measured end-to-end on the real 4K HDR film, 288 source frames, both modes, audio dropped so the
+comparison is the interpolation and the encode:
+
+| | wall | source frames/s | projected 2 h film | encode |
+| --- | --- | --- | --- | --- |
+| **Quality** (3840×1632) | 12.4 s | 23.2 | 2.1 h | 23.1 MB, 15.4 Mbps |
+| **Fast** (1920×816) | **3.2 s** | **88.8** | **0.5 h** | 10.0 MB, 6.7 Mbps |
+
+**3.8×**, which is better than the 3.3× the interpolation cost alone predicts (105 → 31.87 ms) —
+because the encode is cheaper too, at less than half the bitrate for the same 12 s of film. Both
+outputs were probed and are correct: 60000/1001, 718 frames, 11.978633 s, 10-bit, and — the part
+worth checking — **`smpte2084` / `bt2020` intact on both**, so the HDR description survives the new
+scale path (invariant 16, arrived at from a new direction).
+
+`interp-harness --quality quality|fast` was added so this is measurable rather than inferred, and
+`--calibrate` so the playback decision is checkable rather than taken on trust.
+
+**In one line.** Playback now does what SVP does *as behaviour* — it interpolates at a reduced width
+and holds real time, chosen by measuring the film rather than assuming, and verified in the shipped
+app at **59.6 fps of 59.94 with nothing skipped, 1.0× real time** — and conversion offers both
+methods, 3.8× apart, with the quality one still the default. What it still cannot do is SVP's
+*method*: coarse block matching is not reachable through this framework, and no amount of resizing
+substitutes for it. What it cost to get there was four calibration defects and one settings-migration
+defect, all of which were silent, and three of which looked like properties of the film.
+
+## Invariants 51–55
+
+**51. SVP's advantage is its motion model, not its resize — and the resize is worth only 22% of the
+gap, so "downscale like SVP does" predicts a speed it does not deliver.** SVP's own resize
+(3840×1632 → 3384×1440) measured **81.55 ms per interval** against the film's 41.7 ms budget: still
+1.96× over, still dropping about half the intervals. The full 4K figure is ~105 ms, so the resize
+buys 22% of a ~2.5× gap. §29 invites the reading "SVP resizes, therefore resize"; that reading
+predicts 3384 wide is enough to hold the rate, and it is not. The resize is worth having anyway — but
+for a different reason than SVP's speed: this engine's cost is a staircase in width (invariant 49),
+and 1920 happens to be the tread that fits.
+
+**52. ffmpeg's `minterpolate` is not a fast path at any resolution, and no hardware motion estimator
+exists to be called instead.** `me=epzs`/`mb_size=16`/`mc_mode=aobmc`/`vsbmc` on the real 4K HDR film:
+**2.09 s per interval** at 4K, **511 ms** at 1920×816 — against this engine's **31.87 ms** at the same
+1920×816, so **16× slower** (20× at 4K). `user ≈ real`, so it is single-threaded scalar C and
+`-threads 8` moves it only from 2.09 s to 1.02 s. It is a genuine block matcher from the MVTools
+lineage, which is exactly why it was worth measuring and exactly why the measurement closes the
+question. The VideoToolbox headers contain no `MotionEstimation` symbol, so there is no hardware
+estimator to fall back on. "Use ffmpeg for the motion" is closed, permanently and at every width.
+
+**53. A calibration probe measures the pipeline; the player is the pipeline *plus* presentation —
+so a margin is needed, and getting it too large is as wrong as getting it too small.** The probe's
+sink discards frames and nothing draws them, so presentation cost is invisible to it by
+construction. At 4K the gap was large: the probe measured **72.50 ms per interval** while the app
+presented **19.6 fps** (§25) — the probe's figure implies ~34 output fps, so the app lost ~40% to
+something the probe cannot see. That is why a margin exists at all. But the first version's 0.85 was
+sized from that 4K gap and then applied to every rung, where it rejected this film's 1920 rung —
+32.95 to 36.53 ms against a 41.708 ms budget — for being a few per cent over a line it clears in
+practice, and the film fell to 960×408. The two errors are not symmetric: too small ships a player
+that drops frames, too large ships a player that is soft for no reason, and *both are silent*. The
+only way to tell which one you have is to measure the app itself, which is what the three-sample
+capture in §30 does — 59.4/59.6/56.6 fps with nothing skipped.
+
+**54. A probe eight intervals long is noise, and the noise is one-sided — which is how a calibration
+came to answer 960 for a film whose answer is 1920.** The same rung, same film, same machine:
+1920×816 measured **43.55 and 46.48 ms** at two positions over 8 intervals, and **36.53 ms** at one
+of those positions over 30. Over 8 intervals the figures move by more than 30% run to run and
+systematically *upward*, so a short probe under-reports what the machine can afford and the error
+lands on the conservative side — indistinguishable, from the outside, from "this machine is slow".
+The default is now **20 intervals, 3 discarded for warm-up**. The corollary is the general one: a
+timing probe must be long enough that its own variance is smaller than the difference it is being
+asked to decide, and 8 samples against a 15% margin is not. A second corollary, about the *ladder*
+rather than the probe: probing the whole ladder at five positions with 30 intervals gives **three
+cost treads, not six** — 3840 and 2560 at ~80–93 ms, **1920, 1600 and 1280 all at ~33–37 ms**, 960 at
+~25–27 ms — so a ladder carrying 1600 and 1280 spends its probe budget on rungs that cannot change
+the answer and never reaches the one that can.
+
+**55. A required `Codable` field added to a persisted settings struct silently resets every stored
+setting.** `playbackResolution` and `conversionQuality` were added to `AppSettings` as non-optional
+properties; the stored JSON predated them; `JSONDecoder` threw; `load()` caught it and returned
+`AppSettings()`. The volume, the playback speed, the output folder, the worker count, the depth and
+the container all reverted to defaults — **with no message, no error, and no way to notice**, because
+a settings struct that resets is indistinguishable from one that was never changed. The fix is to
+decode every field with `decodeIfPresent` and fall back to that field's own default, so a stored blob
+that predates a field loads the rest of itself. Declaring `init(from:)` also suppresses the implicit
+memberwise initialiser, so the no-argument `init()` has to be written out — which is itself the
+reason the bug was invisible for a build: the app compiled, launched, and played.
+
+---
+
+## 31. "Still not real time" — the prediction was the bug
+
+**Reported:** *"Player is still not able to play it in real time."* After §30 shipped `.automatic`, which
+measured the film at load and interpolated at 1920 wide. The readout agreed with itself, the suite was
+green, and the film still did not hold.
+
+The report was right, and the number that proved it was already in this document.
+
+### The two measurements that do not agree
+
+| what was measured | figure | against the 41.71 ms budget |
+| --- | --- | --- |
+| the **engine**, 1920 wide, on the real film | **31.74 ms/interval** | 1.31× — **24% spare** |
+| the **whole player**, same film, same width | **59.4 fps of 59.94** | **0.6% *over*** |
+
+Both are real, and together they say the thing the calibration could not: **everything the player does
+that is not interpolation consumes very nearly the whole of the spare.** The probe said "24% to spare"
+and the player spent all of it.
+
+The first figure comes from the calibration's own probe. The second comes from the harness driving the
+real `PlaybackController` on the real film:
+
+```
+$ interp-harness --play "$FILM" --start 30 --seconds 25 --sound
+shown  : 1498 frames | skipped 0 intervals
+clock  : 25.02 s of film in 25.72 s wall  -> 0.97x
+picture: 24.97 s covered by 1498 frames -> 58.2 fps presented
+[PASS] the picture advanced 0.998x the clock's rate
+```
+
+58.2 fps of *wall* time is 0.97× — but the wall clock includes the second the decoder takes to open the
+film, and the film clock does not. Per second of *film*, 1498 frames over 24.97 s is **59.99 fps** — real
+time, exactly, and not one frame of headroom. That run had a display that costs nothing. The shipping app
+has one that costs something.
+
+### Why the probe could not see it
+
+`PlaybackCalibrator.measure` drives the real pipeline — the real source, the real engine, the real scene
+detector, the real depth — and writes into a sink that **counts frames and keeps nothing**. That is the
+right instrument for pricing interpolation and the wrong one for pricing a player, because a discard sink
+is not a queue, is not a presenter, and is not a display:
+
+```
+    probe:      source -> engine -> discard
+    player:     source -> engine -> queue -> presenter -> display
+```
+
+**Everything to the right of the engine is absent from the number that decides how much work the engine
+may be given.** No margin constant repairs this, because the quantity a margin would have to cover is not
+a constant: it is the window the film is playing in, the display it is on, whether the display is doing
+extended-range compositing, and what else the machine is doing at the time. A margin is a guess wearing
+an arithmetic sign.
+
+### The ladder, measured properly
+
+`--measure-widths` was added to the harness for this — a pure measurement with no policy in it, which is
+the question that needed answering ("where does the cost curve actually step?") rather than the one
+`--calibrate` answers ("what will the app decide?"). On the real film, 20 intervals per rung, at the
+probe position the app itself uses:
+
+```
+  width     scaled        ms/interval   engine fps   vs budget   spare
+   1920     1920 x 816      31.74         78.8        1.31x      +9.97 ms
+   1792     1792 x 762      33.45         74.7        1.25x      +8.26 ms
+   1664     1664 x 706      34.25         73.0        1.22x      +7.46 ms
+   1536     1536 x 652      32.44         77.1        1.29x      +9.27 ms
+   1408     1408 x 598      50.97         49.1        0.82x      -9.26 ms
+   1280     1280 x 544      33.32         75.0        1.25x      +8.38 ms
+   1152     1152 x 490      33.64         74.3        1.24x      +8.06 ms
+   1024     1024 x 434      33.13         75.5        1.26x      +8.58 ms
+    960      960 x 408      23.82        104.9        1.75x     +17.88 ms
+    896      896 x 380      23.27        107.5        1.79x     +18.44 ms
+```
+
+**Two treads and a cliff.** Everything from 1024 to 1920 costs the same ~32–34 ms, so **1920 is strictly
+the best rung on that tread** — the same cost as 1280 for 2.25× the picture. 960 is a second tread at
+23.82 ms. The 1408 row is probe noise (the same width measures 32–34 elsewhere) and is not a rung. This
+confirms invariant 54's ladder from the other direction: there is no useful rung between 1024 and 1920,
+which is why "give up a little resolution" is not available — the only step down is a large one.
+
+### The fix: let the player be told it was wrong
+
+`.automatic` still calibrates, and still starts at the widest rung that fits. What is new is that the
+player then **watches its own output** and gives ground if the prediction was wrong.
+
+```
+    every 1.5 s while playing:
+        achieved = (frames shown since last sample) / (wall seconds since last sample)
+        if achieved < target x 0.97, twice running:
+            narrow one rung of the ladder, rebuild the session at the same instant of film
+```
+
+Four things about it are deliberate, and each is a way it could have gone wrong:
+
+- **It measures the picture, not the pipeline.** `DisplayPresenter.shown` counts frames handed to the
+  display, and the presenter blocks on `isReadyForMoreMediaData` — so the count is throttled by whatever
+  the display will accept. It is the closest thing to a presented-frame counter the framework offers.
+- **Two short samples, not one.** A seek, a stall or a window that just lost focus is one sample.
+- **It never runs for `.source` or `.p1080`.** Those are instructions, not predictions. A player that
+  quietly narrows a size the user named is a player that lied about a setting.
+- **It stops at the bottom of the ladder, and after two steps.** A watchdog that keeps narrowing past the
+  last rung rebuilds a session every second and a half forever, which is worse than a picture that is
+  honestly short of the rate.
+
+The rebuild is the same operation a seek performs — a new source, a new pipeline, a new pair of threads —
+and the sound is moved to the instant it is already at, so what the viewer sees is a hitch in the picture
+rather than a jump in the film. The reason is recorded and shown, so the readout says
+`960×408 · measured` and the problems list says why.
+
+### Verified, end to end, on the real film
+
+`--display-cost` was added to `--play` for this: a simulated cost per frame, **scaled by the frame's own
+pixel count** — because narrowing the picture is only worth doing if it makes the thing that was too slow
+cheaper. (A cost that did not fall with the frame size would have proved the detection and not the
+recovery, which is exactly the mistake this section is about.) It is the only way to test the watchdog
+without a screen.
+
+**Baseline — a display that costs nothing:**
+
+```
+shown  : 1198 frames | skipped 0 intervals
+picture: 19.97 s covered by 1198 frames -> 57.8 fps presented
+size   : interpolated at 1920 x 816   (Automatic, calibrated)
+[PASS] the picture advanced 0.998x the clock's rate
+```
+
+1198 frames over 19.97 s of film is **59.99 fps**, the picture stays at 1920, and the watchdog stays
+silent. A player that narrows when it does not need to is the other half of this bug.
+
+**Throttled — 22 ms per frame at 1920 wide, which is a cost the calibration cannot see:**
+
+```
+  t=  35.0 s | picture  35.00 s | shown  172 | lag    23 ms | sound  35.02 s
+  t=  40.0 s | picture  40.01 s | shown  472 | lag    18 ms | sound  40.02 s
+  t=  45.0 s | picture  45.03 s | shown  773 | lag    13 ms | sound  45.04 s
+  t=  50.0 s | picture  50.03 s | shown 1073 | lag    11 ms | sound  50.04 s
+  t=  55.0 s | picture  55.02 s | shown 1372 | lag    14 ms | sound  55.04 s
+  t=  60.0 s | picture  60.03 s | shown 1672 | lag    21 ms | sound  60.05 s
+
+size   : interpolated at 960 x 408   (Automatic, calibrated)
+problems (1):
+  the picture did not hold 60000/1001 at 1920 wide, so it was lowered to 960x408;
+  the film keeps playing from the same instant
+[PASS] the picture advanced 0.999x the clock's rate over 40.0 s
+```
+
+The first sample is **34.4 fps** (172 frames in the first 5 s). The watchdog fires within three seconds,
+narrows to 960×408, and every sample after that is **300 frames per 5 s — 60.0 fps** — for the remaining
+37 seconds, with the lag settling at 11–21 ms and not growing.
+
+**That is the fix: it starts at the best picture the machine is predicted to afford, and if the prediction
+is wrong the player finds out from its own output and gives ground until it holds.**
+
+### In the installed app, on the real film
+
+Everything above was measured through the harness, which is the only way to run a watchdog without a
+screen. The claim is about the app, so the app was run.
+
+**What was run.** `/Applications/60FPS.app` — the bundle from `build/60FPS-1.0.0.dmg`
+(SHA-256 `e792cab…`, identical to the copy in the deliverables folder), ad-hoc signed with the hardened
+runtime, installed and launched from the Finder. The film is the real one: *The Fast and the Furious*
+(2001), 2160p UHD BluRay, 10-bit HDR, DTS-X 7.1, 6411.456 s — 153,721 source intervals. The screen was
+unlocked and the window in front. That last part is not a detail: **an occluded window is a window
+macOS is allowed to stop drawing**, and the first attempt at this measured a film that had advanced
+3.3 s in 10 s purely because the app was behind a browser.
+
+**Two independent readings, and they agree.**
+
+*The position, against the wall clock.* Two captures, each taken with the app brought to the front
+immediately beforehand:
+
+```
+  capture mtime   position    film
+  00:53:53.021    0:04:56.1   296.10 s
+  00:54:25.894    0:05:28.9   328.90 s
+  -------------------------------------
+  wall  32.873 s         film  32.800 s         ratio  0.998 x
+```
+
+**0.998× real time.** The mtimes are the capture instants to the millisecond and the position readout
+has a tenth of a second of granularity, which puts the error near ±0.3%; the honest statement is
+**0.998 ± 0.003×**. It is the same number the costless-display harness run reported, which is what one
+would expect if the display has stopped being the constraint.
+
+*The rate the display accepted.* The readout, which samples the presented count live:
+
+```
+  59.9 fps of 59.94 presented · 1920x816 · measured · 0 of 153721 intervals skipped (0%)
+  59.5 fps of 59.94 presented · 1920x816 · measured · 5 of 153721 intervals skipped (0%) · 34 late frames discarded
+```
+
+This is the stronger of the two, because it does not depend on when a screenshot happened to be taken.
+**The output rate is `60000/1001`, which is exactly 2.5 × the film's `24000/1001` — so holding the
+output rate holds the film's rate, with nothing left over.** 59.5 of 59.94 is 99.3%; 59.9 is 99.9%.
+Either way the film advances at the speed it was shot.
+
+**And the watchdog never fired.** The size stayed at `1920×816 · measured` — the widest rung that fits,
+which is what calibration chose. A loop that narrows when it does not need to is the other half of this
+bug, and on the real display at this window size the prediction was right and the loop stayed out of the
+way. The `--display-cost 22` run above is the case where the prediction is wrong, and the loop catches
+it.
+
+**What is left.** The final reading is 59.5 fps with **5 of 153,721 intervals skipped** and **34 late
+frames discarded**. The two counters are not the same thing and only the first costs smoothness: a
+**skipped interval** is work the player refused because the clock had passed it; a **discarded frame**
+is a finished frame whose moment had passed, which is the presenter doing its job. Five skipped
+intervals across the ~9,060 intervals that 378 s of playback covers is 0.06% — roughly one every
+seventy-five seconds. It is not the stutter that was reported, and it is not zero.
+
+**The trap underneath the whole section, stated as a rule.** The previous claim of real-time playback was
+made from a run on a short `/tmp` clip that presented **59.6 fps of 59.94 — 99.4%**. At the edge is not
+holding. **A verification run on a short clip is not a verification, and 99% is not a pass.**
+
+---
+
+## Invariants 56–58
+
+**56. A probe that discards its output cannot price what happens to the output.** `PlaybackCalibrator`
+drives the real source, the real engine, the real scene detector and the real depth into a sink that
+counts frames and keeps nothing — so it never runs the queue, never runs the presenter, and never
+presents. **Everything the player does that is not interpolation is therefore absent from the number
+that decides how much interpolation it may be given.** Measured on the real film at 1920 wide: the engine
+alone costs **31.74 ms/interval** against a **41.71 ms** budget, 24% spare; the whole player presents
+**59.4 fps of 59.94**, 0.6% over. The non-engine half consumes the entire spare, and no margin constant
+can be right, because the quantity a margin would cover — the window, the display, extended-range
+compositing, the machine's load — is not a constant.
+
+**57. A player that predicts its own throughput must be able to be told it was wrong.** The calibration is
+a measurement taken *before* the thing it predicts exists, so it is a prediction however carefully it is
+made. The response is not a better prediction but a **closed loop**: sample the rate the picture is
+actually achieving, and give ground when it does not hold. Five rules, each a way it goes wrong: measure
+the **presented** count rather than the pipeline's (a probe's throughput is not a player's); require **two**
+short samples, because one is a seek or a stall; never run it for a policy that named a size, because that
+is an instruction and not a prediction; stop at the **bottom** of the ladder, because a watchdog that
+keeps narrowing rebuilds forever; and **do not count the watchdog's own rebuild as a shortfall**, or it
+will narrow the picture because it rebuilt — measured, and the guard is the `firstFrameReady` flag the
+presenter already sets. Verified on the real film: with the display's cost simulated at 22 ms per frame the
+rate starts at 34 fps, the loop narrows 1920 → 960 within three seconds, and the picture then holds
+**60.0 fps** for the rest of the run; with the cost removed the loop never fires at all. In the installed
+app on the real film the loop never fires either — the size stayed at `1920×816 · measured` while the
+position advanced **0.998 ± 0.003×** the wall clock's rate.
+
+**58. A rate verified on a short clip is not verified, and 99% is not a pass.** Real-time playback was
+reported working from a run on a short `/tmp` clip that presented **59.6 fps of 59.94 — 99.4%**, and the
+user's next message was *"still not being able to play it in real time."* The user was right. A short clip
+has no time to fall behind: startup, a seek, or a cache that is still warm covers the whole of it, and a
+number at the edge of the target reads as success until the run is long enough for the deficit to
+accumulate. Verify on the real film, for minutes rather than seconds, and treat a rate below the target as
+a **failure with a cause** rather than a rounding of a success — the two counters the readout now carries
+(`skipped intervals`, `late frames discarded`) exist because "it looked fine" was not enough to tell them
+apart.
+
+## 32. Two things you asked for: a real full-screen mode, and the scrub freeze
+
+*"Yes implement the proper full-screen viewing mode"* and *"while playing, when I click the play head
+to any specific part of the video, it freezes from time to time."*
+
+Both are in the 2026-10-12 build. They turned out to be one of each kind of bug: the freeze was a
+performance problem with a measurement behind it, and full screen was a **correctness** problem that
+looked like a performance problem and produced no error anywhere.
+
+### The freeze was the main thread, and the variance said so
+
+A seek in this player is not a move of the playhead. It tears the whole session down — both threads
+joined, the decoder closed — and builds a new one: a new `FFmpegFrameSource`, a new pipeline, a new
+queue, a new thread pair, and an ffmpeg seeking into a 9.9 GB file. The harness prices that exactly
+(`--seek-cost` on the real film, five targets):
+
+```
+  target s |  blocked ms | to first frame ms
+  ---------+-------------+-------------------
+      60.0 |         141 | 1074
+     300.0 |         474 | 1698
+     900.0 |         116 | 1217
+    1800.0 |         111 | 1270
+    3600.0 |         134 | 1264
+blocked the caller: mean 195 ms, worst 474 ms
+```
+
+**The variance is the diagnosis.** 300 s costs 474 ms; 900 s costs 116 ms — four times less, for the
+same gesture. `FFmpegFrameSource` seeks with `-ss` *before* `-i`, so ffmpeg jumps to the keyframe at or
+before the target and then decodes forward to it, and how far back that keyframe sits depends entirely
+on where in the film the target lands. That is the whole of the "from time to time": some playhead
+positions land just after a keyframe, some land most of a GOP away from one.
+
+And the work was happening **on the calling thread**, which in the app is the main thread — the thread
+that draws the window. So the block *was* the freeze. `AppModel.seek` even wrapped it in a `Task` that
+slept 16 ms first, so the app drew "Seeking…" and then froze the very frame it had drawn it on.
+
+### The fix: one serial queue, one token
+
+`beginSession` now carries `dispatchPrecondition(condition: .onQueue(sessionQueue))` and every caller
+goes through that queue. `start()` uses `sync` — opening is a state the caller needs on return, and the
+app is already showing "Preparing…" — while `seek`, `stop`, `restart` and the watchdog's `narrow()` use
+`async` and return immediately.
+
+Three details carry the correctness:
+
+- **`seek` reports through a completion instead of `throws`.** There is no longer a caller sitting on
+  the result, so the error has to travel. (It also cannot be `return completion?(…)` in a `Void`
+  closure: the optional chain yields `Void?`, which is a compile error, not a style point.)
+- **A request token.** A rebuild takes long enough that a second click can arrive during the first, and
+  a user who clicks the playhead twice has asked for the *second* position. `requestToken` is bumped by
+  every request and a queued build whose token is stale is dropped rather than run — running it would
+  tear down the session the newer request is about to build, and the film would settle where the older
+  click said. `stop()` bumps it too, so anything queued for a film that is no longer open is dropped.
+- **`stop()` detaches synchronously and queues the join.** Clearing `session` is a single pointer write
+  and it is what makes the picture stop; the join and the decoder close — the parts that block — go to
+  the queue.
+
+One consequence worth stating: `resume` is read at *click* time as `playRequested || clock.isPlaying`
+rather than `clock.isPlaying` alone. During startup the clock is deliberately held until the first frame
+exists (invariant 36), so a seek in that window would otherwise turn a film that is starting into a film
+that is paused.
+
+### Verified: 487 ms → 43 ms, on the same six clicks
+
+The instrument is the Accessibility API with a short messaging timeout, which is the only way to measure
+a frozen window from outside it. `AXUIElementSetMessagingTimeout(ax, 0.75)` plus a poller thread calling
+`AXUIElementCopyAttributeValue`: a blocked main thread cannot answer, and the failed call returns fast, so
+the gaps between polls are the freeze. Six playhead clicks at 10/25/40/55/70/85%, on the real film, same
+session, old build against new:
+
+```
+old build : AX polls: 1915 | mean gap 6.6 ms | max gap 487 ms | gaps over 50 ms: 11
+new build : AX polls: 2540 | mean gap 5.0 ms | max gap  43 ms | gaps over 50 ms:  0
+```
+
+**Zero stalls over 50 ms**, and the worst gap is 43 ms — which is not a stall at all but the poller's own
+scheduling. The work did not get faster; the harness shows the same picture-back time (mean 1297 ms
+against 1305 ms) because that is the real cost of seeking in this file. What changed is **who waits**.
+The caller is held for **0 ms on every target**, with and without the soundtrack.
+
+### Full screen: the mode, and the trap it walked into
+
+What was there before was macOS's stock window full screen — the green button and `View ▸ Enter Full
+Screen` both worked — but it was not a viewing mode: the Convert/Player picker and the transport stayed
+on screen permanently, and **⌃⌘F did nothing at all**, because the stock item's key equivalent carries
+`NSEvent.ModifierFlags.function` (Fn+F) rather than the ⌃⌘ the whole system uses.
+
+The mode that is now built:
+
+| | |
+| --- | --- |
+| ⌃⌘F | enters and leaves — a `Playback` menu item with `.keyboardShortcut("f", modifiers: [.command, .control])` |
+| Double click on the picture | toggles both ways |
+| Escape | leaves; the event is **swallowed**, so macOS's own Escape handling cannot act on the same press |
+| Pointer moves | the chrome returns — tracked with a **local event monitor at the window**, not a tracking area on the picture, because the pointer is over the *transport* when the user is reaching for the scrubber |
+| 2.5 s still, and playing | the chrome takes itself away |
+| The picture | 2560 × 1080, edge to edge, menu bar gone |
+
+The chrome **floats** over the picture rather than occupying space, and that is not decoration: a
+viewer's chrome comes and goes several times a minute, and a transport that took layout space would
+resize the film on every appearance — the picture would visibly reflow under a moving pointer.
+
+**And the first version of this destroyed the picture.** Measured on the real 4K film: windowed, 28.2% of
+the picture area lit; press ⌃⌘F, and it is **0.0%** — 2,227,200 pixels, every one of them exactly 0 — for
+the rest of the session, while the player's own readout went on reporting **59.9 fps of 59.94 presented**
+with three dropped frames in three minutes. The session was healthy and nothing was on screen.
+
+The cause is the shared view. `VideoSurface` hands SwiftUI the *same* `NSView` every time — it has to,
+because the presenter holds a reference to the layer inside it — so a branch like
+`if isFullScreen { floating } else { strip }`, whose two sides both contain a `VideoSurface`, gives
+SwiftUI two representables wrapping one view. When the condition flips, SwiftUI builds the incoming
+branch (which adopts that view) and *then* dismantles the outgoing one, whose teardown removes the very
+view the new branch is using.
+
+The control that proved it: **switching Convert ⇄ Player does not break the picture, in either build.**
+`BatchView` has no video surface, so there is never a second representable to tear down. The bug needed
+a branch with the picture on both sides, and full screen was the first one.
+
+`AnyLayout` is the fix, at both levels — `RootView` and `PlayerView`. It keeps one child list, the same
+views in the same order, and changes only how they are arranged, so `surface` never changes identity. The
+transport and the picker are **faded with `opacity`, never removed**, for the same reason: removing one
+would change the number of children the layout has and re-identify the picture beside it.
+
+One more thing that fix exposed: in a `ZStack` the first child is *behind*, so the picker — first in the
+list because a `VStack` draws its children top to bottom — disappeared behind the player entirely.
+`.zIndex(model.isFullScreen ? 1 : 0)` restores the draw order without touching identity.
+
+### Verified, by driving the running app
+
+Not by reading source. The window goes to **2560 × 1080 at y = −1080** (it covers the menu bar), the
+chrome is up at 2 s and gone by 3 s after the last pointer move, and the readout in full screen reads
+**`59.9 fps of 59.94 presented`** with **`3840×1632 · 10-bit · HDR · bt2020`** and **`1920×816 ·
+measured`** — the same state as windowed, at the whole display's size.
+
+**418 tests in 34 suites pass, with zero warnings.** The two new figures are `60FPS-full-screen.png` and
+`60FPS-seek-freeze.png`.
+
+## Invariants 59–63
+
+**59. A branch whose two sides both contain the picture destroys the picture.** `VideoSurface` returns one
+shared `NSView` on purpose — the presenter holds a reference to the layer inside it, so a second layer
+would be a second thing nobody can see. That makes any `if`/`else` with a `VideoSurface` on both sides a
+bug: SwiftUI builds the incoming branch, adopting the view, and then dismantles the outgoing one, whose
+teardown removes it again. Measured: **28.2% of the picture area lit windowed, 0.0% in full screen**,
+2.2 M pixels at exactly zero, with the readout still reporting 59.9 fps of 59.94 and three dropped frames
+in three minutes. Nothing errored. The control that named the cause: switching Convert ⇄ Player is safe
+in both builds, because only one of those branches has a video surface. Use `AnyLayout` to change the
+arrangement of one child list, and fade chrome with `opacity` rather than removing it.
+
+**60. In a `ZStack` the first child is behind it.** A view list that reads correctly top-to-bottom for a
+`VStack` — picker first, content second — puts the picker *underneath* the content the moment the same
+list is laid out as a `ZStack`, and the picker simply vanishes with no error. One child order has to serve
+both, so the draw order is stated explicitly with `.zIndex` rather than left to the layout's convention.
+
+**61. A ratio of two numbers that both round to zero is a number-shaped lie.** With the seek fix in, the
+harness printed **"spread: worst block is 2.3x the mean — a constant would be 1.0x"** over a mean block of
+0.0004 ms. Both operands were real and the arithmetic was right; the figure was still meaningless, and it
+read as a measurement of something. Guard a derived statistic on the thing it describes being present, and
+print that it is not applicable rather than a plausible-looking number.
+
+**62. A screen-region capture measures whichever window is on top, and it will not tell you.** A pixel
+test on a 1400 × 900 region returned **99.9% non-black** — a confident result — from a region where a
+text editor was covering the app under test. Raise the window (`AXRaise` after activating; activation
+alone is not enough) and confirm the frame with `CGWindowList` before believing a single pixel of it.
+The same class of error as invariant 42, one layer out: there, the capture was of the wrong *layer*; here,
+of the wrong *window*.
+
+**63. An Accessibility position write can report success, read back the new value, and not have moved the
+window.** Moving the app to the other display: `AXUIElementSetAttributeValue(w, kAXPositionAttribute, …)`
+returned `.success`, a subsequent read of the same attribute returned `(120,120)`, and `CGWindowList`
+reported `(1806,−986)` — still on the display it started on. The Accessibility API is the window's own
+account of itself and can be optimistic; `CGWindowListCreateDescriptionFromArray` is what the window
+server actually did. Cross-check a move with the window server before building a test on it.
+
+---
+
+## 33. "Can you not play it in native resolution while interpolating?" — and the hang that was hiding the answer
+
+The question arrived with a second one about arrow keys, and behind both of them was a bug I had
+introduced myself the day before. It is worth taking in order, because the bug is what made the
+question unanswerable from inside the app.
+
+### 33.1 The hang
+
+Changing the player's resolution while paused crashed the app, and I fixed that by making each pipe
+reader close its own handle (the `NSFileHandleOperationException` above). The fix introduced a hang:
+`close()` waited in `process.waitUntilExit()` and never returned. `sample` of the wedged process:
+
+```
+PlaybackController.start() → beginSession → resolveInterpolation()
+  → PlaybackCalibrator.calibrate → choose → measure
+    → InterpolationPipeline.run(into:) → $defer #1
+      → FFmpegFrameSource.close() → -[NSConcreteTask waitUntilExit]   ← blocked
+```
+
+I had a theory — unblock the write and ffmpeg's main loop reaches its `received_sigterm` check — and the
+theory was wrong. `/tmp/pipetest` turned it into a measurement, four ways of ending an ffmpeg whose
+reader has stopped, with the signals sent from inside the process because the agent shell's `kill` is
+sandboxed and proves nothing:
+
+```
+  Process.terminate()              *** ALIVE after 3 s
+  raw kill(SIGTERM)                *** ALIVE after 3 s
+  raw kill(SIGTERM) + drain hard   *** ALIVE after 3 s   (764 MB drained past it)
+  raw kill(SIGKILL)                exited in 21 ms
+```
+
+Draining 764 MB of frames past it changed nothing, and a second SIGTERM — which in ffmpeg is documented
+to `exit()` straight from the handler — changed nothing either. The handler itself is fine: pointed at an
+ffmpeg with **no output pipe at all** (`-f null -`, so it can never block) the same signal ends it in
+**43 ms, exit 255**.
+
+So the signal was never the problem. The block was, and it is not an edge case: a 3840×1632 P010 frame is
+**12,582,912 bytes** and a pipe holds **64 KB**, so ffmpeg is always part-way through a write when a
+reader stops. The fix is SIGKILL, and the doc comment in `close()` carries the table above so that nobody
+"improves" it back to a grace period — a grace period here would be paid in full every single time,
+because every close of a live decoder is a close of a *blocked* decoder.
+
+Two consequences had to be handled with it. `close()` ends the process with a signal, so
+`terminationStatus` is that signal number, and the reader's last frame is short — both of which the
+source reported as faults (`ffmpeg exited 9`, `shortRead`). A cancelled run, a seek and a resolution
+change would each have logged a fault, which is how a real one gets ignored.
+
+### 33.2 The answer
+
+With the hang gone, the calibration finally returned, and the answer to the question turned out to be
+**yes — and it is already there**. A matched pair on the real film, same build, same start point, via
+`--play --policy`:
+
+| | `--policy automatic` | `--policy source` |
+|---|---|---|
+| interpolated at | **1920 × 816** (calibrated) | **3840 × 1632** (Full) |
+| frames shown | 1166 | 384 |
+| intervals skipped | **0** | **233** |
+| presented | **56.4 fps** of 59.94 | **18.2 fps** of 59.94 |
+| lag at the end | 16 ms, not growing | 113 ms, not growing |
+| real time | 0.97× | 0.95× |
+
+**Full is native resolution while interpolating, and it works** — 3840×1632, interpolated, in real time,
+no growing lag. What it cannot do is hold the rate: the engine takes **84.15 ms per interval against a
+41.71 ms budget**, so it renders about half the intervals and the picture lands at **18.2 fps**. The
+honest statement is therefore not "you cannot", it is: *native resolution and real time, yes; native
+resolution and 59.94, no — that is a 2× cost against a 1× budget on this machine.*
+
+The readout carries both as a one-click picker, and the app agrees with the harness. Switching
+**Automatic → Full** live, on the real film:
+
+```
+before : state=paused  res=1920  calibrated=true   watching=false  narrow=0
+Full   : state=playing res=3840  calibrated=false  watching=false  narrow=0  rate=17.5  dropped=38
+Auto   : state=playing res=1920  calibrated=true   watching=false  narrow=0
+```
+
+`watching=false` at Full is deliberate and is invariant 51's rule: `.source` is an *instruction*, and a
+player that quietly narrows a size the user chose is a player that lied about a setting.
+
+### 33.3 The open question that was not a bug
+
+I had left one item open: `.automatic` was reported to pick 3840 and never narrow, leaving the film at
+~18 fps while claiming to be automatic. **It does narrow.** `--calibrate` on the real film, which walks
+the ladder widest first and stops at the first rung that fits:
+
+```
+  probe 1   3840 x 1632    84.15 ms/interval    29.7 output fps  0.50x real time  too slow
+  probe 2   2560 x 1088    81.62 ms/interval    30.6 output fps  0.51x real time  too slow
+  probe 3   1920 x 816     37.05 ms/interval    67.5 output fps  1.13x real time  fits
+choice  : 1920 x 816   37.05 ms/interval   67.5 output fps   1.13x real time   (3 probes)
+```
+
+and the app, from the diagnostics log: **`res=1920 calibrated=true watching=true rate=59.4 dropped=0`**.
+The `3840 · automatic` reading was a session whose calibration never returned — it was the hang, wearing
+the costume of a policy bug. Worth recording as its own lesson: *a policy that cannot be observed while
+it decides will be blamed for a failure that is not its own*, which is why `resolutionReport` exists.
+
+The 2560 rung is the one thing here worth a second look. It buys **3%** over 3840 (81.62 against 84.15 ms)
+for a 44% loss of resolution, and the second rung that *does* fit is nearly free — the cost curve is a
+step in *width*, not a line in pixels. It is kept in the ladder because it is the source width for a
+2560-wide film, but on a 3840-wide source it is a probe that will essentially always fail.
+
+### 33.4 The arrow keys
+
+Bare `←` is −5 s and bare `→` is +10 s, through a local `NSEvent` monitor rather than a menu key
+equivalent — a menu item with a bare arrow key equivalent takes that key away from every focused text
+field, because AppKit checks menu key equivalents before the responder chain. The same amounts are on the
+Playback menu items as `⌘←` / `⌘→`, sharing `AppModel.backSeconds` / `forwardSeconds` so the two cannot
+drift apart. Measured in the app, paused, four presses:
+
+```
+  Right 1: +10.00 s   (asked +10)
+  Right 2: +10.00 s   (asked +10)
+  Left  1:  -5.00 s   (asked  -5)
+  Left  2:  -5.00 s   (asked  -5)
+```
+
+### 33.5 Verification
+
+- **`--calibrate` on the real film: 7 s, exit 0.** It was an infinite hang.
+- **`--play` A/B** on the real film, table in §33.2.
+- **The app, on the real film:** resolution change in both directions, no crash, no wedge; the log's age
+  stays under a second and the AX tree keeps answering, which are the two ways to see a blocked main
+  thread from outside.
+- **421 tests in 34 suites pass, zero warnings.** Two of them are new guards on the hang:
+  `closeEndsABlockedDecoder` runs the close on a detached thread so a regression *fails in five seconds*
+  rather than hanging the suite — checked against the old code, where it fails at 5.76 s — and
+  `aDeliberateStopIsNotADecoderFailure`.
+
+## Invariants 64–67
+
+**64. SIGTERM does not end a child that is blocked writing into a full pipe, and the pipe is always full
+when the reader stops if one frame is bigger than the pipe.** Measured on the real film, reader stopped,
+0.8 s for the write to stall: `Process.terminate()`, raw `kill(SIGTERM)` and SIGTERM-plus-764 MB-drained
+all left it alive after 3 s; `kill(SIGKILL)` ended it in 13–23 ms. The handler is not the problem — an
+ffmpeg with no output pipe dies on SIGTERM in 43 ms, exit 255 — the blocked write is, because ffmpeg's
+main loop never reaches the check. A 12,582,912-byte frame against a 64 KB pipe makes this every case
+rather than an edge case, so a grace period is a tax paid in full every time. Stop it with SIGKILL.
+
+**65. A stop you asked for looks exactly like a fault, and reporting it as one is how a real fault gets
+ignored.** SIGKILL leaves `terminationStatus == 9` and the reader's last frame short. Left alone, every
+cancelled run, every seek and every resolution change logs `ffmpeg exited 9` or `shortRead`. The source
+has to know that it was stopped: `finish()` returns without reporting when `closed` is set, and
+`read(into:)` treats a partial frame as end of stream when `closed` is set. The caller's own
+`tearingDown` flag is a second line of defence, not the only one.
+
+**66. A write the Accessibility API accepts can be a write the app never performs.** `AXUIElementSet
+AttributeValue(popup, kAXValueAttribute, "Full")` on a SwiftUI `Picker` returned `.success`, and reading
+the same attribute straight back gave `"Automatic"`. Invariant 63's shape, one control over: the AX
+layer reports what it was asked to do, not what the app did. To drive a SwiftUI popup, `AXPress` it and
+`AXPress` the `AXMenuItem` that appears — and note that the menu's items surface in the application's
+tree, mixed in with the menu bar's.
+
+**67. `terminationStatus` raises while the task is still running; it does not return a sentinel.**
+`-[NSConcreteTask terminationStatus]: task still running` is an `NSInvalidArgumentException`, so an
+unguarded read in a "print the state" helper kills the process that was only trying to describe itself.
+Guard it on `isRunning` — the same shape as invariant 64's `waitUntilExit()` and the
+`NSFileHandleOperationException` above: in this corner of Foundation the failure mode of an unguarded
+call is an exception, not a value.
+
 ---
 
 
+
+## 34. "SVP plays 4K and ours cannot at Full — why?" — the three-way split, and the ceiling re-checked
+
+§29 identified the mechanism (the motion model, 185× denser) and §30 built the response (`.automatic`,
+which is SVP's `fi_auto` answer). This section adds the two numbers that were missing when the question
+came back: where a 4K interval's time actually goes, and whether the API ceiling still holds on the OS
+this machine now runs. It also quotes SVP's manual on the resize, which §29 had read from the settings
+file but not from the documentation.
+
+**Where the 41.71 ms goes.** Measured today, 600 frames of the real 4K HDR film, the app's exact ffmpeg
+arguments:
+
+| stage | per frame | share of the interval |
+| --- | --- | --- |
+| decode 4K HEVC 10-bit → P010, `-hwaccel videotoolbox`, no pipe | 2.67 ms (600 in 1.60 s = 375 fps) | 6% |
+| + the rawvideo pipe and a fast reader | 4.62 ms (600 in 2.77 s = 217 fps) | 11% |
+| interpolation at 3840×1632 | **84.15 ms** | **89%** |
+
+So the decode and the plumbing together are **11%** of the interval and the engine is the other **89%**.
+§29's decode finding (2.9× and nine cores back from hardware decode, bit-identical) is real and was
+already fixed — and it is also not the answer, and this is the number that says so. **Do not optimise the
+pipe:** a bigger buffer or a shared mapping can buy at most 11% of a 2× miss. Reach for the width ladder.
+
+**The ladder, re-measured on the same film** (`--calibrate`, `--start 1800`): 3840×1632 → **84.15 ms** ·
+2560×1088 → **81.62 ms** · 1920×816 → **37.05 ms**. Only the 1920 rung fits. The 2560 rung costing 97% of
+the 3840 rung is invariant 49 restated on a fresh run: cost steps with width, not with pixel count.
+
+**The ceiling still holds on macOS 27.** Re-ran `analysis/probes/vt_ll_limits.swift` on macOS 27.0.1 /
+M2 Max, because §29's ceiling was measured on an earlier OS and an API ceiling is exactly the kind of
+fact that moves:
+
+```
+1280x720    OK        7.99 ms  -> 250 output fps
+1920x1080   OK       22.24 ms  ->  90 output fps
+2048x1080   FAILED  -19730 "Processor is not initialized"
+2560x1440   FAILED  -19730
+3840x2160   FAILED  -19730
+7680x4320   FAILED  -19730
+```
+
+**Unchanged: 1920×1080 is the ceiling**, and it is still silent — `startSession` succeeds, every
+`process()` returns `-19730`, and no frame is ever written. So **no Apple API interpolates above 1080p in
+real time on this hardware.** That is why `.automatic` settling on a 1920-wide rung is the framework's
+ceiling rather than a compromise the app chose. The low-latency path could not serve this film even at
+1080p: 23.976 → 59.94 is exactly 2.5×, needing phases 0.2 / 0.4 / 0.6 / 0.8, and that grid exposes only
+k/2ⁿ. The fast path is for exact-2× sources only.
+
+**SVP says the resize out loud.** §29 read SVP's working resolution out of `logs/active.log` (3384×1440).
+Its manual states the rule and the reason, under *Resizing an Image*:
+
+> "Frame scaling is used to **reduce the CPU load when the frame rate conversion function is active**. …
+> **Preliminary reduction of the frame size made before the calculation of intermediate frames** allows
+> using higher-quality parameters for this calculation."
+
+with modes *Keep normal size*, *Decrease to screen size*, *Decrease to HD* (1280×720) and *Resize to
+screen*. So "SVP plays 4K" is already SVP interpolating *below* 4K, by design and by default. The
+comparison was never "SVP does 4K and we do not"; it is that SVP resizes **and** its motion model is 185×
+cheaper, so it can afford a larger resize target than we can. Its `fi_auto_adjust: 30` is the second half
+of that: it will trade motion quality for the rate, which our engine cannot do.
+
+---
+
+## Invariants 68–69
+
+**68. The engine is 89% of a 4K interval and the plumbing is 11%, so the plumbing is never the answer.**
+600 frames of the real 4K HDR film: decode alone **2.67 ms/frame** (375 fps), decode plus the rawvideo
+pipe **4.62 ms/frame** (217 fps), interpolation at 3840×1632 **84.15 ms**. Against the film's 41.71 ms
+interval that is 11% against 89%. A pipe optimisation can buy at most 11% of a 2× miss, so it cannot be
+the fix — and a plausible-sounding "the frames cross a pipe to the CPU" story is ruled out by measurement
+rather than by argument.
+
+**69. An API ceiling is a fact with a date on it, and it has to be re-measured when the OS moves.** The
+1920×1080 ceiling on `VTLowLatencyFrameInterpolationConfiguration` was measured on an earlier macOS;
+re-run on macOS 27.0.1 it is unchanged (1280×720 → 7.99 ms, 1920×1080 → 22.24 ms, 2048×1080 and above →
+`-19730`, silently). The point is not that it held. It is that "the framework caps here" is the kind of
+claim that decides what the app can promise out loud, and it costs one compile and one sweep to re-check.
+
+---
+
+## 35. The second lever: interpolate small, deliver screen-sized
+
+§34 ended with the one thing SVP does that this app could not: it interpolates **below** the size it
+delivers. Its manual states the rule under *Resizing an Image* — scaling exists to "reduce the CPU load
+when the frame rate conversion function is active", by reducing the frame size "before the calculation of
+intermediate frames". This section is that lever, built.
+
+### 35.1 Why it is a separate setting and not a change to `--quality`
+
+Interpolation cost is a **step function of frame width**, not of pixel count: measured at 2560×1088 it is
+81.62 ms, at 1920×816 **37.05 ms**. Going from 1920 to 1984 — 3.3% more width — costs 28% more time. So the
+size the engine runs at is a decision about *time*, and it is the only decision `ConversionQuality` was
+ever making.
+
+The size the file comes out at is a decision about *the screen it is for*. Those were one number, and the
+coupling was the whole problem: a screen-sized file necessarily cost a full-resolution interpolation, and a
+cheap interpolation necessarily produced a small file. §30's "Fast" wrote 1080p not because 1080p is a good
+delivery size but because 1080p is a cheap interpolation size — and the note in the app said so out loud,
+in the wrong direction, claiming "there is no scaler in this pipeline".
+
+**Both halves of that note were wrong.** The pipeline has a scaler; it is `VTPixelTransferSession`, and the
+correction is written into `Request.quality`'s comment rather than quietly deleted.
+
+### 35.2 The scaler, and what it costs
+
+`VTPixelTransferSession` is the whole implementation, and it does Fit and Fill natively — one property,
+two documented modes:
+
+| mode | `VTPixelTransferSession` | what it does |
+| --- | --- | --- |
+| fit | `kVTScalingMode_Letterbox` | "preserve aspect ratio of the source, and fill remaining areas with black in to fit destination dimensions" |
+| fill | `kVTScalingMode_Trim` | "preserve aspect ratio of the source, and crop picture to fit destination dimensions" |
+
+Measured on this machine: **2.71 ms** per frame for 1920×816 → 3440×1440, **3.48 ms** from 4K, **1.05 ms**
+for a same-size copy, session creation **0.138 ms**, and **811 transfers/s** aggregate across 4 parallel
+lanes. Against the 37.05 ms interpolation it sits behind, that is 4–5% — it does not change which rung of
+the width ladder fits, which is what makes the split worth having.
+
+Two things were measured rather than assumed:
+
+- **The bars are written, not left over.** With the destination pre-filled with a sentinel of 77, a
+  letterboxed result still reads **16** in the bars — so a recycled pool buffer cannot show the previous
+  frame's edge. Verified for NV12 and P010. This matters because the destination buffers come from a
+  `PixelBufferPool` (invariant 2) and are reused.
+- **The transfer accepts odd dimensions** (3441×3441 → status 0). So the even-dimension constraint belongs
+  to the *encoder*, not the transfer — `OutputSize` normalises anyway, but the comment says why.
+
+### 35.3 The geometry is a description, not an engine
+
+`OutputGeometry.fitting(source:target:mode:)` computes what the framework will do — bars, crop, the scaled
+size — and is used for exactly two things: telling the user before a four-hour job starts, and giving the
+tests something exact to assert. **It places nothing.** The framework places the picture.
+
+Two bugs lived in it, and **both were found by tests rather than by review**:
+
+- `816 * (3440.0 / 1920)` is **1462.0000000000002**, not 1462. `rounded(.up)` gave 1463 — one pixel of
+  phantom crop reported to the user about a conversion that has none. Fixed by snapping a value within
+  `1e-6` of an integer onto it before rounding.
+- **The crop direction was inverted.** Both bars and crop were computed as `target − scaled`. For `fill`
+  the picture is *larger* than the target, so the crop is `scaled − target`; written as one subtraction it
+  clamped to zero and reported "no crop" on a picture being cropped. **The fit cases passed throughout** —
+  which is precisely why the fill cases had to be written.
+
+### 35.4 The display's size is not the largest mode it accepts
+
+The picker lists connected displays by name and native size. The obvious way to get that size is to walk
+`CGDisplayCopyAllDisplayModes` and take the largest `pixelWidth × pixelHeight`. **That answer is wrong on
+this machine, and wrong in the direction that looks right.** Measured for the LG ULTRAGEAR:
+
+```
+CGDisplayPixelsWide/High            3440 × 1440     <- what the file should be
+current mode pixelWidth/Height      3440 × 1440
+largest pixel mode in the mode list 3840 × 2160     <- a scaled mode, not native
+```
+
+3840×2160 is a mode the panel accepts over DisplayPort and scales down itself. It is *larger* than the
+panel, so a "biggest mode" heuristic picks it every time, and the conversion would deliver 38% more pixels
+than the display has — an interpolation a whole rung of the ladder more expensive, for a picture the panel
+throws away. `CGDisplayPixelsWide/High` is the size the display is *currently driven at*, which is the only
+number that answers the question. This is the same class of mistake as `max()` over a list of things that
+are not alternatives: a mode list is a list of *offerings*, not of *sizes*.
+
+The three displays on this machine report **3440×1440, 2560×1080, 1920×1080**, all at scale 1.0. The scale
+factor is carried for the readout and deliberately **not** multiplied in: `CGDisplayPixelsWide/High` is
+already in pixels, so applying it again would ask for a 6048-wide file for a 3024-wide framebuffer.
+
+### 35.5 Verified, end to end, on the real film
+
+Through the shipping harness, 120 source frames of the real 4K HDR film at `--quality fast`:
+
+```
+plain  1920,816,yuv420p10le,298,     no target — unchanged behaviour
+fit    3440,1440,yuv420p10le,298,    3440 × 1440, fit
+fill   3440,1440,yuv420p10le,298,    3440 × 1440, fill
+```
+
+`plain` is byte-for-byte the pipeline it was before, which is the promise `.source` makes.
+
+The bars were then located by pixel, over 24 frames spread through the clip. The test is not "are the
+edges dark" — the film opens on a dark scene, so that proves nothing. It is: **a bar is written on every
+frame, so the columns it covers are constant across frames, and picture never is.**
+
+```
+fit   left 0..8    max   234   left 26..33  max 19168   centre max 35422
+fill  left 0..8    max 19450   left 26..33  max 25138   centre max 35408
+```
+
+and the transition, per-column maximum over the 24 frames:
+
+```
+x = 0..25 : 234 158 158 158 158 158 152 158 224 158 167 167 224 153 168 224 205 374 468 307 299 383 449 257 589 868
+x = 26    : 19066      <- the picture starts here
+```
+
+**x = 26 is exactly the bar width `OutputGeometry` predicts** (3440 − 3388 = 52, halved). The jump is a
+factor of 22. In `fill` there is no such column anywhere: every band reads picture level.
+
+### 35.6 In the installed app, on the real film
+
+Both fit modes were driven in the running app with the real 4K HDR film open, by flipping the setting in
+the stored blob and relaunching — the screen was locked, so `loginwindow` was frontmost and synthetic
+events could not reach the app (see invariant 74).
+
+The player's readout states the interpolation size, the mode, and **what the mode is doing to this picture
+in this window**, computed from the layer's own bounds:
+
+| mode | readout | `OutputGeometry` predicts |
+| --- | --- | --- |
+| fit | `fit · 500 high picture, 47 px bars top and bottom` | scaled 1180×500, letterBars (594−500)/2 = **47** |
+| fill | `fill · 1398 wide picture, 109 px cropped each side` | scaled even-up(3840×594/1632) = **1398**, crop (1398−1180)/2 = **109** |
+
+and the picture itself was measured to confirm the label is not decorative — sampling the window capture
+at rows 70–100 and 630–645, inside the video area and outside the picture:
+
+```
+row  70:  fit mean   0.00 max   0   | fill mean  80.83 max 147
+row 100:  fit mean   0.00 max   0   | fill mean  84.21 max 147
+row 630:  fit mean   0.00 max   0   | fill mean  46.92 max 100
+row 645:  fit mean   0.00 max   0   | fill mean  45.17 max 122
+```
+
+`fit` letterboxes; `fill` crops. Both are `videoGravity` — `.resizeAspect` and `.resizeAspectFill` — which
+is a **live property**, so the control sits in the transport where a viewer can work it while watching,
+while the resolution picker beside it has to rebuild the session.
+
+The Settings screen lists the connected display by name — **"LG ULTRAGEAR — 3440 × 1440"** — resolved from
+the stored *size* back to the display through `CGDisplayPixelsWide/High`, not from the largest mode.
+
+### 35.7 One consequence that had to be handled
+
+Once the delivered size is a setting, the same film converted twice at two sizes is two files — and without
+a change they would be the **same path**. `overwrite` is off, so the second job would stop with "an output
+already exists": a correct refusal and a confusing one, because the intent ("give me this film at my
+screen's size as well") is reasonable. So the delivered size goes in the file name —
+`Film-60fps-3440x1440.mkv` — and the suffix is omitted for `.source`, keeping the promise that a conversion
+with no target is the file it was before.
+
+---
+
+## Invariants 70–75
+
+**70. A screen's size is `CGDisplayPixelsWide/High`, not the largest mode it accepts.** Measured on the LG
+ULTRAGEAR: native 3440×1440, largest mode in the list **3840×2160** — a mode the panel accepts and scales
+down itself. A "biggest mode" heuristic over-reports by 38% and costs a whole rung of the interpolation
+ladder. A mode list is a list of *offerings*, not of *sizes*.
+
+**71. A test suite that passes on the first run has proven nothing until its guard is mutated and seen to
+fail.** `ScalingFrameSink`'s seven tests were green first time. Forcing both modes to `kVTScalingMode_Trim`
+failed **4 of 7**; forcing both to `Letterbox` failed the fill test with 5 issues. Two mutations, two
+different guards, both confirmed live. This is cheap and it is the only thing that separates "the assertion
+is right" from "the assertion is unreachable".
+
+**72. `try? #require(x)` is worse than `#require(x)`.** It converts "there was no value" into a silent
+`?? 0`, so a test that should say *there is no estimate* instead fails on a wrong number — and swift-testing
+flags it as a redundant unwrap, which is how four of them were found sitting in `ProgressEstimatorTests`
+after a clean rebuild that the incremental build had been hiding. The fix is to make the test `throws` and
+use `try #require`, which is what it was reaching for.
+
+**73. Two questions that were one number have to be split at the value level, not at the call site.**
+`OutputTarget` is a value with `.source` / `.fixed(OutputSize)`, and `Request` carries it. A boolean or a
+nullable size threaded through the call sites would let the batch path and the playback path disagree about
+the same film — which is the failure `OutputRatePolicy` already exists to prevent one layer up.
+
+**74. `screencapture -l <windowid>` works while the screen is locked; synthetic events do not.** With the
+screen locked, `NSWorkspace.shared.frontmostApplication` is **`loginwindow`**, `screencapture -x` of the
+display returns pure black, and `CGEvent` scrolls and keystrokes go to the login window and never reach the
+app — `AXUIElementPerformAction` on a menu item still works, which is what let the Settings window be
+opened. Window-level capture bypasses all of it. When a UI check is failing for no visible reason, check
+who is frontmost before checking the app.
+
+**75. `select` plus `-frames:v N` yields N copies of the *first* selected frame unless `-fps_mode
+passthrough` is set — and that makes a "constant across frames" test pass on a single frame.** The bar
+test above is exactly that shape: it asserts a bar column is constant across 24 frames while picture is
+not. Without the flag, ffmpeg's default vsync duplicated frame 0 twenty-four times, and since the film
+opens on a flat dark frame the measurement came back with every column reading the same value — a
+plausible-looking result that had measured one frame and answered a question nobody asked. The tell was
+that a *stretched* control clip read identically to the others. Any test whose premise is "these differ
+across frames" has to prove it got different frames first.
+
+---
 
 **All three answers are in — 2026-10-08.**
 
