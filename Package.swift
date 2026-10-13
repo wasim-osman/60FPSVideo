@@ -18,6 +18,6 @@ let package = Package(
         .target(name: "Interpolator"),
         .executableTarget(name: "interp-harness", dependencies: ["Interpolator"]),
         .executableTarget(name: "InterpolatorApp", dependencies: ["Interpolator"]),
-        .testTarget(name: "InterpolatorTests", dependencies: ["Interpolator"]),
+        .testTarget(name: "InterpolatorTests", dependencies: ["Interpolator", "InterpolatorApp"]),
     ]
 )

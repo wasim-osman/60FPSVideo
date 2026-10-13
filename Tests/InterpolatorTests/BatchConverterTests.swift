@@ -145,10 +145,11 @@ struct BatchConverterTests {
             probe: { url in
                 url == input ? info : info.statingFrameCount(outputFrameCount)
             },
-            makeSource: { _, _, _, _ in
-                SyntheticFrameSource(width: info.width, height: info.height,
-                                     format: info.format, frameRate: info.frameRate,
-                                     totalFrames: info.frameCount ?? 0)
+            makeSource: { request in
+                SyntheticFrameSource(width: request.info.width, height: request.info.height,
+                                     format: request.info.format,
+                                     frameRate: request.info.frameRate,
+                                     totalFrames: request.info.frameCount ?? 0)
             },
             makeSink: { url, _ in
                 if let sink { return sink(url) }
@@ -782,19 +783,21 @@ struct BatchConverterTests {
                                         log: JoinLog) -> BatchConverter {
         BatchConverter(
             probe: { url in url == input ? info : info.statingFrameCount(outputFrameCount) },
-            makeSource: { _, media, start, limit in
+            makeSource: { request in
+                let media = request.info
                 // ffmpeg's `-ss` returns the first frame **at or after** the instant, so
                 // the frame a seek lands on is the ceiling, not the floor. Modelling this
                 // the other way round is what let a half-frame error in the seek hide
                 // from every test in this file while shifting every segment of a real
                 // film by one source frame.
-                let offset = start.map {
+                let offset = request.startSeconds.map {
                     Int(($0 * media.frameRate.doubleValue).rounded(.up))
                 } ?? 0
                 return SyntheticFrameSource(width: media.width, height: media.height,
                                             format: media.format,
                                             frameRate: media.frameRate,
-                                            totalFrames: limit ?? (media.frameCount ?? 0),
+                                            totalFrames: request.frameLimit
+                                                ?? (media.frameCount ?? 0),
                                             firstFrame: offset)
             },
             makeSink: { url, _ in
@@ -1137,8 +1140,13 @@ struct BatchConverterTests {
         let firstRendering = try #require(log.entries.first { $0.stage == .rendering })
         #expect(firstRendering.detail.contains("resuming"),
                 "the resume was not announced: \(firstRendering.detail)")
-        #expect(firstRendering.fraction == Double(total - 1) / Double(total),
-                "\(String(describing: firstRendering.fraction)) of \(total)")
+        // Measured in **intervals**, which is the same unit the per-interval callback uses. A
+        // piece count would be a different step size: the bar would move smoothly inside a
+        // piece and then jump by a twelfth at the boundary.
+        let totalIntervals = plan.sourceFrameCount - 1
+        let doneIntervals = plan.segments[total - 2].intervalEnd
+        #expect(firstRendering.fraction == Double(doneIntervals) / Double(totalIntervals),
+                "\(String(describing: firstRendering.fraction)) of \(totalIntervals) intervals")
         // And it only ever renders the one piece that was missing.
         let piecesRendered = Set(log.entries
             .filter { $0.stage == .rendering && !$0.detail.contains("resuming") }
@@ -1172,6 +1180,43 @@ struct BatchConverterTests {
         // The join is announced before it happens, because it is not instant either.
         #expect(log.stages.contains(.joining), "\(log.stages)")
         #expect(log.stages.last == .finishing)
+    }
+
+    /// The bug this fixed. The segmented path built its pipeline with **no** progress callback,
+    /// so the only reports a piece ever made were at its two edges. The bar was a staircase with
+    /// one step every few minutes — and a staircase cannot be turned into a time remaining by
+    /// anything, because the rate across a step is the step and the rate between steps is zero.
+    @Test("a segmented job reports progress inside a piece, not only at its edges")
+    func segmentedProgressMovesInsideAPiece() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("in.mkv")
+        let output = directory.appendingPathComponent("out.mp4")
+
+        let log = ProgressLog()
+        var converter = makeSegmentedConverter(input: input, info: makeInfo(frames: 120),
+                                               outputFrameCount: nil, log: JoinLog())
+        converter.progress = { log.note($0) }
+        _ = try converter.run(.init(input: input, output: output, sceneDetection: false,
+                                    segmentSeconds: 1.0))
+
+        // Each piece used to make exactly two reports: "piece n of m" and "piece n finished".
+        let byPiece = Dictionary(grouping: log.entries.filter { $0.stage == .rendering },
+                                 by: \.piece)
+        #expect(!byPiece.isEmpty)
+        for (piece, reports) in byPiece {
+            let fractions = reports.compactMap(\.fraction)
+            #expect(fractions.count > 3,
+                    "piece \(String(describing: piece)) made \(fractions.count) reports")
+        }
+
+        // And one continuous scale: a bar that goes backwards is worse than one that does not
+        // move, because it reads as work being thrown away.
+        let fractions = log.fractions
+        for (a, b) in zip(fractions, fractions.dropFirst()) {
+            #expect(b >= a, "\(a) then \(b)")
+        }
+        #expect(fractions.last == 1, "\(String(describing: fractions.last))")
     }
 }
 

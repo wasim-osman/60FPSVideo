@@ -53,10 +53,14 @@ public enum FrameSourceError: Error, CustomStringConvertible {
 ///
 /// ## Why the pipe is not a bottleneck
 ///
-/// Measured on the reference disc: 4K HEVC to raw P010 through a pipe runs at
-/// **37 source frames per second**. The interpolator consumes about 14.6 — two
-/// source frames per interval at ~137 ms. So decoding runs at roughly 2.5× what
-/// the rest of the pipeline can absorb, and the pipe is never the constraint.
+/// Measured on the reference disc, decoding 600 frames of 4K HEVC 10-bit to raw P010 with
+/// nothing consuming them: **4.40 s in software at 939% CPU** against **1.53 s through
+/// VideoToolbox at 98% CPU**. Either figure is far above the ~14 source frames per second the
+/// interpolator consumes — two source frames per interval at ~137 ms — so the decoder is never
+/// the constraint and the pipe has room to spare.
+///
+/// The hardware path is the one used, and it is free: the decoded bytes are identical, MD5 for
+/// MD5. See the argument list below.
 public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
 
     public let info: MediaInfo
@@ -100,6 +104,17 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
                                                         height: info.height)
 
         var arguments: [String] = ["-hide_banner", "-v", "error", "-nostdin"]
+        // Decode in hardware. Measured on the reference disc, 600 frames of 4K HEVC 10-bit to
+        // raw P010: **4.40 s using 939% CPU** without this and **1.53 s using 98% CPU** with
+        // it — 2.9× faster and nine cores given back. The output is **bit-identical**
+        // (MD5 `f9429dee…` both ways), so this costs nothing at all in quality; VideoToolbox's
+        // decoder is exact for this stream.
+        //
+        // It is unconditional because ffmpeg degrades on its own: given a codec VideoToolbox
+        // cannot decode it warns (`Failed setup for format videotoolbox_vld`) and decodes in
+        // software anyway, exiting 0 with the full output. Measured on an MPEG-4 part 2 file,
+        // which has no VideoToolbox decoder at all. So there is no fallback to write here.
+        arguments += ["-hwaccel", "videotoolbox"]
         if let startSeconds, startSeconds > 0 {
             arguments += ["-ss", String(format: "%.6f", startSeconds)]
         }
@@ -138,10 +153,15 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
         // Drain stderr on its own thread. An undrained pipe fills at 64 KB and
         // blocks the writer — which would deadlock ffmpeg, and through it the whole
         // pipeline, with no visible reason.
+        //
+        // This thread closes the handle it read, and only now. See `close()`: closing a pipe
+        // from any other thread, while this one is blocked in the read, raises an Objective-C
+        // exception that no `try` can catch and that kills the process.
         let handle = errorHandle
         let lock = errorLock
         Thread.detachNewThread { [weak self] in
             let data = handle.readDataToEndOfFile()
+            try? handle.close()
             let text = String(data: data, encoding: .utf8) ?? ""
             lock.lock()
             self?.errorText = text
@@ -161,8 +181,11 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
             guard let chunk, !chunk.isEmpty else {
                 // End of stream. A partial frame here means the file is truncated or
                 // ffmpeg died mid-frame; both are worth reporting rather than
-                // silently ending.
-                if filled == 0 {
+                // silently ending — *unless* we are the ones who ended it. `close()`
+                // stops the process wherever it happens to be, and by the arithmetic
+                // above that is always mid-frame, so a short frame after a
+                // deliberate stop is the stop rather than a fault in the film.
+                if filled == 0 || closed {
                     reachedEnd = true
                     try finish()
                     return false
@@ -183,12 +206,85 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
     /// Frames handed out so far.
     public var count: Int { framesRead }
 
+    /// Stop the decoder, and let the readers finish on their own.
+    ///
+    /// ## The crash this no longer does
+    ///
+    /// This used to terminate ffmpeg and then close both pipes. Closing a pipe **while another
+    /// thread is blocked reading it** does not fail that read, it *raises*: `readDataOfLength:`
+    /// and `read(upToCount:)` both go through `-[NSConcreteFileHandle readDataUpToLength:error:]`,
+    /// and an errno it does not recognise — `EBADF`, because the descriptor was closed under it —
+    /// comes back as an `NSFileHandleOperationException`, which is an Objective-C exception and
+    /// therefore not something `try` can catch. Uncaught, it takes the process with it.
+    ///
+    /// Measured on the real film, changing the player's resolution while paused:
+    ///
+    /// ```
+    /// *** Terminating app due to uncaught exception 'NSFileHandleOperationException',
+    ///     reason: '*** -[NSConcreteFileHandle readDataOfLength:]: unknown error'
+    ///   3  Foundation  -[NSConcreteFileHandle readDataOfLength:]
+    ///   4  60FPS       FFmpegFrameSource.init(url:info:startSeconds:frameLimit:scale:) closure
+    /// ```
+    ///
+    /// Frame 4 is the **stderr drain thread** — the one started in `init` so ffmpeg's error pipe
+    /// cannot fill and deadlock the decoder — sitting in `readDataToEndOfFile()` at the moment
+    /// this method closed that very handle. The frame pipe has the same race against the producer
+    /// thread, one stack frame away.
+    ///
+    /// ## The rule
+    ///
+    /// **A pipe is closed by the thread that reads it, and only once that reader has seen end of
+    /// stream.** So this method closes nothing. It ends the process and *waits* for it: ffmpeg
+    /// exiting closes both write ends, both readers see EOF, and each then closes its own handle —
+    /// `finish()` for the frame pipe, the drain thread for the error pipe. Nothing is ever closed
+    /// while a read is in flight, so nothing can raise.
+    ///
+    /// `waitUntilExit()` is what makes that a wait rather than a hope: when this returns the pipes
+    /// are already at EOF, so the producer's blocked read is about to return, not about to fail.
+    ///
+    /// It is also why a rebuild cannot be made cheaper by skipping the wait. The alternative —
+    /// close the pipes to unblock the readers — is the crash above.
+    ///
+    /// ## The signal, which was wrong
+    ///
+    /// This used to call `Process.terminate()` — SIGTERM — and then wait. **SIGTERM does not end
+    /// this process, and the wait was therefore forever.** The app hung with a live ffmpeg and no
+    /// way out, reproducibly, whenever a reader stopped early: changing the player's resolution
+    /// wedged it, because the calibration probe reads a few frames and stops.
+    ///
+    /// The reason is arithmetic. A 3840×1632 P010 frame is 12,582,912 bytes and a pipe holds
+    /// 64 KB, so ffmpeg is **always** part-way through a write when a reader stops — it is not an
+    /// edge case, it is every case. Blocked in `write()`, it cannot reach the point in its main
+    /// loop that notices the signal, and its handler has already run and set the flag it will
+    /// never read.
+    ///
+    /// Measured against the real film, reader stopped, 0.8 s for the write to stall:
+    ///
+    /// ```
+    ///   Process.terminate()              *** ALIVE after 3 s
+    ///   raw kill(SIGTERM)                *** ALIVE after 3 s
+    ///   raw kill(SIGTERM) + drain hard   *** ALIVE after 3 s   (764 MB drained past it)
+    ///   raw kill(SIGKILL)                exited in 21 ms
+    /// ```
+    ///
+    /// Draining is the interesting one: it is the obvious theory — unblock the write and the loop
+    /// gets to its check — and 764 MB of frames went by without it making any difference. Sending
+    /// SIGTERM twice, which in ffmpeg is documented to `exit()` straight from the handler, did not
+    /// help either.
+    ///
+    /// The handler itself is fine. Pointed at an ffmpeg with no output pipe at all (`-f null -`,
+    /// so it can never block) the same signal ends it in **43 ms, exit 255**. It is the blocked
+    /// write, and only that.
+    ///
+    /// So the stop is SIGKILL. It is not a preference — a grace period would be paid in full every
+    /// time, because every close of a live decoder is a close of a *blocked* decoder. The wait is
+    /// ~20 ms and the readers still see a clean end of stream: measured, the blocked frame reader
+    /// returns rather than raising, and the stderr drain returns 0 bytes and closes its own handle.
     public func close() {
         guard !closed else { return }
         closed = true
-        if process.isRunning { process.terminate() }
-        try? readHandle.close()
-        try? errorHandle.close()
+        guard process.isRunning else { return }
+        kill(process.processIdentifier, SIGKILL)
         process.waitUntilExit()
     }
 
@@ -196,6 +292,11 @@ public final class FFmpegFrameSource: FrameSource, @unchecked Sendable {
     private func finish() throws {
         process.waitUntilExit()
         try? readHandle.close()
+        // A stop we asked for is not a decoder failure. `close()` ends the process with a signal,
+        // so the status is that signal number — and a cancelled run, or a seek taking the source
+        // away, would report `ffmpeg exited 9` as though the film were broken. That is how a real
+        // fault gets ignored.
+        guard !closed else { return }
         guard process.terminationStatus == 0 else {
             errorLock.lock()
             let text = errorText

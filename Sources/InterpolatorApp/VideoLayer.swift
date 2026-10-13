@@ -47,6 +47,19 @@ final class DisplayHost {
         view.displayLayer.backgroundColor = CGColor(gray: 0, alpha: 1)
     }
 
+    /// How the picture is fitted to the window — `fit` letterboxes, `fill` crops.
+    ///
+    /// A plain property write on the layer, with **no session rebuild**. `videoGravity` is read
+    /// by the layer as it composites each frame, so the next frame is already fitted the new
+    /// way. That is the difference between this and the resolution policy beside it in the
+    /// readout: changing the interpolation size changes every buffer and the size the encoder
+    /// writes, so it has to tear the session down, while this one costs nothing. It is also why
+    /// this can be a control a viewer works while watching.
+    var fitMode: FitMode {
+        get { view.fitMode }
+        set { view.fitMode = newValue }
+    }
+
     /// Drop everything queued, for a seek.
     func discardQueuedFrames() {
         view.displayLayer.sampleBufferRenderer.flush()
@@ -58,15 +71,45 @@ final class DisplayHost {
 /// `makeBackingLayer` rather than assigning `layer` after `wantsLayer`: assigning it works
 /// until AppKit decides to replace the backing layer, and then the picture disappears for
 /// reasons that are nowhere near this file.
+///
+/// ## Why the double click is handled *here*
+///
+/// The picture is an `NSView` sitting on top of everything SwiftUI would otherwise attach a
+/// gesture to, so a `.onTapGesture` in the view body never fires: the event arrives at this view
+/// first and, with nothing to do with it, is passed up the responder chain rather than into the
+/// SwiftUI gesture layer. A `mouseDown` override is the one thing that is certain to work.
+///
+/// The pointer *is* tracked — but at the window, not here. See `AppModel.installEventMonitors()`:
+/// revealing the chrome has to work while the pointer is over the transport as well as over the
+/// picture, and a tracking area on this view would cover only the picture.
 @MainActor
 final class VideoLayerView: NSView {
 
     let displayLayer = AVSampleBufferDisplayLayer()
 
+    /// The picture was double-clicked. Full screen in, full screen out.
+    var onDoubleClick: (() -> Void)?
+
+    /// How the picture fills the view. See ``DisplayHost/fitMode``.
+    ///
+    /// **`videoGravity` and not a manual transform.** `resizeAspect` preserves the aspect ratio
+    /// and leaves the remainder black — letterbox or pillarbox, whichever the shapes call for —
+    /// and `resizeAspectFill` preserves it and crops the overflow. Both are the layer's own
+    /// documented behaviour, the same choice `VTPixelTransferSession` makes for the file on disk
+    /// (`kVTScalingMode_Letterbox` / `kVTScalingMode_Trim`), so what a viewer sees in the window
+    /// and what a conversion writes are the same two modes and not two approximations of them.
+    var fitMode: FitMode = .fit {
+        didSet { applyGravity() }
+    }
+
+    private func applyGravity() {
+        displayLayer.videoGravity = fitMode == .fit ? .resizeAspect : .resizeAspectFill
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        displayLayer.videoGravity = .resizeAspect
+        applyGravity()
         displayLayer.backgroundColor = CGColor(gray: 0, alpha: 1)
     }
 
@@ -80,14 +123,59 @@ final class VideoLayerView: NSView {
     }
 
     override var isOpaque: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 { onDoubleClick?() } else { super.mouseDown(with: event) }
+    }
 }
 
 /// Hosts the model's display view. It hosts it and nothing else.
 struct VideoSurface: NSViewRepresentable {
     let host: DisplayHost
+    var onDoubleClick: (() -> Void)?
 
-    func makeNSView(context: Context) -> VideoLayerView { host.view }
-    func updateNSView(_ nsView: VideoLayerView, context: Context) {}
+    func makeNSView(context: Context) -> VideoLayerView {
+        host.view.onDoubleClick = onDoubleClick
+        return host.view
+    }
+
+    /// Re-assign rather than ignore: the closure captures the model, and the model is a
+    /// reference type, so this is the same closure every time — but a representable that
+    /// silently drops its inputs is how a gesture stops working after some unrelated change.
+    func updateNSView(_ nsView: VideoLayerView, context: Context) {
+        nsView.onDoubleClick = onDoubleClick
+    }
+}
+
+/// Hands the model the `NSWindow` SwiftUI made for it.
+///
+/// Full screen is an `NSWindow` property — `toggleFullScreen(_:)`,
+/// `styleMask.contains(.fullScreen)`, the two notifications — and a SwiftUI `Window` scene does
+/// not expose the window. A zero-sized representable is the supported way to reach it:
+/// `viewDidMoveToWindow` is the one callback certain to run once the window exists, and it runs
+/// again if SwiftUI ever re-parents the view.
+struct WindowAccessor: NSViewRepresentable {
+    let onWindow: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> WindowReader {
+        let reader = WindowReader()
+        reader.onWindow = onWindow
+        return reader
+    }
+
+    func updateNSView(_ reader: WindowReader, context: Context) {
+        reader.onWindow = onWindow
+    }
+
+    @MainActor
+    final class WindowReader: NSView {
+        var onWindow: ((NSWindow) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window { onWindow?(window) }
+        }
+    }
 }
 
 /// The system file chooser, which is AppKit's and not SwiftUI's on macOS.

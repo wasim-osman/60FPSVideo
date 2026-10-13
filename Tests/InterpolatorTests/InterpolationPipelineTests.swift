@@ -1217,4 +1217,71 @@ struct InterpolationPipelinePoolTests {
         #expect(poolSink.ordered.map(\.index) == singleSink.ordered.map(\.index))
         #expect(poolSink.ordered.map(\.bytes) == singleSink.ordered.map(\.bytes))
     }
+
+    // MARK: - The stage instrument
+
+    /// `StageCosts` exists to answer "which stage owns the wall time", and the answer is
+    /// worthless unless the numbers add up to the run. `slotWait` is the discriminator: the
+    /// driver holds a slot from before it loads a frame until the engine's completion releases
+    /// it, so time spent waiting for one is time the *pool* was the constraint — and time spent
+    /// in the other five is time the driver was. If the two did not partition the run, a
+    /// conclusion drawn from them would be an artefact of the instrument.
+    @Test("the stages account for the run, and slotWait is the wait for the pool")
+    func stagesAccountForTheRun() throws {
+        let source = makeSource(frames: 30)
+        // A deliberately slow engine — 20 ms a call against a 128x96 synthetic frame — so the
+        // pool is unambiguously the constraint and the driver must spend the run waiting for
+        // slots rather than filling them.
+        let engine = RecordingEngine(width: Self.width, height: Self.height, format: .nv12,
+                                     maximumInterpolationsPerInterval: 5, depth: 2,
+                                     readDelayMicroseconds: 20_000)
+        let sink = MemoryFrameSink(width: Self.width, height: Self.height, format: .nv12)
+        let pipeline = InterpolationPipeline(source: source,
+                                             sourceRate: Self.sourceRate,
+                                             outputRate: Self.outputRate,
+                                             engine: engine,
+                                             configuration: .init(depth: 2, sceneDetection: false))
+        let report = try pipeline.run(into: sink)
+        let stages = report.stages
+
+        // The stages are a partition of the driver's own time, so they cannot exceed the run —
+        // which also runs `sink.finish()` and the drains, neither of which is the driver's.
+        #expect(stages.driverBusy + stages.slotWait <= report.wallSeconds,
+                "stages \(stages.summary) exceed the \(report.wallSeconds)s run")
+
+        // And they have to account for most of it. The only thing deliberately unmeasured is the
+        // loop's own bookkeeping, which is arithmetic on two integers.
+        #expect(stages.driverBusy + stages.slotWait >= report.wallSeconds * 0.5,
+                "stages \(stages.summary) account for too little of the \(report.wallSeconds)s run")
+
+        // ~29 intervals at 20 ms is ~580 ms of pool, so the driver waits rather than works.
+        #expect(stages.slotWait > stages.driverBusy,
+                "the driver should be waiting for the pool: \(stages.summary)")
+    }
+
+    /// The arithmetic a segmented job needs: its report is the sum of its pieces, and a field
+    /// left out of the sum is a field that silently reads zero.
+    @Test("stage costs add up field by field")
+    func stageCostsAdd() {
+        var a = InterpolationPipeline.StageCosts()
+        a.read = 1; a.signature = 2; a.load = 3
+        a.slotWait = 4; a.submit = 5; a.passthrough = 6
+        var b = InterpolationPipeline.StageCosts()
+        b.read = 10; b.signature = 20; b.load = 30
+        b.slotWait = 40; b.submit = 50; b.passthrough = 60
+
+        let total = a + b
+        #expect(total.read == 11)
+        #expect(total.signature == 22)
+        #expect(total.load == 33)
+        #expect(total.slotWait == 44)
+        #expect(total.submit == 55)
+        #expect(total.passthrough == 66)
+
+        // `driverBusy` is everything the driver did that was *not* waiting for the pool, so
+        // `slotWait` is deliberately outside it — that exclusion is the whole measurement.
+        // 187 of driver work, 44 of waiting for the pool, 231 of the driver's own time.
+        #expect(total.driverBusy == 11 + 22 + 33 + 55 + 66)
+        #expect(total.driverBusy + total.slotWait == 231)
+    }
 }

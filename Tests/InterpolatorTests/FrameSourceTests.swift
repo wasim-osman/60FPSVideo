@@ -145,6 +145,68 @@ struct FrameSourceTests {
         #expect(frames == 10)
     }
 
+    /// The decoder cannot be stopped by asking nicely, and this is the guard on that.
+    ///
+    /// `close()` used to send SIGTERM and then wait. A frame of 1080p NV12 is 3.1 MB and a pipe
+    /// holds 64 KB, so ffmpeg is **always** part-way through a write when a reader stops — blocked
+    /// there, it never reaches the point in its main loop that notices the signal, and the wait was
+    /// therefore forever. The app hung with a live ffmpeg whenever a reader stopped early, which is
+    /// the calibration probe, a cancelled run, and a seek taking the source away.
+    ///
+    /// The close runs on a detached thread so that a regression **fails in five seconds** rather
+    /// than hanging the suite. The difference matters: a hung test tells you nothing, and this one
+    /// has to be able to report the bug it exists for.
+    @Test("closing a source whose reader stopped does not wait forever")
+    func closeEndsABlockedDecoder() throws {
+        guard FileManager.default.fileExists(atPath: selfTestClip.path) else {
+            Issue.record("samples/test24.mp4 is missing")
+            return
+        }
+        let info = try MediaProbe.probe(selfTestClip)
+        let source = try FFmpegFrameSource(url: selfTestClip, info: info)
+
+        // The test is only meaningful while one frame cannot fit in the pipe: that is exactly what
+        // leaves the decoder stalled in `write()` once the reader stops. Were the frames small
+        // enough to fit, nothing would block and this would pass against the broken code.
+        #expect(source.frameByteSize > 65_536,
+                "a \(source.frameByteSize)-byte frame fits in the pipe, so nothing blocks here")
+
+        var staging = [UInt8](repeating: 0, count: source.frameByteSize)
+        for _ in 0..<2 {
+            _ = try staging.withUnsafeMutableBytes { try source.read(into: $0.baseAddress!) }
+        }
+        // Stop reading, and give ffmpeg time to reach the write it cannot finish.
+        Thread.sleep(forTimeInterval: 0.5)
+
+        let returned = DispatchSemaphore(value: 0)
+        let closer = Thread { source.close(); returned.signal() }
+        closer.name = "interp.test.closer"
+        closer.start()
+
+        #expect(returned.wait(timeout: .now() + 5) == .success,
+                "close() never returned: the decoder was blocked writing and nothing ended it")
+    }
+
+    @Test("a stop we asked for is not reported as a broken film")
+    func aDeliberateStopIsNotADecoderFailure() throws {
+        guard FileManager.default.fileExists(atPath: selfTestClip.path) else {
+            Issue.record("samples/test24.mp4 is missing")
+            return
+        }
+        let info = try MediaProbe.probe(selfTestClip)
+        let source = try FFmpegFrameSource(url: selfTestClip, info: info)
+        var staging = [UInt8](repeating: 0, count: source.frameByteSize)
+        #expect(try staging.withUnsafeMutableBytes { try source.read(into: $0.baseAddress!) })
+
+        source.close()
+
+        // `close()` ends the process with a signal, so its status is that signal number. Reading on
+        // must end the stream quietly; reporting `ffmpeg exited 9` would put a fault in the log
+        // every time a run was cancelled or a seek took the source away, which is how a real one
+        // gets ignored.
+        #expect(try staging.withUnsafeMutableBytes { try source.read(into: $0.baseAddress!) } == false)
+    }
+
     @Test("seeking starts where it is asked to")
     func honoursSeek() throws {
         guard FileManager.default.fileExists(atPath: selfTestClip.path) else {

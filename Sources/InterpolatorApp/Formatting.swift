@@ -49,8 +49,15 @@ enum Fmt {
     }
 
     /// A duration as a rough human interval, for a projection.
+    ///
+    /// Deliberately coarse, and the coarseness is the point: the rate behind it moves with how
+    /// much of the picture is moving, so "3.8 hours" is a claim the measurement supports and
+    /// "3:47:12" is not — the seconds would be invented. The boundaries are where the wording
+    /// stops being useful: below a minute a projection has nothing to say, and past ninety
+    /// minutes "1.6 hours" is read faster than "96 minutes".
     static func interval(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds > 0 else { return "—" }
+        if seconds < 60 { return "less than a minute" }
         if seconds < 90 { return "under two minutes" }
         let minutes = seconds / 60
         if minutes < 90 { return String(format: "%.0f minutes", minutes) }

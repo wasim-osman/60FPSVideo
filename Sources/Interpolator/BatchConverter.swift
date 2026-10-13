@@ -32,6 +32,39 @@ public protocol FrameCountingSink: FrameSink {
 ///
 /// ## Testability
 ///
+/// What to open, and how.
+///
+/// A struct rather than five positional arguments because the last field — whether to scale on
+/// the way in — is the whole difference between a quality conversion and a fast one, and a
+/// trailing `Bool` after two optionals is exactly the argument that gets passed the wrong way
+/// round without anything complaining.
+public struct SourceRequest: Sendable {
+    public var url: URL
+    /// The size the pipeline will be handed.
+    ///
+    /// When this is **smaller than the file**, `scale` must be true or every buffer is sized for
+    /// one picture and filled with another — which is invariant 22's failure, arrived at from the
+    /// other direction.
+    public var info: MediaInfo
+    public var startSeconds: Double?
+    public var frameLimit: Int?
+    /// Ask ffmpeg to resize to `info`'s dimensions as the frames leave the decoder.
+    ///
+    /// Decode-side, and therefore free of the pipeline's colour-range rule (invariant 16): what
+    /// arrives is already the format `info` says it is. This is how a fast conversion interpolates
+    /// at 1080p while the film stays 4K on disk.
+    public var scale: Bool
+
+    public init(url: URL, info: MediaInfo, startSeconds: Double? = nil,
+                frameLimit: Int? = nil, scale: Bool = false) {
+        self.url = url
+        self.info = info
+        self.startSeconds = startSeconds
+        self.frameLimit = frameLimit
+        self.scale = scale
+    }
+}
+
 /// The three stages are injected. The defaults are the real ones — ffprobe, ffmpeg, an
 /// `AVAssetWriter` — but a test can drive the whole converter with a synthetic source
 /// and a packed-file sink, which is how the ordering, the count check and the cleanup
@@ -48,6 +81,41 @@ public struct BatchConverter: Sendable {
         /// The rate policy. A value rather than a rate, so the batch converter and the
         /// player cannot pick different cadences for the same film.
         public var policy: OutputRatePolicy
+
+        /// How much work each frame is allowed, and therefore what size it is **interpolated** at.
+        ///
+        /// `.quality` interpolates at the source's own resolution. `.fast` interpolates at
+        /// 1080p — the resize SVP performs before it interpolates, and the only one of its two
+        /// levers `VTFrameProcessor` exposes. Measured on the real 4K HDR film: 105 → 31.87 ms
+        /// per interval, and **3.8× end to end** (12.4 s → 3.2 s for 288 source frames) once the
+        /// cheaper 1080p encode is counted.
+        ///
+        /// **This is the interpolation size, not the delivered size.** What the file comes out
+        /// as is ``outputTarget``'s answer, and `ScalingFrameSink` bridges the two. They used to
+        /// be one number, which is why this comment used to end by saying the output size follows
+        /// the interpolation size and that the pipeline has no scaler. Both halves of that were
+        /// wrong, and the correction is worth writing down rather than quietly deleting: the
+        /// pipeline **does** have a scaler — `VTPixelTransferSession`, measured at **2.71 ms**
+        /// for 1920×816 → 3440×1440 — and it does not need a second encode pass, because it runs
+        /// on the frames while they are already in flight. The old note reasoned from this
+        /// machine's *ffmpeg* (no `zscale`, `scale_vt` fails `ENOSYS`) to a conclusion about the
+        /// pipeline, and the pipeline does not use ffmpeg to scale anything.
+        public var quality: ConversionQuality
+
+        /// The size to deliver. Defaults to the size the film is interpolated at.
+        ///
+        /// Set this to a screen's pixel size to get a file that fills that screen, with
+        /// ``fitMode`` deciding what happens to the parts that do not fit. The interpolation
+        /// size is untouched, so a 4K film can be **delivered** at 3440×1440 while being
+        /// interpolated at 1920 wide — which is the arrangement SVP ships, and the difference
+        /// between a real-time conversion and one that cannot keep up. See ``OutputTarget``.
+        public var outputTarget: OutputTarget
+
+        /// What to do when the picture's shape does not match the target's.
+        ///
+        /// Fit letterboxes, fill crops. Both are VideoToolbox's own scaling modes; see
+        /// ``FitMode`` for the measurement that confirms where the bars land.
+        public var fitMode: FitMode
 
         /// `nil` asks `VideoEncodeSettings` for its measured default.
         public var bitRate: Int?
@@ -120,6 +188,9 @@ public struct BatchConverter: Sendable {
         public init(input: URL,
                     output: URL,
                     policy: OutputRatePolicy = .default,
+                    quality: ConversionQuality = .quality,
+                    outputTarget: OutputTarget = .source,
+                    fitMode: FitMode = .fit,
                     bitRate: Int? = nil,
                     depth: Int = 2,
                     workers: Int = 0,
@@ -135,6 +206,9 @@ public struct BatchConverter: Sendable {
             self.input = input
             self.output = output
             self.policy = policy
+            self.quality = quality
+            self.outputTarget = outputTarget
+            self.fitMode = fitMode
             self.bitRate = bitRate
             self.depth = depth
             self.workers = workers
@@ -160,6 +234,20 @@ public struct BatchConverter: Sendable {
         public let source: MediaInfo
         /// The rate decision, including the note when the policy could not act.
         public let resolution: OutputRatePolicy.Resolution
+        /// The pixel size the file was actually delivered at.
+        ///
+        /// Recorded rather than derived, because it is **not** always `source`'s size and it is
+        /// not always the interpolation size either: `ScalingFrameSink` sits between the two, and
+        /// after the run there is no way to recover which one happened from the file alone
+        /// without probing it. A report that states the delivered size is a report that can be
+        /// compared with the setting that asked for it.
+        public let delivered: OutputSize
+        /// How the picture was fitted into ``delivered`` when the shapes did not match.
+        ///
+        /// Recorded for the same reason as ``delivered``: it is a fact about *this file*, and a
+        /// report that reads the current setting instead is a report that starts lying the
+        /// moment the setting is changed after the job ran.
+        public let fitMode: FitMode
         public let report: InterpolationPipeline.Report
         /// Frames the sink actually placed. Equals `report.outputFrames` or the run
         /// would have thrown.
@@ -325,7 +413,7 @@ public struct BatchConverter: Sendable {
     // MARK: - Seams
 
     public var probe: @Sendable (URL) throws -> MediaInfo
-    public var makeSource: @Sendable (URL, MediaInfo, Double?, Int?) throws -> FrameSource
+    public var makeSource: @Sendable (SourceRequest) throws -> FrameSource
     public var makeSink: @Sendable (URL, VideoEncodeSettings) throws -> FrameCountingSink
 
     /// The interpolation engine, from the rates and the depth.
@@ -370,9 +458,11 @@ public struct BatchConverter: Sendable {
     /// `AVAssetWriter`.
     public init() {
         self.probe = { try MediaProbe.probe($0) }
-        self.makeSource = { url, info, start, limit in
-            try FFmpegFrameSource(url: url, info: info,
-                                  startSeconds: start, frameLimit: limit)
+        self.makeSource = { request in
+            try FFmpegFrameSource(url: request.url, info: request.info,
+                                  startSeconds: request.startSeconds,
+                                  frameLimit: request.frameLimit,
+                                  scale: request.scale)
         }
         self.makeSink = { url, settings in
             AssetWriterSink(url: url, settings: settings)
@@ -385,7 +475,7 @@ public struct BatchConverter: Sendable {
     }
 
     public init(probe: @escaping @Sendable (URL) throws -> MediaInfo,
-                makeSource: @escaping @Sendable (URL, MediaInfo, Double?, Int?) throws -> FrameSource,
+                makeSource: @escaping @Sendable (SourceRequest) throws -> FrameSource,
                 makeSink: @escaping @Sendable (URL, VideoEncodeSettings) throws -> FrameCountingSink,
                 makeEngine: @escaping @Sendable (FrameRate, FrameRate, Int) throws -> InterpolationEngine,
                 mux: @escaping @Sendable (MuxRequest) throws -> AudioMuxer.Outcome = {
@@ -475,10 +565,16 @@ public struct BatchConverter: Sendable {
             if !placed { try? manager.removeItem(at: temporary) }
         }
 
-        let settings = VideoEncodeSettings.forSource(info, bitRate: request.bitRate)
-        let sink = try makeSink(staging, settings)
-        let source = try makeSource(request.input, info,
-                                    request.startSeconds, request.maximumSourceFrames)
+        let interpolation = Self.interpolationInfo(for: request, info: info)
+        let (sink, counter) = try Self.makePipelineSink(for: request,
+                                                        interpolation: interpolation,
+                                                        url: staging,
+                                                        makeSink: makeSink)
+        let source = try makeSource(SourceRequest(
+            url: request.input, info: interpolation,
+            startSeconds: request.startSeconds,
+            frameLimit: request.maximumSourceFrames,
+            scale: interpolation.width != info.width))
         let workers = RenderWorkers.resolve(request.workers)
         // One session per worker, all driving the same source and the same sink. This is
         // where the 1.78× lives: nothing else about the run changes, and with `workers` 1
@@ -505,7 +601,7 @@ public struct BatchConverter: Sendable {
 
         // The pipeline calls `sink.finish()` itself, at the end of `run`.
         let report = try pipeline.run(into: sink)
-        let written = sink.written
+        let written = counter.written
 
         guard written == report.outputFrames else {
             throw Failure.shortOutput(expected: report.outputFrames, written: written)
@@ -590,6 +686,8 @@ public struct BatchConverter: Sendable {
         return Result(output: request.output,
                       source: info,
                       resolution: resolution,
+                      delivered: request.outputTarget.size(for: interpolation),
+                      fitMode: request.fitMode,
                       report: report,
                       written: written,
                       bytes: bytes,
@@ -623,13 +721,112 @@ public struct BatchConverter: Sendable {
     ///
     /// With no total to divide by, the callback is not installed at all. An indeterminate bar
     /// is better than one computed from a made-up number.
+    /// The size this request will interpolate at, and therefore write.
+    ///
+    /// The film's own `MediaInfo` describes the *file*; this describes the *work*. Everything
+    /// downstream that sizes a buffer — the encode settings and the decoder's own scale — reads
+    /// this rather than the file, so a fast conversion is 1080p all the way through instead of
+    /// 1080p frames in 4K buffers.
+    ///
+    /// The audio stage and the `Result` keep the original: a scaled picture does not change what
+    /// the soundtrack is or how many chapters the disc has.
+    static func interpolationInfo(for request: Request, info: MediaInfo) -> MediaInfo {
+        InterpolationWidth.scaled(
+            info,
+            toWidth: InterpolationWidth.conversionWidth(request.quality,
+                                                        sourceWidth: info.width))
+    }
+
+    /// The size the file is *delivered* at, which is not the size it was interpolated at.
+    ///
+    /// Two sizes come out of a request and they are easy to conflate:
+    ///
+    /// - ``interpolationInfo(for:info:)`` — what the engine is asked to interpolate. This is the
+    ///   cost lever, and it may be much smaller than the film (§29–30).
+    /// - this — what the encoder is told the frames are, which is what the file *is*.
+    ///
+    /// Everything that sizes the encode reads this one, and that is not cosmetic: the default bit
+    /// rate is derived from the pixel count (`VideoEncodeSettings.defaultBitRate`), so encoding a
+    /// 3440×1440 picture at a bit rate computed for 1920×816 would spend about a third of the
+    /// bits the picture needs — and the result would look like it.
+    ///
+    /// A `.source` target returns the interpolation info unchanged, so nothing about the previous
+    /// behaviour moves.
+    static func deliveredInfo(for request: Request, interpolation: MediaInfo) -> MediaInfo {
+        guard request.outputTarget.needsScaling(from: interpolation) else { return interpolation }
+        let size = request.outputTarget.size(for: interpolation)
+        return interpolation.scaled(toWidth: size.width, height: size.height)
+    }
+
+    /// The sink for a job, wrapped in a scaler when the delivered size differs from the work size.
+    ///
+    /// Returns the sink the pipeline writes into **and** the sink that counts. The scaler is a
+    /// `FrameSink` rather than a `FrameCountingSink`, and the count has to come from the stage
+    /// that actually placed frames — keeping both is also what makes a failed transfer a failure
+    /// rather than a short file: the inner sink never sees the frame, `written` comes up one
+    /// short, and the job is refused. See `Failure.shortOutput`.
+    static func makePipelineSink(for request: Request,
+                                 interpolation: MediaInfo,
+                                 url: URL,
+                                 makeSink: (URL, VideoEncodeSettings) throws -> FrameCountingSink)
+        throws -> (pipeline: FrameSink, counter: FrameCountingSink) {
+        let delivered = deliveredInfo(for: request, interpolation: interpolation)
+        let settings = VideoEncodeSettings.forSource(delivered, bitRate: request.bitRate)
+        let counter = try makeSink(url, settings)
+
+        guard request.outputTarget.needsScaling(from: interpolation) else {
+            return (counter, counter)
+        }
+        let size = request.outputTarget.size(for: interpolation)
+        return (ScalingFrameSink(wrapping: counter, target: size, mode: request.fitMode), counter)
+    }
+
+    /// The job's progress once `intervalsDone` of the film's intervals are done.
+    ///
+    /// **One scale for every report the converter makes.** The segmented path has three places
+    /// that announce progress — resuming, starting a piece, finishing a piece — and they used to
+    /// report a *piece* count while the per-interval callback reported an *interval* count. Those
+    /// are different step sizes, so the bar moved smoothly inside a piece and then jumped by a
+    /// twelfth at the boundary, and any rate measured across the seam was the seam rather than
+    /// the job. Everything now divides the same numerator by the same denominator.
+    static func jobFraction(intervalsDone: Int, totalIntervals: Int) -> Double {
+        guard totalIntervals > 0 else { return 0 }
+        return min(1, max(0, Double(intervalsDone) / Double(totalIntervals)))
+    }
+
     static func intervalReporter(progress: @escaping @Sendable (Progress) -> Void,
                                  intervals: Int?) -> @Sendable (Int) -> Void {
         guard let intervals, intervals > 0 else { return { _ in } }
-        let divisor = Double(intervals)
         return { interval in
             progress(Progress(stage: .rendering,
-                              fraction: min(1, max(0, Double(interval + 1) / divisor)),
+                              fraction: jobFraction(intervalsDone: interval + 1,
+                                                    totalIntervals: intervals),
+                              detail: "interval \(interval + 1) of about \(intervals)"))
+        }
+    }
+
+    /// The segmented path's per-interval reporter: the same fraction, plus which piece it is.
+    ///
+    /// The pipeline reports the **film's own** interval number even for a windowed run — it is
+    /// documented as doing so, and it is why a resumed job does not start its percentage over.
+    /// So no offset arithmetic belongs here: the segment's `sourceStart` is already in the number
+    /// the pipeline hands over, and adding it again would park the bar near 90% before the first
+    /// piece had finished.
+    ///
+    /// Without this the segmented path has **no** progress inside a piece — the pipeline was
+    /// built without a callback at all, so the bar was a staircase with one step every few
+    /// minutes. A staircase cannot be turned into a time remaining by anything: the rate across a
+    /// step is the step, and the rate between steps is zero.
+    static func segmentIntervalReporter(progress: @escaping @Sendable (Progress) -> Void,
+                                        segment: SegmentPlan.Segment,
+                                        pieces: Int,
+                                        intervals: Int?) -> @Sendable (Int) -> Void {
+        guard let intervals, intervals > 0 else { return { _ in } }
+        return { interval in
+            progress(Progress(stage: .rendering,
+                              fraction: jobFraction(intervalsDone: interval + 1,
+                                                    totalIntervals: intervals),
+                              piece: segment.index + 1, pieces: pieces,
                               detail: "interval \(interval + 1) of about \(intervals)"))
         }
     }
@@ -702,6 +899,13 @@ public struct BatchConverter: Sendable {
         // exist fails silently enough to look like a sink that wrote nothing.
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
 
+        // What the finished file will be delivered at, as opposed to what each piece is
+        // interpolated at. Computed once here for the result — `render(segment:)` works out its
+        // own, because the scaling sink is built per piece, but the answer cannot differ
+        // between them: both come from the same request and the same source info.
+        let deliveredSize = request.outputTarget
+            .size(for: Self.interpolationInfo(for: request, info: info))
+
         var placed = false
         defer {
             try? manager.removeItem(at: staging)
@@ -734,15 +938,25 @@ public struct BatchConverter: Sendable {
         var passthroughFrames = 0
         var cutCount = 0
         var wallSeconds = 0.0
+        var stages = InterpolationPipeline.StageCosts()
 
         // A resumed job starts its bar where the manifest says it is, not at zero. A bar
         // that restarts at 0% on a job that is 90% finished is the one reading that makes a
         // user think their work was thrown away.
         let pieces = plan.segments.count
+        // The plan's own interval count, used as the denominator by *every* report this path
+        // makes — the per-interval callback included. Two different denominators for the same
+        // bar is how a percentage goes backwards.
+        let totalIntervals = max(0, plan.sourceFrameCount - 1)
         var piecesDone = finished.count
         if piecesDone > 0 {
+            // Where the *work* is, not how many pieces are done: a resumed job's bar has to sit
+            // where the intervals already rendered put it, on the same scale as everything else.
+            let done = plan.segments.filter { finished.contains($0.index) }
+                .map(\.intervalEnd).max() ?? 0
             progress(Progress(stage: .rendering,
-                              fraction: Double(piecesDone) / Double(pieces),
+                              fraction: Self.jobFraction(intervalsDone: done,
+                                                         totalIntervals: totalIntervals),
                               piece: piecesDone, pieces: pieces,
                               detail: "resuming after \(piecesDone) of \(pieces) pieces"))
         }
@@ -757,7 +971,8 @@ public struct BatchConverter: Sendable {
             try? manager.removeItem(at: file)
 
             progress(Progress(stage: .rendering,
-                              fraction: Double(piecesDone) / Double(pieces),
+                              fraction: Self.jobFraction(intervalsDone: segment.sourceStart,
+                                                         totalIntervals: totalIntervals),
                               piece: segment.index + 1, pieces: pieces,
                               detail: "piece \(segment.index + 1) of \(pieces)"))
 
@@ -773,6 +988,7 @@ public struct BatchConverter: Sendable {
             passthroughFrames += report.passthroughFrames
             cutCount += report.cutCount
             wallSeconds += report.wallSeconds
+            stages = stages + report.stages
 
             let size = (try? manager.attributesOfItem(atPath: file.path))?[.size]
             working.record(JobManifest.Entry(
@@ -793,7 +1009,8 @@ public struct BatchConverter: Sendable {
 
             piecesDone += 1
             progress(Progress(stage: .rendering,
-                              fraction: Double(piecesDone) / Double(pieces),
+                              fraction: Self.jobFraction(intervalsDone: segment.intervalEnd,
+                                                         totalIntervals: totalIntervals),
                               piece: segment.index + 1, pieces: pieces,
                               detail: "piece \(segment.index + 1) of \(pieces) finished"))
         }
@@ -877,6 +1094,8 @@ public struct BatchConverter: Sendable {
         return Result(output: request.output,
                       source: info,
                       resolution: resolution,
+                      delivered: deliveredSize,
+                      fitMode: request.fitMode,
                       report: InterpolationPipeline.Report(
                         sourceFrames: sourceFrames,
                         outputFrames: written,
@@ -885,6 +1104,7 @@ public struct BatchConverter: Sendable {
                         engineCalls: 0,
                         decisions: [],
                         wallSeconds: wallSeconds,
+                        stages: stages,
                         problems: []),
                       written: written,
                       bytes: bytes,
@@ -902,8 +1122,11 @@ public struct BatchConverter: Sendable {
                         info: MediaInfo,
                         resolution: OutputRatePolicy.Resolution,
                         to file: URL) throws -> InterpolationPipeline.Report {
-        let settings = VideoEncodeSettings.forSource(info, bitRate: request.bitRate)
-        let sink = try makeSink(file, settings)
+        let interpolation = Self.interpolationInfo(for: request, info: info)
+        let (sink, counter) = try Self.makePipelineSink(for: request,
+                                                        interpolation: interpolation,
+                                                        url: file,
+                                                        makeSink: makeSink)
 
         // Half a frame *before* the frame's own presentation, not after it.
         //
@@ -918,11 +1141,13 @@ public struct BatchConverter: Sendable {
         // static opening the shift is invisible, which is why it was not obvious; by
         // two minutes in the passthrough frames were 37 mean-absolute-difference away
         // from the source frames they name.
-        let source = try makeSource(request.input, info,
-                                    Self.seekSeconds(forFrame: segment.readStart,
-                                                     rate: info.frameRate,
-                                                     base: request.startSeconds ?? 0),
-                                    segment.readCount)
+        let source = try makeSource(SourceRequest(
+            url: request.input, info: interpolation,
+            startSeconds: Self.seekSeconds(forFrame: segment.readStart,
+                                           rate: info.frameRate,
+                                           base: request.startSeconds ?? 0),
+            frameLimit: segment.readCount,
+            scale: interpolation.width != info.width))
         // Each piece gets the whole pool. Pieces are rendered one after another on purpose —
         // they exist so that a crash costs one piece rather than three hours, and running
         // them at once would give that up for nothing, because the parallelism is already
@@ -942,11 +1167,22 @@ public struct BatchConverter: Sendable {
                                  sceneDetection: request.sceneDetection,
                                  maximumSourceFrames: segment.readCount,
                                  expectedOutputFrameCount: segment.outputCount,
-                                 window: .init(segment: segment)))
+                                 window: .init(segment: segment),
+                                 // The piece reports its own progress against the **film's**
+                                 // interval count, so the bar moves continuously across a
+                                 // boundary instead of stepping once every few minutes. The
+                                 // pipeline numbers intervals by the film's own index even in
+                                 // a windowed run, which is what makes this a division and
+                                 // not an offset.
+                                 progress: Self.segmentIntervalReporter(
+                                    progress: progress,
+                                    segment: segment,
+                                    pieces: plan.segments.count,
+                                    intervals: max(0, plan.sourceFrameCount - 1))))
 
         let report = try pipeline.run(into: sink)
-        guard sink.written == report.outputFrames else {
-            throw Failure.shortOutput(expected: report.outputFrames, written: sink.written)
+        guard counter.written == report.outputFrames else {
+            throw Failure.shortOutput(expected: report.outputFrames, written: counter.written)
         }
         return report
     }

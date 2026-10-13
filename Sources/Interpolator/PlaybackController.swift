@@ -44,30 +44,32 @@ public final class PlaybackController: @unchecked Sendable {
         public var leadSeconds: Double
         /// Where to begin, in seconds.
         public var startSeconds: Double
-        /// Scale the picture down before interpolating.
+        /// What size to interpolate at.
         ///
-        /// The downscale toggle the 4K decision was recorded with, and the only thing that
-        /// makes 4K material play in real time on a machine that cannot interpolate it:
-        /// interpolation is per-pixel, so 1080p is a quarter of the work. The measured 4K
-        /// result is half the intervals skipped and a constant ~150 ms lag; this is how a
-        /// user buys that back, at the cost of the resolution.
+        /// The lever that decides whether a 4K film plays in real time here. Interpolation is
+        /// per-pixel, and — measured — a **step function of frame width** rather than of pixel
+        /// count, so the only way to hold the rate on this machine is to interpolate at fewer
+        /// columns and let the display scale the result up.
         ///
-        /// Ignored when the source is already at or below 1080p — upscaling would be work
-        /// spent to lose information.
-        public var downscaleTo1080p: Bool
+        /// That is precisely the resize SVP performs before it interpolates, and it is the one of
+        /// SVP's two levers `VTFrameProcessor` leaves us: the other is its block-matching motion
+        /// model, which the framework does not expose at all. Measured at 4K on the real film,
+        /// `.source` gives half the intervals skipped and a constant ~150 ms of lag; `.automatic`
+        /// gives real time.
+        public var resolutionPolicy: PlaybackResolutionPolicy
 
         public init(outputRate: FrameRate,
                     depth: Int = 2,
                     sceneDetection: Bool = true,
                     leadSeconds: Double = 1.0,
                     startSeconds: Double = 0,
-                    downscaleTo1080p: Bool = false) {
+                    resolutionPolicy: PlaybackResolutionPolicy = .automatic) {
             self.outputRate = outputRate
             self.depth = depth
             self.sceneDetection = sceneDetection
             self.leadSeconds = leadSeconds
             self.startSeconds = startSeconds
-            self.downscaleTo1080p = downscaleTo1080p
+            self.resolutionPolicy = resolutionPolicy
         }
     }
 
@@ -119,12 +121,113 @@ public final class PlaybackController: @unchecked Sendable {
     private let lock = NSLock()
     private var session: Session?
     private var lastReport: DisplayPresenter.Report?
+    /// The size the pipeline will be handed, decided once per film by ``resolveInterpolation()``.
+    ///
+    /// Cached because a seek rebuilds the session, and a calibration is a measured run of the
+    /// pipeline — paying for it on every seek would make scrubbing a two-second-per-click
+    /// operation. It is a property of the film and the machine, and neither changes mid-playback.
+    private var resolved: MediaInfo?
+    /// What the calibration found, when the policy asked for one.
+    private var calibration: PlaybackCalibrator.Choice?
     /// Kept after a session is torn down, so `status` still answers once the film has ended.
     private var lastSkipped = 0
     private var problemList: [String] = []
     /// A play request that is waiting for the first frame to exist.
     private var playRequested = false
     private var firstFrameReady = false
+
+    // MARK: - Where a session is built
+
+    /// The one thread a session is ever built on.
+    ///
+    /// A seek is not a move of the playhead: it tears the session down — both threads joined, the
+    /// decoder closed — and builds a new one, which means spawning ffmpeg and asking it to seek
+    /// into the file. Measured on the real 4K film that is **120 ms of blocking work, worst 162**,
+    /// and it used to happen **on the calling thread**, which in the app is the main thread. The
+    /// main thread is where the window is drawn, so the block *is* the freeze a viewer sees when
+    /// they grab the playhead — and the bad ones are intermittent because the cost depends on
+    /// where in the film the target lands: `-ss` seeks to the preceding keyframe and then decodes
+    /// forward to the requested instant, so how far back that keyframe sits is the whole variance.
+    ///
+    /// Every build goes through here instead, and the callers return immediately.
+    ///
+    /// **One serial queue, not one per caller.** Two builds at once would each tear down the
+    /// other's session — which is exactly why the rate watchdog's rebuild was already being
+    /// marshalled onto the main thread before this existed. Serialising them is the property that
+    /// mattered; the main thread was only ever how it was achieved.
+    private let sessionQueue = DispatchQueue(label: "interp.playback.session",
+                                             qos: .userInitiated)
+
+    /// Which build the caller last asked for.
+    ///
+    /// A rebuild takes long enough that another request can arrive while the first is still
+    /// running, and a user who clicks the playhead twice has asked for the second position, not
+    /// for both. A queued build whose token is stale is dropped rather than run: running it would
+    /// tear down the session the newer request is about to build, and the film would settle at
+    /// where the *older* click said.
+    private var requestToken: UInt64 = 0
+
+    /// Is this request still the one being waited on?
+    private func isCurrent(_ token: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return requestToken == token
+    }
+
+    /// Take the next token, invalidating everything already queued.
+    private func nextToken() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        requestToken &+= 1
+        return requestToken
+    }
+
+    // MARK: - Holding the rate
+
+    /// The rate watchdog: the player's own answer to "is this actually real time".
+    ///
+    /// ## Why a prediction is not enough
+    ///
+    /// `.automatic` picks a width by running the *pipeline* for a measured number of intervals
+    /// and comparing that against one interval of film time. That probe is honest about what it
+    /// measures and silent about what it does not: it writes into a sink that discards frames, so
+    /// it never runs the queue, never runs the presenter, and never presents. **Everything the
+    /// player does that is not interpolation is absent from the number that decides how much
+    /// interpolation the player may do.**
+    ///
+    /// Measured on the real film at 1920 wide, the engine alone costs **31.74 ms per interval**
+    /// against a **41.71 ms** budget — 24% spare. Measured on the same film through the whole
+    /// player, the picture came out at **59.4 fps of 59.94** — 0.6% *over*. So the non-engine
+    /// half of the player consumes very nearly the whole of the spare, and a prediction with 24%
+    /// of headroom is really a prediction with none. Nothing in the probe can see this, and no
+    /// margin constant fixes it, because the cost that eats the spare depends on the window the
+    /// film is playing in, the display it is on, and what else the machine is doing.
+    ///
+    /// So the player watches itself. Every ``watchdogInterval`` it takes the picture's own
+    /// counter and asks a simpler question than the calibration asked: *did the last second and a
+    /// half present at the rate we need?* If it did not, twice running, the picture is narrowed
+    /// one rung of the ladder and the session rebuilt at the same instant of film.
+    ///
+    /// This is SVP's `fi_auto`, which also lowers quality to hold the rate — and it is the honest
+    /// version of it, because the thing being lowered is chosen from what the machine actually
+    /// did rather than from what it was expected to do.
+    private var watchdog: DispatchSourceTimer?
+    /// The last sample: frames shown, and when. `nil` until two samples exist.
+    private var watchdogSample: (shown: Int, at: TimeInterval)?
+    /// Consecutive samples below the target. One short sample is a seek or a stall, not a verdict.
+    private var shortSamples = 0
+    /// How many times this film's picture has been narrowed. Bounded, because a player that keeps
+    /// halving its own resolution is a player that has not understood the problem.
+    private var narrowings = 0
+    private let watchdogQueue = DispatchQueue(label: "interp.playback.watchdog")
+
+    /// How often the player checks its own rate.
+    private static let watchdogInterval: TimeInterval = 1.5
+    /// How far below the target counts as short. Not 1.0: a rate that oscillates around the
+    /// target by a fraction of a frame is a player working at its limit and holding.
+    private static let watchdogTolerance = 0.97
+    /// Short samples in a row before the picture is narrowed.
+    private static let watchdogPatience = 2
+    /// The most rungs the player may descend for one film.
+    private static let maximumNarrowings = 2
 
     /// One run of the film, from one position.
     ///
@@ -198,7 +301,13 @@ public final class PlaybackController: @unchecked Sendable {
     deinit {
         lock.lock()
         let current = session
+        let timer = watchdog
+        watchdog = nil
         lock.unlock()
+        // Cancelled outside the lock, and only here once — a `DispatchSourceTimer` that is
+        // cancelled while still suspended traps, so `watchdog` is only ever set after `resume()`
+        // and this is the only place it is taken without being stopped first.
+        timer?.cancel()
         if let current { tearDown(current, wait: false) }
         audio?.pause()
     }
@@ -206,6 +315,11 @@ public final class PlaybackController: @unchecked Sendable {
     // MARK: - Transport
 
     /// Build the session and start producing. The film does not play until ``play()``.
+    ///
+    /// Synchronous, and deliberately: this is the film *opening*, where the app is already showing
+    /// "Preparing…" and there is nothing to keep responsive, and its callers need the session to
+    /// exist by the time it returns. It runs on ``sessionQueue`` rather than on the caller so that
+    /// an opening and a seek can never overlap.
     public func start() throws {
         lock.lock()
         guard session == nil else {
@@ -213,7 +327,9 @@ public final class PlaybackController: @unchecked Sendable {
             throw Failure.alreadyStarted
         }
         lock.unlock()
-        try beginSession(at: configuration.startSeconds, resetClock: true)
+        try sessionQueue.sync {
+            try beginSession(at: configuration.startSeconds, resetClock: true)
+        }
     }
 
     /// Start playing, or arm playback to start as soon as the first frame is ready.
@@ -260,28 +376,77 @@ public final class PlaybackController: @unchecked Sendable {
         // sound into the playhead — small, but in the direction that grows.
         audio?.pause()
         clock.pause()
+        // A paused player has no rate to judge, and leaving the watchdog running would let it
+        // count a pause as a shortfall and narrow the picture for a film nobody is watching.
+        stopWatchdog()
     }
 
-    /// Jump to a position. Rebuilds the session, which takes about a second.
-    public func seek(to seconds: Double) throws {
-        lock.lock()
-        let wasPlaying = clock.isPlaying
-        lock.unlock()
+    /// Jump to a position.
+    ///
+    /// **Asynchronous, and that is the fix rather than an inconvenience.** The rebuild is ~120 ms
+    /// of blocking work (worst measured 162 ms on the real 4K film) and it used to run on the
+    /// caller's thread — which in the app is the main thread, where the window is drawn. So the
+    /// click *was* a freeze, and an intermittent one, because ffmpeg's `-ss` lands on the
+    /// preceding keyframe and decodes forward to the requested instant: how far back that keyframe
+    /// sits is the variance.
+    ///
+    /// This now returns immediately and the work happens on ``sessionQueue``. `completion` is
+    /// called on that queue when the session exists, when the request failed, or when a newer
+    /// request superseded it. The error travels through the completion rather than `throws`
+    /// because there is no longer a caller sitting on the result.
+    ///
+    /// - Parameter resume: whether to play after the jump. `nil` means "as the player was", which
+    ///   is the intent rather than the clock's state — during startup the clock is deliberately
+    ///   held until the first frame exists, and a seek in that window must not turn a film that is
+    ///   starting into a film that is paused.
+    public func seek(to seconds: Double,
+                     resume: Bool? = nil,
+                     completion: (@Sendable (Result<Void, Error>) -> Void)? = nil) {
         let target = max(0, min(seconds, info.duration))
-        if info.duration > 0, target >= info.duration {
-            throw Failure.pastEnd(seconds)
-        }
-        try beginSession(at: target, resetClock: false)
         lock.lock()
-        // A seek to a new position has to decode and re-prepare too, so resuming goes
-        // through the same gate as a first play rather than starting the clock into a gap.
-        // `beginSession` has already moved the sound and the clock to `target`.
-        playRequested = wasPlaying
+        // Read *now*, not when the build runs: whether the film was playing is a fact about the
+        // moment of the click, and by the time the queue reaches it the old session is gone.
+        let wasPlaying = resume ?? (playRequested || clock.isPlaying)
         lock.unlock()
-        if !wasPlaying { clock.pause() }
+
+        if info.duration > 0, target >= info.duration {
+            completion?(.failure(Failure.pastEnd(seconds)))
+            return
+        }
+
+        let token = nextToken()
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            // `completion?(…)` returns `Void?`, so it cannot be the operand of `return` in a
+            // `Void` closure — the call and the return have to be separate statements.
+            guard self.isCurrent(token) else {
+                completion?(.success(()))
+                return
+            }
+            do {
+                try self.beginSession(at: target, resetClock: false)
+            } catch {
+                completion?(.failure(error))
+                return
+            }
+            self.lock.lock()
+            // A seek to a new position has to decode and re-prepare too, so resuming goes
+            // through the same gate as a first play rather than starting the clock into a gap.
+            // `beginSession` has already moved the sound and the clock to `target`.
+            self.playRequested = wasPlaying
+            self.lock.unlock()
+            if !wasPlaying { self.clock.pause() }
+            completion?(.success(()))
+        }
     }
 
     /// Stop and release everything.
+    ///
+    /// The session is **detached** here, on the caller's thread, because that is what makes the
+    /// picture stop and it is a single pointer write. The join and the decoder close — the parts
+    /// that block — go to ``sessionQueue``, where they cannot hold up the caller. Anything already
+    /// queued is invalidated first: a build that is about to run belongs to a film that is no
+    /// longer open.
     public func stop() {
         lock.lock()
         let current = session
@@ -289,10 +454,14 @@ public final class PlaybackController: @unchecked Sendable {
         playRequested = false
         firstFrameReady = false
         lock.unlock()
+        _ = nextToken()
+        stopWatchdog()
         guard let current else { return }
-        tearDown(current, wait: true)
-        audio?.pause()
-        clock.stop()
+        sessionQueue.async { [self] in
+            tearDown(current, wait: true)
+            audio?.pause()
+            clock.stop()
+        }
     }
 
     /// Which frame counters a status should carry.
@@ -366,6 +535,12 @@ public final class PlaybackController: @unchecked Sendable {
     // MARK: - Sessions
 
     private func beginSession(at seconds: Double, resetClock: Bool) throws {
+        // The invariant this whole file depends on, stated where it can be enforced: exactly one
+        // build at a time, on one queue. Every caller above goes through `sessionQueue` — `start`
+        // with `sync`, everything else with `async` — so a seek, a watchdog narrowing and an
+        // end-of-film restart cannot interleave and tear down each other's sessions.
+        dispatchPrecondition(condition: .onQueue(sessionQueue))
+
         lock.lock()
         let previous = session
         session = nil
@@ -374,11 +549,10 @@ public final class PlaybackController: @unchecked Sendable {
 
         let outputRate = configuration.outputRate
         let sourceRate = info.frameRate
-        // What the pipeline will actually be handed. The downscale is decided here, once,
+        // What the pipeline will actually be handed. The resolution is decided here, once,
         // and everything downstream — the buffers, the sink, the presentation size — is
         // built from this rather than from the file's own dimensions.
-        let presentation = Self.presentationSize(for: info,
-                                                 downscale: configuration.downscaleTo1080p)
+        let presentation = resolveInterpolation()
         let planner = IntervalPlanner(source: sourceRate, output: outputRate)
 
         // Which source frame to start from, and therefore which output frame the run's
@@ -506,6 +680,7 @@ public final class PlaybackController: @unchecked Sendable {
     private func startPlaying() {
         audio?.play()
         clock.play()
+        startWatchdog()
     }
 
     /// Start the film again from the beginning, after it has ended.
@@ -516,10 +691,17 @@ public final class PlaybackController: @unchecked Sendable {
     /// again — with sound, a picture that starts a second and a third behind the soundtrack
     /// and never catches up.
     private func restart() {
-        try? beginSession(at: 0, resetClock: false)
+        // The play request is armed *before* the build is queued, so that the first frame of the
+        // new session finds it already waiting — `firstFrameArrived` is what honours it, and it
+        // can arrive on the presenter's thread the moment the session starts producing.
+        let token = nextToken()
         lock.lock()
         playRequested = true
         lock.unlock()
+        sessionQueue.async { [weak self] in
+            guard let self, self.isCurrent(token) else { return }
+            try? self.beginSession(at: 0, resetClock: false)
+        }
     }
 
     private func finish(_ report: DisplayPresenter.Report, session: Session) {
@@ -559,6 +741,120 @@ public final class PlaybackController: @unchecked Sendable {
         lock.unlock()
     }
 
+    // MARK: - The rate watchdog
+
+    /// Begin watching the presented rate. Idempotent, and a no-op unless the policy asked to be
+    /// measured: `.source` and `.p1080` are *instructions*, and a player that quietly narrows a
+    /// size the user chose is a player that lied about a setting.
+    private func startWatchdog() {
+        guard configuration.resolutionPolicy == .automatic else { return }
+        lock.lock()
+        guard watchdog == nil else { lock.unlock(); return }
+        let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        timer.schedule(deadline: .now() + Self.watchdogInterval,
+                       repeating: Self.watchdogInterval)
+        timer.setEventHandler { [weak self] in self?.checkRate() }
+        // Resumed before it is stored, so nothing can ever cancel a suspended source — which
+        // traps rather than failing.
+        timer.resume()
+        watchdog = timer
+        lock.unlock()
+    }
+
+    private func stopWatchdog() {
+        lock.lock()
+        let timer = watchdog
+        watchdog = nil
+        watchdogSample = nil
+        shortSamples = 0
+        lock.unlock()
+        timer?.cancel()
+    }
+
+    /// One sample: what has the picture actually done since the last one?
+    private func checkRate() {
+        let state = status
+        lock.lock()
+        let ready = firstFrameReady
+        lock.unlock()
+
+        // Nothing to judge while the film is paused, and nothing to judge while a session is
+        // being rebuilt: a rebuild is a second with no frames in it *by construction*, and
+        // counting that as a shortfall would narrow the picture because the player rebuilt.
+        guard state.state == .playing, ready else {
+            lock.lock()
+            watchdogSample = nil
+            shortSamples = 0
+            lock.unlock()
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let previous = watchdogSample
+        watchdogSample = (shown: state.shown, at: now)
+        lock.unlock()
+
+        guard let previous, now > previous.at else { return }
+        let achieved = Double(state.shown - previous.shown) / (now - previous.at)
+        let target = configuration.outputRate.doubleValue
+        guard target > 0 else { return }
+
+        guard achieved < target * Self.watchdogTolerance else {
+            lock.lock(); shortSamples = 0; lock.unlock()
+            return
+        }
+
+        lock.lock()
+        shortSamples += 1
+        let patience = shortSamples
+        let taken = narrowings
+        lock.unlock()
+        guard patience >= Self.watchdogPatience, taken < Self.maximumNarrowings else { return }
+        narrow()
+    }
+
+    /// Give up one rung of the ladder and rebuild the session at the same instant of film.
+    private func narrow() {
+        lock.lock()
+        let current = (resolved ?? info).width
+        lock.unlock()
+
+        guard let next = InterpolationWidth.narrower(than: current, sourceWidth: info.width) else {
+            // Already on the narrowest rung. Stop asking: there is nothing left to give, and a
+            // check every second and a half that can only rebuild forever is worse than a
+            // picture that is honestly short of the rate.
+            lock.lock(); narrowings = Self.maximumNarrowings; lock.unlock()
+            return
+        }
+
+        let narrowed = InterpolationWidth.scaled(info, toWidth: next)
+        let at = clock.mediaTime
+        lock.lock()
+        resolved = narrowed
+        narrowings += 1
+        shortSamples = 0
+        watchdogSample = nil
+        lock.unlock()
+
+        record("the picture did not hold \(configuration.outputRate) at \(current) wide, so it was "
+               + "lowered to \(narrowed.width)x\(narrowed.height); the film keeps playing from the "
+               + "same instant")
+
+        // The sound keeps playing. `beginSession` moves it to `at`, which is where it already is,
+        // so what the viewer sees is a hitch in the picture rather than a jump in the film.
+        //
+        // Queued on the session queue, where a rebuild and a user's seek cannot overlap. It takes
+        // a token like every other request, so a seek issued while this is queued wins — which is
+        // the right answer, because the seek is the more recent statement of where the film should
+        // be, and `resolved` has already been narrowed for whichever session builds next.
+        let token = nextToken()
+        sessionQueue.async { [weak self] in
+            guard let self, self.isCurrent(token) else { return }
+            try? self.beginSession(at: at, resetClock: false)
+        }
+    }
+
     // MARK: - Arithmetic
 
     /// Intervals of lead-in a run reads before its first rendered interval.
@@ -567,17 +863,98 @@ public final class PlaybackController: @unchecked Sendable {
     /// before it can judge an interval the way the whole-film render would.
     static let leadInIntervals = 31
 
+    /// The size the pipeline will be handed, decided once per film.
+    ///
+    /// `.automatic` runs a **real calibration** here: a short measured probe of the actual
+    /// pipeline, on the actual film, at each rung of the width ladder, widest first, stopping at
+    /// the first that fits the film's budget. It is the same question SVP answers with
+    /// `fi_auto: true`, answered once at load rather than continuously.
+    ///
+    /// It runs *before the clock starts*, and that placement is load-bearing. Invariant 36 says a
+    /// player must not start its clock before the first frame exists; a calibration run during
+    /// playback would be a hitch in the film rather than a delay before it. It also has to happen
+    /// before the source is built, because the width is what the decoder is told to scale to.
+    ///
+    /// The answer is cached, so a seek does not pay for it again.
+    private func resolveInterpolation() -> MediaInfo {
+        lock.lock()
+        let cached = resolved
+        lock.unlock()
+        if let cached { return cached }
+
+        let chosen: MediaInfo
+        switch configuration.resolutionPolicy {
+        case .source, .p1080:
+            chosen = Self.presentationSize(for: info, policy: configuration.resolutionPolicy)
+
+        case .automatic:
+            // Probe a little way in rather than at frame zero. An opening logo is static, and
+            // while the engine's cost is close to content-independent — measured at 106.8 against
+            // 104.7 ms/interval between a bright desert scene and a dark one — there is no reason
+            // to measure the one part of a film that is not representative.
+            let probeStart = min(30, max(0, info.duration * 0.1))
+            let (choice, scaled) = PlaybackCalibrator.calibrate(
+                url: url, info: info,
+                sourceRate: info.frameRate,
+                outputRate: configuration.outputRate,
+                depth: configuration.depth,
+                startSeconds: probeStart)
+            chosen = scaled
+            lock.lock()
+            calibration = choice
+            lock.unlock()
+            if choice.fellBack {
+                record("no interpolation size held the film's rate on this machine; "
+                       + "using \(choice.width) wide, which will drop frames")
+            }
+        }
+
+        lock.lock()
+        resolved = chosen
+        lock.unlock()
+        return chosen
+    }
+
+    /// What the rate watchdog has seen, and what it has done about it.
+    ///
+    /// Exposed for the same reason the display layer's state is (see ``DisplayDiagnostics``): a
+    /// policy that is supposed to *give ground* when its prediction was wrong has to be
+    /// observable while it is deciding. From outside, "it decided not to narrow", "it is not
+    /// running at all" and "it is narrowing but the width is not sticking" are the same silence,
+    /// and they have three different fixes.
+    public var resolutionReport: (width: Int, calibrated: Bool, watching: Bool,
+                                  narrowings: Int, shortSamples: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return ((resolved ?? info).width, calibration != nil, watchdog != nil,
+                narrowings, shortSamples)
+    }
+
+    /// The size the picture is interpolated at, and what decided it.
+    ///
+    /// Kept out of ``Status`` on purpose: it is a property of the *film and the machine* rather
+    /// than of the moment. It does not change while the film plays, so it does not belong in the
+    /// thing a UI polls ten times a second.
+    public var interpolationSize: (width: Int, height: Int,
+                                   policy: PlaybackResolutionPolicy, calibrated: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        let size = resolved ?? info
+        return (size.width, size.height, configuration.resolutionPolicy, calibration != nil)
+    }
+
     /// The size the pipeline will be handed, after any downscale.
     ///
     /// Height is forced **even**. 4:2:0 chroma is subsampled by two in both directions, so an
     /// odd height is not a slightly wrong picture — it is a frame the pixel format cannot
     /// describe, and the failure arrives far from here as a buffer that will not allocate.
     /// 3840×1632 halves to 1920×816, which happens to be even; a 2160-high source would not.
-    static func presentationSize(for info: MediaInfo, downscale: Bool) -> MediaInfo {
-        guard downscale, info.width > 1920 else { return info }
-        let factor = 1920.0 / Double(info.width)
-        let height = max(2, Int((Double(info.height) * factor).rounded()) & ~1)
-        return info.scaled(toWidth: 1920, height: height)
+    ///
+    /// `.automatic` is **not** answered here. Its width comes from a measurement rather than
+    /// from the policy, and a pure function cannot measure anything — see
+    /// ``resolveInterpolation()``.
+    static func presentationSize(for info: MediaInfo,
+                                 policy: PlaybackResolutionPolicy) -> MediaInfo {
+        guard let width = policy.fixedWidth else { return info }
+        return InterpolationWidth.scaled(info, toWidth: width)
     }
 
     /// The seek instant that lands on a given frame.

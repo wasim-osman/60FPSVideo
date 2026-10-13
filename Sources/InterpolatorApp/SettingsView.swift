@@ -1,3 +1,4 @@
+import Combine
 import Interpolator
 import SwiftUI
 
@@ -8,6 +9,15 @@ import SwiftUI
 /// invites the user to undo the measurement.
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+
+    /// The screens attached right now.
+    ///
+    /// Held in `@State` rather than read inline because ``DisplayList/connected`` walks
+    /// `NSScreen.screens` and every mode of every display — cheap, but not something to do once
+    /// per body evaluation, and not something whose *result* should change silently while the
+    /// picker is open. It is refreshed when the window server says the screen arrangement
+    /// changed, which is the event that actually invalidates it.
+    @State private var displays: [DisplayList.Display] = []
 
     var body: some View {
         @Bindable var model = model
@@ -26,17 +36,38 @@ struct SettingsView: View {
             }
 
             Section("Playback") {
-                Picker("Interpolate at", selection: $model.settings.interpolateAtFullResolution) {
-                    Text("The film's own resolution").tag(true)
-                    Text("1080p").tag(false)
+                Picker("Interpolate at", selection: $model.settings.playbackResolution) {
+                    ForEach(PlaybackResolutionPolicy.allCases) { policy in
+                        Text(policy.label).tag(policy)
+                    }
                 }
-                .onChange(of: model.settings.interpolateAtFullResolution) {
+                .onChange(of: model.settings.playbackResolution) {
                     model.reloadForSettingsChange()
                 }
-                Text("At 4K an interval costs 104.7 ms against the 41.7 ms the film spends on "
-                     + "one, so about half the intervals are skipped and the picture judders. "
-                     + "1080p is a quarter of the work and plays smoothly. Batch conversion is "
-                     + "unaffected — it always writes at the source's resolution.")
+                Text(model.settings.playbackResolution.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("At 4K an interval costs 104.7 ms against the 41.7 ms the film spends "
+                     + "playing one. Automatic measures the film and picks the widest size that "
+                     + "still holds real time — the job SVP's fi_auto does — which on this "
+                     + "machine is 1920 wide. Full keeps true 4K and accepts the dropped frames.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                // Routed through the model rather than written straight to the settings, because
+                // the layer has to be told as well — and there are two ways in (here and the
+                // player's readout), so there is one method that does both.
+                Picker("Fit the picture", selection: Binding(
+                    get: { model.settings.playbackFitMode },
+                    set: { model.setPlaybackFitMode($0) })) {
+                    ForEach(FitMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                Text(model.settings.playbackFitMode.detail
+                     + " The same two modes a conversion writes with, so what is on screen here "
+                     + "is what a file will look like. Changing it takes effect on the next "
+                     + "frame — unlike the size above, which rebuilds the session.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -67,12 +98,29 @@ struct SettingsView: View {
             }
 
             Section("Quality") {
+                Picker("Conversion", selection: $model.settings.conversionQuality) {
+                    ForEach(ConversionQuality.allCases) { quality in
+                        Text(quality.label).tag(quality)
+                    }
+                }
+                Text(model.settings.conversionQuality.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if model.settings.conversionQuality == .fast {
+                    Text("Fast interpolates at 1080p. What the file comes out as is the next "
+                         + "setting down, not this one — so Fast plus a 4K delivery is a real "
+                         + "combination, and it is the cheap way to get one.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Toggle("Detect scene cuts", isOn: $model.settings.sceneDetection)
                 Text("Both engines double-expose across a cut, so the interpolations there are "
                      + "turned into held frames. Off only to see why it is needed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            outputSizeSection
 
             folderAccessSection
 
@@ -176,6 +224,121 @@ struct SettingsView: View {
         // prompt for every folder macOS has never been answered about — measured, one dialog
         // at a time, Desktop then Documents then Downloads. The row offers to ask instead.
         .task { model.refreshFolderAccess() }
+    }
+
+    // MARK: - Output size
+
+    /// The size a converted file comes out at — a different question from the size it was
+    /// interpolated at, and the one that decides whether a film is right for a particular screen.
+    ///
+    /// ## Why the screens are listed by name
+    ///
+    /// Because "3440 × 1440" is not something a person knows about their own television, and
+    /// because getting it wrong is invisible until the file is played somewhere else. The rows
+    /// are the connected displays, and the number beside each is the number the app measured for
+    /// it — `CGDisplayPixelsWide/High`, which is not the largest mode the display accepts. On
+    /// this machine those differ by 38% for the ultrawide. See ``DisplayList``.
+    ///
+    /// ## Why this is one setting for the queue and not one per film
+    ///
+    /// A queue is a run of films for one screen. Asking per film would mean answering the same
+    /// question once per file, and the answer would be the same every time. The queue's footer
+    /// states the current answer, so the choice is visible where the jobs are rather than only
+    /// here.
+    @ViewBuilder
+    private var outputSizeSection: some View {
+        // Declared here rather than reached for from `body`: `@Bindable` is a local, and a
+        // computed property is a separate scope. Without it `$model.settings…` does not resolve
+        // and the picker has no binding.
+        @Bindable var model = model
+        let choice = OutputTargetChoice.resolve(from: model.settings.batchOutputSize)
+
+        Section("Output size") {
+            Picker("Deliver at", selection: targetChoiceBinding(choice)) {
+                Text("The film's own size").tag(OutputTargetChoice.source.tag)
+                ForEach(displays) { display in
+                    Text(display.fileLabel).tag(OutputTargetChoice.display(display.id).tag)
+                }
+                // A remembered size that matches no connected screen still gets a row, because
+                // it is still the setting. A picker whose selection has no matching tag shows a
+                // blank row and silently changes the setting when the menu is dismissed, which
+                // is a worse answer than an extra line.
+                if case .size(let size) = choice {
+                    Text("\(size.label) — remembered").tag(OutputTargetChoice.size(size).tag)
+                }
+            }
+            .onChange(of: model.settings.batchOutputSize) {
+                model.reloadForSettingsChange()
+            }
+
+            HStack {
+                Text("Fit")
+                Picker("Fit", selection: $model.settings.batchFitMode) {
+                    ForEach(FitMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+            Text(model.settings.batchFitMode.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text(outputSizeExplanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if model.settings.batchOutputSize == nil {
+                Text("Conversions deliver exactly what was interpolated, at the quality chosen "
+                     + "above. This is the behaviour every measurement in the reports was taken "
+                     + "with, and the cheapest setting here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { displays = DisplayList.connected }
+        .onReceive(NotificationCenter.default
+            .publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
+            displays = DisplayList.connected
+        }
+    }
+
+    /// The picker's selection, as a string tag in both directions.
+    ///
+    /// The stored value is an `OutputSize`; the tags are strings, because a `CGDirectDisplayID`
+    /// is only meaningful while the display is attached and a size is meaningful forever. The
+    /// conversion is ``OutputTargetChoice``'s job and this is the only place it is wired to a
+    /// control, so there is one path in and one path out.
+    private func targetChoiceBinding(_ choice: OutputTargetChoice) -> Binding<String> {
+        Binding(get: { choice.tag },
+                set: { tag in
+                    guard let picked = OutputTargetChoice(tag: tag) else { return }
+                    model.settings.batchOutputSize = picked.target
+                })
+    }
+
+    /// What the setting does, in the numbers it was chosen by.
+    ///
+    /// States the arithmetic for the film that is actually loaded, when there is one, because a
+    /// generic sentence about aspect ratios is not what a user needs before starting a four-hour
+    /// job — they need to know whether *this* film comes out with bars or with the sides cut off.
+    private var outputSizeExplanation: String {
+        var text = "Interpolation cost is a step function of frame width, so the size a file is "
+            + "interpolated at and the size it is delivered at are two separate questions. "
+            + "Delivering 3440 × 1440 from a 1080p interpolation costs 2.7 ms per frame for the "
+            + "upscale against 37 ms for the interpolation itself."
+        if let film = model.film, let target = model.settings.batchOutputSize {
+            let geometry = OutputGeometry.fitting(
+                source: OutputSize(width: film.info.width, height: film.info.height),
+                target: target,
+                mode: model.settings.batchFitMode)
+            text += "\n\n\(film.name) is \(film.info.width) × \(film.info.height): "
+                + "\(geometry.summary)."
+        } else if model.film == nil {
+            text += "\n\nNo film is loaded, so the effect on one cannot be shown yet."
+        }
+        return text
     }
 
     // MARK: - Speed
@@ -328,11 +491,12 @@ struct AboutView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("2 h film, 23.976 → 59.94")
                             .font(.caption.weight(.semibold))
-                        Text("1080p batch · 1.6 h     4K batch · 3.8 h")
+                        Text("Quality (source resolution) · 2.1 h     Fast (1080p) · 0.5 h")
                             .font(.system(.caption, design: .monospaced))
-                        Text("4K playback · ~half the intervals skipped, ~19 fps presented, "
-                             + "a fifth of a second of picture behind the sound, permanently "
-                             + "and without growth.")
+                        Text("Playback · **Automatic** interpolates at 1920 wide and holds real "
+                             + "time — the engine sustains 75.8 output fps against the 59.94 "
+                             + "needed. Full 4K sustains 34.5 fps, so about half the intervals "
+                             + "are skipped; that is still one click away.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

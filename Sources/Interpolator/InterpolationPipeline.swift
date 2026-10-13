@@ -213,6 +213,65 @@ public final class InterpolationPipeline: @unchecked Sendable {
         }
     }
 
+    /// Where the driving thread's time went, in seconds.
+    ///
+    /// ## Why this exists
+    ///
+    /// A conversion that uses a fifth of the CPU and two thirds of the GPU is not short of
+    /// compute — it is *waiting* for something, and which something cannot be read off the
+    /// activity monitors. `top` shows four cores busy and a GPU that is not saturated whether
+    /// the pipeline is blocked on the decoder, on the engine pool, or on its own single-threaded
+    /// bookkeeping; the three look identical from outside and have opposite fixes.
+    ///
+    /// The discriminator is ``slotWait``. The driver holds a slot from before it loads a frame
+    /// until the engine's completion releases it, so time spent waiting for a free slot is time
+    /// the *pool* was the constraint. If that number is near zero and the others sum to the wall
+    /// time, the pool was never the limit and the driver's own serial work is the ceiling — which
+    /// means adding sessions cannot help and only removing work from the driver can.
+    ///
+    /// Measured on the real 4K HDR film at four sessions, this is what settled it: the driver's
+    /// own load-and-sign work was **40.8 ms of every 42 ms**, and the pool wait was **0.0 s over
+    /// the whole run**. See BUILD-DECISIONS §28.
+    public struct StageCosts: Sendable, Equatable {
+        /// Blocked in `source.read` — the decoder, or the pipe.
+        public var read = 0.0
+        /// Computing frame signatures for scene detection.
+        public var signature = 0.0
+        /// Copying packed frames into the engine's `CVPixelBuffer`s.
+        public var load = 0.0
+        /// Waiting for a free slot: the engine pool, or whatever the completions are waiting on.
+        public var slotWait = 0.0
+        /// Inside `engine.submit`.
+        public var submit = 0.0
+        /// Handing passthrough frames to the sink.
+        public var passthrough = 0.0
+
+        public init() {}
+
+        /// A segmented job renders one segment at a time, so its report is the sum of its
+        /// pieces. Without this the aggregate would have to be assembled field by field at the
+        /// call site, which is how a field gets left out.
+        public static func + (lhs: StageCosts, rhs: StageCosts) -> StageCosts {
+            var total = StageCosts()
+            total.read = lhs.read + rhs.read
+            total.signature = lhs.signature + rhs.signature
+            total.load = lhs.load + rhs.load
+            total.slotWait = lhs.slotWait + rhs.slotWait
+            total.submit = lhs.submit + rhs.submit
+            total.passthrough = lhs.passthrough + rhs.passthrough
+            return total
+        }
+
+        /// Everything the driver did that was not waiting for the pool. When this is the wall
+        /// time, the driver is the ceiling.
+        public var driverBusy: Double { read + signature + load + submit + passthrough }
+
+        public var summary: String {
+            String(format: "read %.1f  sign %.1f  load %.1f  submit %.1f  pass %.1f  slotWait %.1f",
+                   read, signature, load, submit, passthrough, slotWait)
+        }
+    }
+
     /// What the run did.
     public struct Report: Sendable {
         public let sourceFrames: Int
@@ -226,6 +285,8 @@ public final class InterpolationPipeline: @unchecked Sendable {
         /// footage, which is where the disagreements nobody thought of live.
         public let decisions: [SceneChangeTracker.Decision]
         public let wallSeconds: Double
+        /// Where the driving thread spent `wallSeconds`. See ``StageCosts``.
+        public let stages: StageCosts
         /// Engine failures, in the order they were seen. The sink's own failures are
         /// the sink's to report.
         public let problems: [String]
@@ -423,6 +484,9 @@ public final class InterpolationPipeline: @unchecked Sendable {
         var held = 0
         var eof = false
 
+        // Where the driving thread's time goes. See ``StageCosts``.
+        let clock = StageClock()
+
         /// Read until absolute frame `absolute` is held, or the source ends.
         /// Returns whether it is held.
         func hold(_ absolute: Int) throws -> Bool {
@@ -433,7 +497,9 @@ public final class InterpolationPipeline: @unchecked Sendable {
                     break
                 }
                 let pointer = ring.pointers[(base + held) % ring.count]
-                guard try source.read(into: pointer) else {
+                var ok = false
+                try clock.measuring(.read) { ok = try source.read(into: pointer) }
+                guard ok else {
                     eof = true
                     break
                 }
@@ -442,10 +508,12 @@ public final class InterpolationPipeline: @unchecked Sendable {
                     // Signatures are computed on the way past, not in a second
                     // pass. A pipe cannot be rewound, and a second pass over a real
                     // file would mean decoding the whole film twice.
-                    let signature = FrameSignature.compute(
-                        luma: UnsafeRawPointer(pointer), format: format,
-                        width: width, height: height, bytesPerRow: packedLumaStride)
-                    decisions.append(contentsOf: tracker.push(signature))
+                    clock.measuring(.signature) {
+                        let signature = FrameSignature.compute(
+                            luma: UnsafeRawPointer(pointer), format: format,
+                            width: width, height: height, bytesPerRow: packedLumaStride)
+                        decisions.append(contentsOf: tracker.push(signature))
+                    }
                 }
             }
             return absolute < base + held
@@ -540,23 +608,27 @@ public final class InterpolationPipeline: @unchecked Sendable {
                     // for its second.
                     let engine = engines[slotIndex % engines.count]
                     // Invariant 17: acquired before the load, released in the completion.
-                    slotFree[slotIndex].wait()
+                    clock.measuring(.slotWait) { slotFree[slotIndex].wait() }
                     let slot = slots[slotIndex]
 
-                    format.load(packed: UnsafeRawPointer(ring.pointers[interval % ring.count]),
-                                into: slot.a, width: width, height: height)
-                    format.load(packed: UnsafeRawPointer(ring.pointers[(interval + 1) % ring.count]),
-                                into: slot.b, width: width, height: height)
+                    clock.measuring(.load) {
+                        format.load(packed: UnsafeRawPointer(ring.pointers[interval % ring.count]),
+                                    into: slot.a, width: width, height: height)
+                        format.load(packed: UnsafeRawPointer(ring.pointers[(interval + 1) % ring.count]),
+                                    into: slot.b, width: width, height: height)
+                    }
 
                     // Passthrough frames cost nothing and need no engine call. On
                     // 23.976 -> 59.94 that is one output frame in five, free.
-                    for frame in resolved {
-                        guard case .passthrough(let sourceIndex) = frame.kind else { continue }
-                        // `frame.index` is the film's output frame; the sink is writing this
-                        // run's file, which begins at zero.
-                        sink.write(sourceIndex == globalInterval ? slot.a : slot.b,
-                                   at: frame.index - outputBase)
-                        passthroughFrames += 1
+                    clock.measuring(.passthrough) {
+                        for frame in resolved {
+                            guard case .passthrough(let sourceIndex) = frame.kind else { continue }
+                            // `frame.index` is the film's output frame; the sink is writing this
+                            // run's file, which begins at zero.
+                            sink.write(sourceIndex == globalInterval ? slot.a : slot.b,
+                                       at: frame.index - outputBase)
+                            passthroughFrames += 1
+                        }
                     }
 
                     let interpolations = resolved.filter { !$0.isPassthrough }
@@ -589,7 +661,7 @@ public final class InterpolationPipeline: @unchecked Sendable {
                                 problems.record("interval \(intervalIndex): \(error)")
                             }
                         }
-                        engine.submit(request)
+                        clock.measuring(.submit) { engine.submit(request) }
                         interpolatedFrames += interpolations.count
                     }
                     outputFrames += resolved.count
@@ -630,6 +702,7 @@ public final class InterpolationPipeline: @unchecked Sendable {
                       engineCalls: submitted,
                       decisions: decisions,
                       wallSeconds: wall,
+                      stages: clock.costs,
                       problems: problems.all)
     }
 }
@@ -679,6 +752,65 @@ private final class FrameRing {
 
     deinit {
         for pointer in pointers { pointer.deallocate() }
+    }
+}
+
+/// Where the driving thread's time went, accumulated as the run proceeds.
+///
+/// A class rather than a struct so the nested `hold` function and the loop can both add to
+/// it without either owning it. Deliberately unlocked: only the thread running `run` ever
+/// touches it, which is the same claim ``InterpolationPipeline`` already makes about itself.
+private final class StageClock {
+    /// The stages a driver iteration is divided into. An enum rather than a key path because
+    /// `self[keyPath:]` is not an assignable lvalue through a class reference — the compiler
+    /// rejects it as "left side of mutating operator isn't mutable".
+    enum Stage {
+        case read, signature, load, slotWait, submit, passthrough
+    }
+
+    var read = 0.0
+    var signature = 0.0
+    var load = 0.0
+    var slotWait = 0.0
+    var submit = 0.0
+    var passthrough = 0.0
+
+    /// Run `body`, adding its wall time to `stage`.
+    ///
+    /// `DispatchTime.now()` costs about 25 ns against the ~42 ms an interval costs at 4K, so
+    /// the instrument sits four orders of magnitude below the thing it measures — which is the
+    /// only condition under which a timer inside a hot loop is allowed to stay in the build.
+    ///
+    /// `rethrows`, so the one call site that reads from the decoder keeps its `try` and the
+    /// five that cannot fail do not have to carry one.
+    @inline(__always)
+    func measuring(_ stage: Stage, _ body: () throws -> Void) rethrows {
+        let start = DispatchTime.now().uptimeNanoseconds
+        defer { add(stage, Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9) }
+        try body()
+    }
+
+    @inline(__always)
+    private func add(_ stage: Stage, _ seconds: Double) {
+        switch stage {
+        case .read: read += seconds
+        case .signature: signature += seconds
+        case .load: load += seconds
+        case .slotWait: slotWait += seconds
+        case .submit: submit += seconds
+        case .passthrough: passthrough += seconds
+        }
+    }
+
+    var costs: InterpolationPipeline.StageCosts {
+        var costs = InterpolationPipeline.StageCosts()
+        costs.read = read
+        costs.signature = signature
+        costs.load = load
+        costs.slotWait = slotWait
+        costs.submit = submit
+        costs.passthrough = passthrough
+        return costs
     }
 }
 

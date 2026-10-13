@@ -136,6 +136,43 @@ struct DisplayPresenterTests {
         #expect(pts.value == 120 && pts.timescale == 60)
     }
 
+    /// The mark that stops the display layer scheduling frames itself.
+    ///
+    /// This is the regression guard for the backwards-seek freeze. It cannot reproduce the freeze
+    /// — that needs a real `AVSampleBufferDisplayLayer` on a real screen, and the measurement lives
+    /// in the report — but it pins the one thing that fixes it, so the fix cannot be dropped by a
+    /// later refactor of the wrapping code without a test going red.
+    @Test("a frame is marked for immediate display, so the layer does not schedule it")
+    func framesAreMarkedForImmediateDisplay() throws {
+        let buffer = makeBuffer()
+        var format: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                                     imageBuffer: buffer.buffer,
+                                                     formatDescriptionOut: &format)
+        let description = try #require(format)
+        let sample = try DisplayPresenter.sampleBuffer(imageBuffer: buffer.buffer,
+                                                       format: description,
+                                                       index: 7, rate: rate)
+
+        // `createIfNecessary: false`: the wrapping call has to have made it. Asking for it here
+        // would build an empty one and the test would pass against a presenter that never set it.
+        let attachments = try #require(CMSampleBufferGetSampleAttachmentsArray(sample,
+                                                                              createIfNecessary: false))
+        #expect(CFArrayGetCount(attachments) == 1)
+        let raw = try #require(CFArrayGetValueAtIndex(attachments, 0))
+        let dictionary = unsafeBitCast(raw, to: CFDictionary.self)
+
+        // Both sides spelled as `UnsafeRawPointer?`. `#expect` type-checks its own expansion, so
+        // the implicit promotions that would make this work in a plain `if` do not happen here —
+        // the two types have to match before the macro sees them, and `toOpaque()` is mutable.
+        let mark: UnsafeRawPointer? = CFDictionaryGetValue(
+            dictionary,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque())
+        let wanted: UnsafeRawPointer? = UnsafeRawPointer(
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        #expect(mark == wanted)
+    }
+
     // MARK: - What reaches the screen
 
     @Test("every frame is presented, in order, when the machine keeps up")

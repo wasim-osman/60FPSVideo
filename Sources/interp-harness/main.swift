@@ -91,6 +91,61 @@ func shortRead(frame: Int, expected: Int, got: Int) -> Never {
     fail("short read at frame \(frame): wanted \(expected) bytes, got \(got)")
 }
 
+// ---------------------------------------------------------------- --progress
+
+/// Rate-limits the progress callback.
+///
+/// The converter calls it once per interval — 172 627 times for a two-hour film — and writing
+/// a line per call would cost more than the interpolation does.
+final class Throttle: @unchecked Sendable {
+    private let lock = NSLock()
+    private let interval: TimeInterval
+    private var last: TimeInterval?
+
+    init(interval: TimeInterval) { self.interval = interval }
+
+    func allow() -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        defer { lock.unlock() }
+        guard last.map({ now - $0 >= interval }) ?? true else { return false }
+        last = now
+        return true
+    }
+}
+
+/// The estimator, behind a lock so the `@Sendable` callback can own it.
+final class EstimateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var estimator = ProgressEstimator()
+
+    func record(_ progress: BatchConverter.Progress) {
+        // Only the rendering stage. Probing and the audio work come *before* the render and
+        // carry no fraction; muxing and joining come after it. Feeding either into the window
+        // is exactly what `elapsed / fraction` got wrong.
+        guard progress.stage == .rendering, let fraction = progress.fraction else { return }
+        lock.lock()
+        estimator.observe(fraction: fraction, at: ProcessInfo.processInfo.systemUptime)
+        lock.unlock()
+    }
+
+    var remaining: TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return estimator.remaining
+    }
+}
+
+/// A duration as a rough human interval, matching the app's `Fmt.interval`.
+func interval(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds > 0 else { return "—" }
+    if seconds < 60 { return "less than a minute" }
+    if seconds < 90 { return "under two minutes" }
+    let minutes = seconds / 60
+    if minutes < 90 { return String(format: "%.0f minutes", minutes) }
+    return String(format: "%.1f hours", minutes / 60)
+}
+
 func parseOptions() -> Options {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 6 else {
@@ -102,10 +157,17 @@ func parseOptions() -> Options {
                                the batch converter end to end: probe the file,
                                interpolate it, encode it, mux the audio, report what was
                                delivered. Options: --policy standard|sixty, --bitrate BPS,
-                               --max-frames N, --start SECONDS, --overwrite,
-                               --force (convert even when already at target),
-                               --container mp4|mkv (default: from OUT's extension),
-                               --audio automatic|copy|transcode|drop.
+                       --max-frames N, --start SECONDS, --overwrite,
+                       --force (convert even when already at target),
+                       --quality quality|fast (quality = interpolate at the source
+                       resolution, fast = interpolate at 1080p),
+                       --output-size WxH (deliver at that size, independent of
+                       --quality; the interpolation size is unchanged),
+                       --fit | --fill (bars, or crop, when the shapes differ),
+                       --workers N (0 asks the machine),
+                       --activity (hold the app's no-throttling assertion),
+                       --container mp4|mkv (default: from OUT's extension),
+                       --audio automatic|copy|transcode|drop.
           --encode IN.packed OUT.mp4 W H [options]
                                encode a packed stream without interpolating. Options:
                                --format, --rate, --bitrate, --max-frames,
@@ -645,12 +707,17 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     var start: Double? = nil
     var depth = 2
     var workers = 0
+    var quality = ConversionQuality.quality
+    var outputTarget = OutputTarget.source
+    var fitMode = FitMode.fit
     var overwrite = false
     var force = false
     var audioPolicy: AudioMuxPolicy? = nil
     var segmentSeconds: Double? = nil
     var restart = false
     var keepSegments = false
+    var activity = false
+    var showProgress = false
 
     let rest = Array(CommandLine.arguments.dropFirst(4))
     var k = 0
@@ -662,6 +729,30 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                 fail("--policy needs standard or sixty")
             }
             policy = named
+        case "--quality":
+            // The conversion-quality lever. `quality` interpolates at the source's resolution;
+            // `fast` interpolates at 1080p and writes 1080p. It exists on the harness so the
+            // speed-up can be measured on the real film rather than inferred from the curve.
+            k += 1
+            guard k < rest.count, let named = ConversionQuality(rawValue: rest[k]) else {
+                fail("--quality needs quality or fast")
+            }
+            quality = named
+        case "--output-size":
+            // The delivered size, which is deliberately independent of `--quality`. It exists on
+            // the harness so a screen-sized output can be measured on the real film — both its
+            // dimensions and where the bars land — rather than looked at in the app and believed.
+            k += 1
+            guard k < rest.count else { fail("--output-size needs WxH, e.g. 3440x1440") }
+            let parts = rest[k].lowercased().split { $0 == "x" || $0 == "×" || $0 == "*" }
+            guard parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 else {
+                fail("--output-size needs WxH, e.g. 3440x1440")
+            }
+            outputTarget = .fixed(OutputSize(width: w, height: h))
+        case "--fit":
+            fitMode = .fit
+        case "--fill":
+            fitMode = .fill
         case "--container":
             k += 1
             guard k < rest.count, let named = AudioMuxPolicy.named(rest[k]) else {
@@ -716,10 +807,20 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                 fail("--segment-seconds needs a positive number of seconds")
             }
             segmentSeconds = value
+        case "--activity":
+            // Hold the same assertion the app holds while a job runs, so its effect can be
+            // measured rather than asserted. See `AppModel.beginJobActivity` and invariant 47.
+            activity = true
         case "--restart":
             restart = true
         case "--keep-segments":
             keepSegments = true
+        case "--progress":
+            // Print the bar and the projection the app would show. It exists so the estimate can
+            // be checked against a real film's real clock rather than against a fixture — the
+            // whole point of the estimator is how it behaves over hours, and no unit test can
+            // wait for that.
+            showProgress = true
         default:
             fail("unknown option '\(rest[k])'")
         }
@@ -730,6 +831,9 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
         input: URL(fileURLWithPath: inputPath),
         output: URL(fileURLWithPath: outputPath),
         policy: policy,
+        quality: quality,
+        outputTarget: outputTarget,
+        fitMode: fitMode,
         bitRate: bitRate,
         depth: depth,
         workers: workers,
@@ -744,9 +848,45 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
 
     log("input  : \(inputPath)")
     log("output : \(outputPath)")
+    if case .fixed(let size) = outputTarget {
+        log("deliver: \(size.label)  (\(fitMode.label.lowercased()) into it)")
+    }
 
     do {
-        let result = try BatchConverter().run(request)
+        // The same assertion the app holds for the whole of a job — `AppModel.beginJobActivity`.
+        // It is here so that its effect can be *measured* rather than assumed: run this under
+        // `taskpolicy -b` with and without it. See invariant 47.
+        let hold = activity
+            ? ProcessInfo.processInfo.beginActivity(options: .userInitiated,
+                                                    reason: "harness conversion")
+            : nil
+        defer { if let hold { ProcessInfo.processInfo.endActivity(hold) } }
+
+        let result = try {
+            var converter = BatchConverter()
+            if showProgress {
+                // The same two pieces the app uses: a throttle, because this is called once per
+                // interval (172 627 times for a two-hour film), and an estimator fed **only** the
+                // rendering stage. Probing and the audio work come before the render and carry no
+                // fraction; muxing and joining come after it. Feeding either into the window is
+                // exactly the mistake `elapsed / fraction` made, and it reads long for hours.
+                let throttle = Throttle(interval: 1.0)
+                let estimator = EstimateBox()
+                converter.progress = { progress in
+                    guard throttle.allow() else { return }
+                    estimator.record(progress)
+                    let fraction = progress.fraction.map { String(format: "%5.1f%%", $0 * 100) } ?? "   —  "
+                    // The raw seconds as well as the human form: the app shows "about 2.0 hours"
+                    // and that is the right thing for a person, but a measurement needs the
+                    // number, and the number is what shows whether the projection converges.
+                    let left = estimator.remaining.map {
+                        String(format: "  about %@ left  (%.0f s)", interval($0), $0)
+                    } ?? ""
+                    log("  progress \(fraction)  \(progress.detail)\(left)")
+                }
+            }
+            return try converter.run(request)
+        }()
         let info = result.source
         log("probe  : \(info.width)x\(info.height)  \(info.frameRate)  "
             + "\(info.pixelFormat) -> \(info.format.bitDepth)-bit  "
@@ -816,6 +956,11 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                    + "-> %.1f h for a 2 h film",
                    result.wallSeconds, throughput,
                    172_627 / max(throughput, 0.0001) / 3600))
+        // Which stage owns the wall time. `slotWait` near zero with the rest summing to
+        // `wall` means the driver's own serial work is the ceiling — see `StageCosts`.
+        let stages = result.report.stages
+        log(String(format: "stages : %@   (driver busy %.1fs of %.1fs)",
+                   stages.summary, stages.driverBusy, result.wallSeconds))
         if !result.isClean {
             for problem in result.problems.prefix(10) { log("  problem: " + problem) }
             log("RESULT : \(result.problems.count) problem(s)")
@@ -845,11 +990,33 @@ private final class CountingDisplay: VideoDisplay, @unchecked Sendable {
     private var first: Double?
     private var last: Double?
 
+    /// A simulated cost, in milliseconds for a frame 1920 wide, **scaled by the frame's own pixel
+    /// count** — because the real cost is per pixel, not per frame.
+    ///
+    /// That distinction is the whole reason the rate watchdog can work at all: narrowing the
+    /// picture is only worth doing if it makes the thing that was too slow cheaper. A cost that
+    /// did not fall with the frame size would prove the detection and not the recovery.
+    ///
+    /// The real display does work no probe of the *pipeline* can see: it converts, scales and
+    /// composites, on the same GPU the engine is already saturating. This stub is how that cost is
+    /// put back into a headless run, and the only way to check the watchdog without a screen.
+    let costMilliseconds: Double
+
+    init(costMilliseconds: Double = 0) {
+        self.costMilliseconds = costMilliseconds
+    }
+
     var isReadyForMoreMediaData: Bool { true }
     var requiresFlushToResumeDecoding: Bool { false }
     func discardQueuedFrames() {}
 
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
+        if costMilliseconds > 0, let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            let relative = Double(CVPixelBufferGetWidth(pixels) * CVPixelBufferGetHeight(pixels))
+                / Double(1920 * 816)
+            let microseconds = costMilliseconds * relative * 1000
+            if microseconds >= 1 { usleep(UInt32(microseconds)) }
+        }
         let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         lock.lock()
         count += 1
@@ -864,6 +1031,194 @@ private final class CountingDisplay: VideoDisplay, @unchecked Sendable {
     }
 }
 
+// The playback calibration, on a real film, as the app performs it at load.
+//
+// `--play` below drives the pipeline directly and never asks `PlaybackController` a question, so
+// it cannot show what the *automatic* policy decides. This mode can: it walks the same ladder,
+// with the same budget and the same margin, against the same engine the player uses — and prints
+// every rung it probed, so the decision can be checked rather than taken on trust.
+// A pure measurement, with no policy in it: what does the engine cost per interval at each
+// width, on this film, right now?
+//
+// `--calibrate` answers "what will the app decide", which is the wrong question when the
+// question is "where does the ladder's step actually fall". This walks a list of widths and
+// reports each one, so a rung can be chosen from measurement rather than from a guess about
+// which widths are on the same tread of the cost curve.
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--measure-widths" {
+    let inputPath = CommandLine.arguments[2]
+    let input = URL(fileURLWithPath: inputPath)
+    var startSeconds = 0.0
+    var intervals = 20
+    var widths: [Int] = []
+
+    let rest = Array(CommandLine.arguments.dropFirst(3))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--start":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else {
+                fail("--start needs a number")
+            }
+            startSeconds = value
+        case "--intervals":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]), value > 0 else {
+                fail("--intervals needs a positive number")
+            }
+            intervals = value
+        case "--widths":
+            k += 1
+            guard k < rest.count else { fail("--widths needs a comma-separated list") }
+            widths = rest[k].split(separator: ",").compactMap { Int($0) }
+            guard !widths.isEmpty else { fail("--widths needs at least one number") }
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+    guard !widths.isEmpty else { fail("--widths is required") }
+
+    guard let info = try? MediaProbe.probe(input) else {
+        fail("could not probe \(inputPath)")
+    }
+    let outputRate = OutputRatePolicy.default.resolve(source: info.frameRate).output
+    let budget = InterpolationWidth.budget(sourceRate: info.frameRate)
+    let perInterval = Double(outputRate.numerator) * Double(info.frameRate.denominator)
+        / (Double(outputRate.denominator) * Double(info.frameRate.numerator))
+
+    log("input   : \(inputPath)")
+    log("format  : \(info.width)x\(info.height) \(info.format.bitDepth)-bit"
+        + " \(info.frameRate) -> \(outputRate)")
+    log(String(format: "budget  : %.2f ms per interval   (one interval of film time)", budget))
+    log(String(format: "output  : %.2f frames per interval", perInterval))
+    log(String(format: "probe   : %d intervals, warm-up 2, depth 2, start %.1f s",
+               intervals, startSeconds))
+    log("")
+    log("  width     scaled        ms/interval   engine fps   vs budget   spare")
+    for width in widths {
+        let scaled = InterpolationWidth.scaled(info, toWidth: width)
+        guard let m = try? PlaybackCalibrator.measure(
+            url: input, info: info, sourceRate: info.frameRate, outputRate: outputRate,
+            width: width, intervals: intervals, depth: 2, startSeconds: startSeconds) else {
+            log(String(format: "  %5d     %4d x %-4d   unmeasurable",
+                       width, scaled.width, scaled.height))
+            continue
+        }
+        let engineFPS = 1000.0 / m.millisecondsPerInterval * perInterval
+        log(String(format: "  %5d     %4d x %-4d   %7.2f       %6.1f       %5.2fx    %+7.2f ms",
+                   width, scaled.width, scaled.height, m.millisecondsPerInterval,
+                   engineFPS, budget / m.millisecondsPerInterval,
+                   budget - m.millisecondsPerInterval))
+    }
+    exit(0)
+}
+
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--calibrate" {
+    let inputPath = CommandLine.arguments[2]
+    let input = URL(fileURLWithPath: inputPath)
+    var startSeconds = 0.0
+    // The shipping defaults, so the harness reports the decision the app would make. They are
+    // overridable because the point of the harness is to be able to ask "what if".
+    var intervals = 20
+    var maximumProbes = 4
+    var margin = 0.9
+
+    let rest = Array(CommandLine.arguments.dropFirst(3))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--start":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else { fail("--start needs a number") }
+            startSeconds = value
+        case "--intervals":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]), value > 0 else {
+                fail("--intervals needs a positive number")
+            }
+            intervals = value
+        case "--probes":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]), value > 0 else {
+                fail("--probes needs a positive number")
+            }
+            maximumProbes = value
+        case "--margin":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]), value > 0 else {
+                fail("--margin needs a positive number")
+            }
+            margin = value
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+
+    guard let info = try? MediaProbe.probe(input) else {
+        fail("could not probe \(inputPath)")
+    }
+    let outputRate = OutputRatePolicy.default.resolve(source: info.frameRate).output
+    let budget = InterpolationWidth.budget(sourceRate: info.frameRate)
+    let candidates = InterpolationWidth.candidates(sourceWidth: info.width)
+
+    log("input   : \(inputPath)")
+    log("format  : \(info.width)x\(info.height) \(info.format.bitDepth)-bit"
+        + " \(info.frameRate) -> \(outputRate)")
+    log(String(format: "budget  : %.2f ms per interval   (one interval of film time)", budget))
+    log(String(format: "margin  : %.2f  ->  a rung must measure <= %.2f ms", margin, budget * margin))
+    log("ladder  : \(candidates.map(String.init).joined(separator: " -> "))")
+
+    // One interval of film time produces `perInterval` output frames, so the output rate a probe
+    // can sustain is not its interval rate — it is that, times this. Printing the interval rate
+    // alone invites reading 30/s as "30 fps" and concluding the rate is missed by half.
+    let perInterval = Double(outputRate.numerator) * Double(info.frameRate.denominator)
+        / (Double(outputRate.denominator) * Double(info.frameRate.numerator))
+    log(String(format: "output  : %.2f frames per interval", perInterval))
+    log("")
+
+    var probed = 0
+    let choice = PlaybackCalibrator.choose(candidates: candidates, budget: budget,
+                                           margin: margin,
+                                           maximumProbes: maximumProbes) { width in
+        probed += 1
+        let measurement = try? PlaybackCalibrator.measure(
+            url: input, info: info, sourceRate: info.frameRate, outputRate: outputRate,
+            width: width, intervals: intervals, depth: 2, startSeconds: startSeconds)
+        guard let measurement else {
+            log(String(format: "  probe %d   %4d wide                    unmeasurable",
+                       probed, width))
+            return nil
+        }
+        let fits = measurement.millisecondsPerInterval <= budget * margin
+        let outputFPS = 1000.0 / measurement.millisecondsPerInterval * perInterval
+        log(String(format: "  probe %d   %4d x %-4d  %7.2f ms/interval  %6.1f output fps"
+                       + "  %4.2fx real time  %@",
+                   probed, measurement.width, measurement.height,
+                   measurement.millisecondsPerInterval,
+                   outputFPS, budget / measurement.millisecondsPerInterval,
+                   fits ? "fits" : "too slow"))
+        return measurement.millisecondsPerInterval
+    }
+
+    let scaled = InterpolationWidth.scaled(info, toWidth: choice.width)
+    log("")
+    if let ms = choice.millisecondsPerInterval {
+        log(String(format: "choice  : %d x %d   %.2f ms/interval   %.1f output fps"
+                       + "   %.2fx real time   (%d probes)",
+                   scaled.width, scaled.height, ms, 1000.0 / ms * perInterval,
+                   budget / ms, choice.probes))
+    } else {
+        log(String(format: "choice  : %d x %d   FELL BACK (%d probes)",
+                   scaled.width, scaled.height, choice.probes))
+    }
+    log("verdict : " + (choice.fellBack
+        ? "no probed width holds the rate; the narrowest was taken"
+        : "\(scaled.width) wide holds \(outputRate)"))
+    exit(0)
+}
+
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     let inputPath = CommandLine.arguments[2]
     let input = URL(fileURLWithPath: inputPath)
@@ -874,6 +1229,8 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     var withSound = false
     var startSeconds = 0.0
     var prepareOnly = false
+    var displayCost = 0.0
+    var policy = PlaybackResolutionPolicy.automatic
 
     let rest = Array(CommandLine.arguments.dropFirst(3))
     var k = 0
@@ -895,6 +1252,12 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
             withSound = true
         case "--prepare-only":
             prepareOnly = true
+        case "--display-cost":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]), value >= 0 else {
+                fail("--display-cost needs a non-negative number of milliseconds")
+            }
+            displayCost = value
         case "--rate":
             k += 1
             guard k < rest.count else { fail("--rate needs a value") }
@@ -905,6 +1268,14 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
             depth = value
         case "--no-scene-detect":
             sceneDetection = false
+        case "--policy":
+            k += 1
+            guard k < rest.count,
+                  let parsed = PlaybackResolutionPolicy(rawValue: rest[k]) else {
+                fail("--policy needs one of "
+                     + PlaybackResolutionPolicy.allCases.map(\.rawValue).joined(separator: "|"))
+            }
+            policy = parsed
         default:
             fail("unknown option '\(rest[k])'")
         }
@@ -927,6 +1298,7 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
     log("format : \(info.width)x\(info.height) \(info.format.bitDepth)-bit \(info.pixelFormat)"
         + " \(info.frameRate) -> \(outputRate)")
     log("length : \(String(format: "%.1f", info.duration)) s")
+    log("policy : \(policy.label)")
     if startSeconds > 0 {
         log(String(format: "start  : %.1f s", startSeconds))
     }
@@ -971,12 +1343,16 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
         }
     }
 
-    let display = CountingDisplay()
+    let display = CountingDisplay(costMilliseconds: displayCost)
+    if displayCost > 0 {
+        log(String(format: "display: %.1f ms of simulated cost per frame", displayCost))
+    }
     let controller = PlaybackController(
         url: input, display: display,
         configuration: .init(outputRate: outputRate, depth: depth,
                              sceneDetection: sceneDetection,
-                             startSeconds: startSeconds),
+                             startSeconds: startSeconds,
+                             resolutionPolicy: policy),
         info: info,
         audio: audio)
 
@@ -1044,6 +1420,12 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
                advanced, shown, wall > 0 ? Double(shown) / wall : 0))
     log(String(format: "first  : the first frame carried film time %.2f s",
                stats.first ?? 0))
+    // Where the player *ended up*, which is not necessarily where it started: the rate watchdog
+    // narrows the picture when the rate does not hold, and this is the only line that can show it.
+    let size = controller.interpolationSize
+    log(String(format: "size   : interpolated at %d x %d   (%@%@)",
+               size.width, size.height, size.policy.label,
+               size.calibrated ? ", calibrated" : ""))
     if let soundAtEnd {
         // With sound attached the clock *is* the sound, so this is the A/V relationship
         // itself rather than a coincidence: whatever the picture's last frame carries, the
@@ -1096,6 +1478,192 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--play" {
                verdict, pictureRate, span, lag * 1000))
     for failure in failures { log("       \(failure)") }
     exit(verdict == "PASS" ? 0 : 1)
+}
+
+// ---------------------------------------------------------------- seek cost
+
+/// How long a seek blocks its caller, and how long until the picture comes back.
+///
+/// A seek is not a move of the playhead: it tears the whole session down — both threads joined,
+/// the decoder closed — and builds a new one, which means spawning ffmpeg and asking it to seek
+/// into the file. **This is the number that decides whether a player freezes when the playhead is
+/// grabbed**, because the app used to run this work on the main thread, which is where the window
+/// is drawn.
+///
+/// And the cost is not a constant, because `FFmpegFrameSource` seeks with `-ss` **before** `-i`:
+/// ffmpeg jumps to the keyframe at or before the target and then decodes forward to it. How far
+/// back that keyframe is depends on where in the film the target happens to land — which is
+/// exactly why the reported freeze is intermittent rather than every time. This mode puts a
+/// number on it instead of a theory.
+///
+/// Since the fix, `seek` returns immediately and the rebuild runs on the controller's own session
+/// queue, so the **blocked** column should read ~0 and the work shows up only in the **to first
+/// frame** column. `--block` waits for the completion on a semaphore, which restores the old
+/// synchronous behaviour and is how the before and after are compared on one machine.
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--seek-cost" {
+    let inputPath = CommandLine.arguments[2]
+    let input = URL(fileURLWithPath: inputPath)
+
+    var positions: [Double] = []
+    var outputRateText = "auto"
+    var depth = 2
+    var settle = 1.5
+    var timeout = 25.0
+    var withSound = false
+    var blockOnSeek = false
+
+    let rest = Array(CommandLine.arguments.dropFirst(3))
+    var k = 0
+    while k < rest.count {
+        switch rest[k] {
+        case "--at":
+            k += 1
+            guard k < rest.count else { fail("--at needs a comma-separated list") }
+            positions = rest[k].split(separator: ",").compactMap { Double($0) }
+        case "--sound":
+            withSound = true
+        case "--block":
+            blockOnSeek = true
+        case "--rate":
+            k += 1
+            guard k < rest.count else { fail("--rate needs a value") }
+            outputRateText = rest[k]
+        case "--depth":
+            k += 1
+            guard k < rest.count, let value = Int(rest[k]) else { fail("--depth needs a number") }
+            depth = value
+        case "--settle":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else { fail("--settle needs a number") }
+            settle = value
+        case "--timeout":
+            k += 1
+            guard k < rest.count, let value = Double(rest[k]) else { fail("--timeout needs a number") }
+            timeout = value
+        default:
+            fail("unknown option '\(rest[k])'")
+        }
+        k += 1
+    }
+    guard !positions.isEmpty else { fail("--at needs at least one position") }
+
+    guard let info = try? MediaProbe.probe(input) else { fail("could not probe \(inputPath)") }
+    let outputRate: FrameRate
+    if outputRateText.lowercased() == "auto" {
+        outputRate = OutputRatePolicy.default.resolve(source: info.frameRate).output
+    } else if let parsed = FrameRate.parse(outputRateText) {
+        outputRate = parsed
+    } else {
+        fail("bad rate '\(outputRateText)'")
+    }
+
+    func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e9 }
+
+    log("input  : \(inputPath)")
+    log("format : \(info.width)x\(info.height) \(info.format.bitDepth)-bit \(info.frameRate) -> \(outputRate)")
+    log("length : \(String(format: "%.1f", info.duration)) s")
+
+    // The soundtrack, if asked for. A seek moves the sound *inside* `beginSession` and the move
+    // is required to be synchronous, so with sound the seek does strictly more work on the
+    // calling thread than without — and without sound this mode would report a smaller number
+    // than the app produces.
+    var audio: PlaybackAudio?
+    if withSound {
+        let plan = AudioPlaybackPlan.choose(
+            for: info, containerIsPlayable: AudioPlaybackPlan.containerIsPlayable(input))
+        log("audio  : \(plan)")
+        do {
+            let extractor = AudioExtractor()
+            let outcome = try extractor.prepare(from: input, info: info, progress: { _ in })
+            log(String(format: "         %@ in %.2f s",
+                       outcome.fromCache ? "from cache" : "prepared", outcome.wallSeconds))
+            audio = try waitForSound {
+                try await PlaybackAudio(url: outcome.url, plan: outcome.plan)
+            }
+        } catch {
+            fail("could not prepare the soundtrack: \(error)")
+        }
+    }
+    log("")
+
+    let display = CountingDisplay(costMilliseconds: 0)
+    let controller = PlaybackController(
+        url: input, display: display,
+        configuration: .init(outputRate: outputRate, depth: depth,
+                             sceneDetection: true, startSeconds: 0),
+        info: info, audio: audio)
+    do {
+        try controller.start()
+    } catch {
+        fail("\(error)")
+    }
+    controller.play()
+
+    log("  target s |  blocked ms | to first frame ms | played before")
+    log("  ---------+-------------+-------------------+--------------")
+    var blocks: [Double] = []
+    var resumes: [Double] = []
+
+    for target in positions {
+        // Settle before *every* seek, not just the first. Measuring the next seek from the
+        // previous seek's first frame measures a teardown with almost nothing in flight, which
+        // is the easy case and not the one a user is in when they grab the playhead.
+        let warm = Date().addingTimeInterval(settle)
+        while Date() < warm { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+
+        let playedBefore = controller.status.shown
+        // The seek is asynchronous now, so what is measured here is the time the *caller* is held
+        // — which is the freeze the app used to take on the main thread. `--block` restores the old
+        // synchronous behaviour by waiting for the rebuild, so the two can be compared directly.
+        let t0 = now()
+        if blockOnSeek {
+            let done = DispatchSemaphore(value: 0)
+            controller.seek(to: target) { _ in done.signal() }
+            done.wait()
+        } else {
+            controller.seek(to: target)
+        }
+        let blocked = (now() - t0) * 1000
+
+        // The picture is back when the *new* session has presented its first frame. The
+        // controller's own counter is the right one: a new session means a new presenter, so it
+        // starts at zero and the first frame is the transition from 0 to 1.
+        var toFirst: Double?
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+            if controller.status.shown > 0 { toFirst = (now() - t0) * 1000; break }
+        }
+        blocks.append(blocked)
+        if let toFirst { resumes.append(toFirst) }
+        log(String(format: "  %8.1f | %11.0f | %17@ | %d",
+                   target, blocked,
+                   toFirst.map { String(format: "%.0f", $0) } ?? "TIMEOUT",
+                   playedBefore))
+    }
+
+    controller.stop()
+
+    let worstBlock = blocks.max() ?? 0
+    let meanBlock = blocks.isEmpty ? 0 : blocks.reduce(0, +) / Double(blocks.count)
+    let worstResume = resumes.max() ?? 0
+    log("")
+    log(String(format: "blocked the caller: mean %.1f ms, worst %.1f ms, over %d seeks",
+               meanBlock, worstBlock, blocks.count))
+    if !resumes.isEmpty {
+        log(String(format: "picture was back:  mean %.0f ms, worst %.0f ms",
+                   resumes.reduce(0, +) / Double(resumes.count), worstResume))
+    }
+    // Only when there is a block to talk about. Since the fix the caller is not held at all, and
+    // the ratio of two sub-microsecond numbers is a real-looking figure that means nothing —
+    // "worst block is 2.3x the mean" printed over a mean of 0.0004 ms.
+    if meanBlock >= 1 {
+        log(String(format: "spread: worst block is %.1fx the mean — a constant would be 1.0x",
+                   worstBlock / meanBlock))
+    } else {
+        log("spread: n/a — the caller is not held, so there is nothing for the ratio to describe")
+    }
+    exit(0)
 }
 
 // ---------------------------------------------------------------- sound helpers

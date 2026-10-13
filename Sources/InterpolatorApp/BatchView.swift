@@ -105,10 +105,21 @@ struct BatchView: View {
 
             Text("·").foregroundStyle(.tertiary)
 
-            Label(model.settings.interpolateAtFullResolution
-                  ? "Batch writes at the source's resolution"
-                  : "Batch still writes at the source's resolution — the 1080p setting is playback only",
+            Label(model.settings.conversionQuality == .fast
+                  ? "Interpolating at 1080p"
+                  : "Interpolating at the source's resolution",
                   systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+
+            Text("·").foregroundStyle(.tertiary)
+
+            // The *delivered* size, which is a separate setting from the interpolation size
+            // beside it. Both are shown because the pair is the point: "interpolating at 1080p,
+            // delivering 3440 × 1440" is the whole arrangement, and either half alone is
+            // ambiguous about what a four-hour job is going to produce.
+            Label(model.settings.batchOutputLabel, systemImage: "rectangle.inset.filled")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
@@ -233,12 +244,17 @@ struct BatchRow: View {
         .frame(width: 62, alignment: .trailing)
     }
 
-    /// The bar, and what the bar is measuring.
+    /// The bar, what the bar is measuring, and how much longer it has to go.
     ///
     /// The fraction comes from the pipeline once per interval, and the total is an **estimate**
     /// — Matroska reports `nb_frames=N/A`, so a film's length comes from its duration. So the
     /// bar is honest about reaching 100% slightly before the film ends rather than pretending
     /// to be exact.
+    ///
+    /// The time remaining is measured from the job's **rate**, not from `elapsed / fraction`.
+    /// Those two differ by hours on a real film: the old formula started its clock at the probe,
+    /// so every second spent extracting the audio counted as a second of rendering. See
+    /// ``ProgressEstimator``.
     private func progressBar(_ progress: BatchConverter.Progress) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             if let fraction = progress.fraction {
@@ -258,12 +274,33 @@ struct BatchRow: View {
                         .foregroundStyle(.tertiary)
                 }
                 Spacer()
-                if let remaining = job.remaining {
-                    Text("about \(Fmt.interval(remaining)) left")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
+                projection(progress)
             }
+        }
+    }
+
+    /// What the job has left, or an honest admission that it does not know yet.
+    @ViewBuilder
+    private func projection(_ progress: BatchConverter.Progress) -> some View {
+        if progress.stage == .rendering {
+            if let remaining = job.remaining {
+                Label("about \(Fmt.interval(remaining)) left", systemImage: "clock")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if job.isEstimating {
+                // Not a placeholder for a number that is on its way — the estimator genuinely
+                // has no rate yet, and saying so beats guessing for the first few seconds.
+                Text("estimating…")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        } else {
+            // The render is behind us. The tail — restoring the audio, joining the pieces —
+            // reports no fraction of its own, and carrying the render's last projection through
+            // it would read "about 0 seconds left" for as long as the mux takes.
+            Text(progress.stage.description)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
     }
 
@@ -287,6 +324,13 @@ struct BatchRow: View {
                 Text("\(result.cutCount) cuts")
                 Text(String(format: "%.0f%% passthrough",
                             result.passthroughFraction * 100))
+                // Only when it differs from the source. A conversion with no output target
+                // delivered the source's size, and printing it twice would be noise.
+                if result.delivered.width != result.source.width
+                    || result.delivered.height != result.source.height {
+                    Text("delivered \(result.delivered.label)")
+                        .foregroundStyle(.secondary)
+                }
                 if let audio = result.audio {
                     Text(audio.summary)
                 } else {
@@ -311,6 +355,8 @@ struct BatchRow: View {
         lines.append("input   : \(job.input.path)")
         lines.append("output  : \(result.output.path)")
         lines.append("source  : \(Fmt.format(result.source))  \(result.source.frameRate)")
+        lines.append("deliver : \(result.delivered.label)"
+                     + "  fit \(result.fitMode.label.lowercased())")
         lines.append("rate    : policy \(model.settings.policy.label) -> \(result.resolution.output)"
                      + "  ratio \(result.resolution.ratio.numerator)"
                      + "/\(result.resolution.ratio.denominator)"

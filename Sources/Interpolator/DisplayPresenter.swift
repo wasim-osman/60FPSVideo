@@ -315,6 +315,11 @@ public final class DisplayPresenter: @unchecked Sendable {
     /// output frame `n` presents at `n x denominator / numerator` seconds, computed in
     /// integers. A `Double` here would be the same mistake as a decimal frame rate
     /// (invariant 14) — small, plausible, and cumulative over a feature film.
+    ///
+    /// The frame is also marked for immediate display. See ``markForImmediateDisplay(_:)``: the
+    /// timestamp is what the presenter *paces* by, and without that mark the display layer
+    /// paces by it too — a second scheduler, holding a different opinion, which is the bug this
+    /// method's second half exists to remove.
     static func sampleBuffer(imageBuffer: CVPixelBuffer,
                              format: CMVideoFormatDescription,
                              index: Int,
@@ -336,7 +341,73 @@ public final class DisplayPresenter: @unchecked Sendable {
         guard status == noErr, let sample else {
             throw InterpolatorError.writerFailed("could not wrap frame \(index) (\(status))")
         }
+        markForImmediateDisplay(sample)
         return sample
+    }
+
+    /// Ask the display to show this frame as soon as it arrives rather than at its timestamp.
+    ///
+    /// ## The bug this is
+    ///
+    /// A seek backwards froze the picture for the rest of the film, with the sound playing on and
+    /// **every counter in this app reporting a healthy player**. Measured on the real 4K film,
+    /// full screen, `AVSampleBufferDisplayLayer` on screen and in the window's layer tree:
+    ///
+    /// ```
+    /// seek forward  +1900 s   picture changed 52.6%
+    /// seek backward −1300 s   picture changed  0.0%   max 0   (bit-identical)
+    /// seek backward   −10 s   picture changed  0.0%   max 0
+    /// ```
+    ///
+    /// while the same seconds reported `status=rendering ready=true shown` climbing at 59.8/s.
+    /// Ten seconds backwards was enough, so it was never about the size of the jump — only its
+    /// direction.
+    ///
+    /// ## Why
+    ///
+    /// `AVSampleBufferDisplayLayer` has a scheduler of its own. From its header,
+    /// `enqueueSampleBuffer:`:
+    ///
+    /// > Otherwise, the decoded image will be displayed at sampleBuffer's output presentation
+    /// > timestamp, **as interpreted by the control timebase (or the `mach_absolute_time`
+    /// > timeline if there is no control timebase)**.
+    ///
+    /// This pipeline never attaches a control timebase — deliberately, see the note at the top of
+    /// this file — so the layer falls back to that second reading and schedules by the timestamp
+    /// itself. The presenter has *already* waited for the frame's moment before enqueuing, so the
+    /// timestamp's only remaining job was to be a second opinion, and the two agree for exactly as
+    /// long as the timestamps only ever increase. A backwards seek makes them disagree, and the
+    /// layer wins: it holds a frame it has decided is not due yet, and the picture on screen stays
+    /// where it was while frames pile up behind it. Nothing fails, so nothing is reported.
+    ///
+    /// ## The mark
+    ///
+    /// The same header names the switch that turns its scheduling off, and it is the semantic this
+    /// presenter was always written against — *"a frame is enqueued when its time has come, and
+    /// the layer shows what it is given as it is given"*:
+    ///
+    /// > if sampleBuffer has the `kCMSampleAttachmentKey_DisplayImmediately` attachment set to
+    /// > `kCFBooleanTrue`, the decoded image will be displayed as soon as possible, replacing all
+    /// > previously enqueued images **regardless of their timestamps**.
+    ///
+    /// It also cleans up the other end of a seek for free: a frame marked this way replaces
+    /// whatever the layer was still holding, so a session that begins behind the old one cannot
+    /// flash the old position first.
+    ///
+    /// The header's one warning about this attachment — that it should not be combined with a
+    /// control timebase or an `AVSampleBufferRenderSynchronizer` — does not apply, because there is
+    /// neither, which is the same fact that made the bug possible.
+    private static func markForImmediateDisplay(_ sample: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample,
+                                                                       createIfNecessary: true),
+              CFArrayGetCount(attachments) > 0 else { return }
+        // The array holds one mutable dictionary per sample, created by the call above.
+        let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0),
+                                       to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            dictionary,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
     }
 
     private func record(_ problem: String) {
