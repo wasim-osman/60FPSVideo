@@ -355,6 +355,143 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--probe" {
     }
 }
 
+// ---------------------------------------------------------------- processor probe
+//
+// `interp-harness --processors` reports what this machine's VideoToolbox frame-processor
+// surface actually offers, by *asking it* rather than by reading the documentation. Two
+// questions drive it, and neither can be answered from a header:
+//
+//   1. **What format must a precomputed optical flow buffer have?** The frame-rate
+//      conversion configuration accepts one (`usePrecomputedFlow: true` +
+//      `VTFrameProcessorOpticalFlow`), and that object is built from two `CVPixelBuffer`s —
+//      but no header states the pixel format, the resolution, or how a vector is encoded in
+//      the bytes. If `VTOpticalFlowConfiguration` states its own destination attributes, that
+//      is the answer, and it is the difference between a week of guessing and an afternoon.
+//
+//   2. **Is the video super-resolution scaler available, and at what scale factors** for the
+//      size this player actually produces (1920×816)? It is documented `macos(26.0)`, and the
+//      app's floor is 15.4, so whether it can be used at all is a runtime question.
+
+/// A FourCC as text, because a pixel format read as a decimal integer is unreadable.
+func fourCC(_ value: UInt32) -> String {
+    let bytes = [UInt8((value >> 24) & 0xFF), UInt8((value >> 16) & 0xFF),
+                 UInt8((value >> 8) & 0xFF), UInt8(value & 0xFF)]
+    guard let text = String(bytes: bytes, encoding: .ascii),
+          text.allSatisfy({ $0.isLetter || $0.isNumber }) else { return "\(value)" }
+    return "'\(text)' (\(value))"
+}
+
+/// One line of a pixel-buffer-attributes dictionary, with the keys that matter first.
+///
+/// Pixel formats come back as a list of FourCC integers and read as gibberish in decimal, so
+/// they are rendered as text. Empty sub-dictionaries are dropped rather than printed as `{}`.
+func attributeSummary(_ attributes: [String: Any]?) -> String {
+    guard let attributes, !attributes.isEmpty else { return "none stated" }
+    let leading = ["PixelFormatType", "Width", "Height", "BytesPerRowAlignment",
+                   "MetalCompatibility", "OpenGLCompatibility"]
+    let ordered = leading.filter { attributes[$0] != nil }
+        + attributes.keys.filter { !leading.contains($0) }.sorted()
+    var parts: [String] = []
+    for key in ordered {
+        guard let value = attributes[key] else { continue }
+        if let list = value as? [NSNumber] {
+            let rendered = key == "PixelFormatType"
+                ? list.map { fourCC($0.uint32Value) }.joined(separator: ",")
+                : list.map { "\($0)" }.joined(separator: ",")
+            parts.append("\(key)=[\(rendered)]")
+        } else if let number = value as? NSNumber {
+            let rendered = key == "PixelFormatType"
+                ? fourCC(number.uint32Value) : "\(number)"
+            parts.append("\(key)=\(rendered)")
+        } else if let dict = value as? [String: Any], dict.isEmpty {
+            continue
+        } else {
+            parts.append("\(key)=\(value)")
+        }
+    }
+    return parts.joined(separator: "  ")
+}
+
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--processors" {
+    let os = ProcessInfo.processInfo.operatingSystemVersion
+    log("macOS    : \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)")
+    log("")
+
+    log("VTOpticalFlowConfiguration  — the companion that would produce a flow to hand back")
+    log("  supported        : \(VTOpticalFlowConfiguration.isSupported)")
+    log("  default revision : \(VTOpticalFlowConfiguration.defaultRevision.rawValue)")
+    log("  revisions        : \(VTOpticalFlowConfiguration.supportedRevisions)")
+    // The destination geometry is the one thing no header states, and it is what an app has to
+    // allocate. Probed across the sizes this project actually uses, so the scaling rule is read
+    // off rather than assumed — the first run reported 240x135 for a 1920x816 request, which is
+    // 1920/8 by 1080/8 and therefore not obviously the rule for a 2.35:1 frame.
+    for (width, height) in [(1920, 816), (1920, 1080), (960, 408), (3840, 1632)] {
+        if let flow = VTOpticalFlowConfiguration(
+            frameWidth: width, frameHeight: height,
+            qualityPrioritization: .normal,
+            revision: VTOpticalFlowConfiguration.defaultRevision) {
+            log("  \(width)x\(height)")
+            log("    source     : \(attributeSummary(flow.sourcePixelBufferAttributes))")
+            log("    destination: \(attributeSummary(flow.destinationPixelBufferAttributes))")
+        } else {
+            log("  \(width)x\(height): init nil")
+        }
+    }
+    log("")
+
+    for usePrecomputed in [false, true] {
+        let label = usePrecomputed ? "precomputed flow" : "flow computed on the fly"
+        log("VTFrameRateConversionConfiguration  — \(label)")
+        if let config = VTFrameRateConversionConfiguration(
+            frameWidth: 1920, frameHeight: 816,
+            usePrecomputedFlow: usePrecomputed,
+            qualityPrioritization: .normal,
+            revision: VTFrameRateConversionConfiguration.defaultRevision) {
+            log("  source attrs     : \(attributeSummary(config.sourcePixelBufferAttributes))")
+            log("  destination attrs: \(attributeSummary(config.destinationPixelBufferAttributes))")
+        } else {
+            log("  init at 1920x816 : nil")
+        }
+    }
+    log("")
+
+    // The super-resolution scalers are `macos(26.0)`. The app's floor is 15.4, so this is a
+    // runtime question and the gate is not cosmetic — without it the file does not compile,
+    // which is itself the answer to "can the app use this on every machine it supports?".
+    if #available(macOS 26.0, *) {
+        log("VTSuperResolutionScalerConfiguration - macOS 26+, the app's floor is 15.4")
+        log("  supported        : \(VTSuperResolutionScalerConfiguration.isSupported)")
+        log("  scale factors    : \(VTSuperResolutionScalerConfiguration.supportedScaleFactors)")
+        for factor in [2, 3] {
+            if let sr = VTSuperResolutionScalerConfiguration(
+                frameWidth: 1920, frameHeight: 816,
+                scaleFactor: factor, inputType: .video,
+                usePrecomputedFlow: false,
+                qualityPrioritization: .normal,
+                revision: VTSuperResolutionScalerConfiguration.defaultRevision) {
+                log("  scale x\(factor)         : ok"
+                    + "   model status \(sr.configurationModelStatus.rawValue)")
+                log("    source attrs   : \(attributeSummary(sr.sourcePixelBufferAttributes))")
+                log("    destination    : \(attributeSummary(sr.destinationPixelBufferAttributes))")
+            } else {
+                log("  scale x\(factor)         : init nil")
+            }
+        }
+        log("")
+
+        log("VTLowLatencySuperResolutionScalerConfiguration - macOS 26+")
+        let lowLatencyFactors = VTLowLatencySuperResolutionScalerConfiguration
+            .supportedScaleFactors(frameWidth: 1920, frameHeight: 816)
+        log("  supported        : \(VTLowLatencySuperResolutionScalerConfiguration.isSupported)")
+        log("  scale factors    : \(lowLatencyFactors)")
+    } else {
+        log("VTSuperResolutionScalerConfiguration: unavailable below macOS 26")
+    }
+    log("")
+
+    exit(0)
+}
+
 // ---------------------------------------------------------------- decode mode
 //
 // `interp-harness --decode FILE OUT [--start T] [--max-frames N]` decodes through
