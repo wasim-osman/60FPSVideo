@@ -4,26 +4,36 @@ import Foundation
 ///
 /// ## The measurement this exists for
 ///
-/// `VTFrameProcessor`'s cost is a **step function of frame width**, not of pixel count. Measured
-/// on the release build, 192 frames of the real film, 24000/1001 → 60000/1001, depth 2:
+/// `VTFrameProcessor`'s cost is a **staircase of frame width**, not a curve of pixel count — and the
+/// staircase is **not monotonic**. Measured on one instrument (`interp-harness --measure-widths`),
+/// one build, one sitting, 20 intervals per width, three repetitions, the real film at
+/// 24000/1001 → 60000/1001, depth 2:
 ///
-/// | resolution | pixels | ms/interval | × the 41.7 ms budget |
+/// | width | height | ms/interval | tread |
 /// | --- | --- | --- | --- |
-/// | 1920×816 | 1.57 Mpx | **31.87** | **0.76** |
-/// | 1920×1088 | 2.09 Mpx | **40.73** | **0.98** |
-/// | 1984×844 | 1.67 Mpx | 52.01 | 1.25 |
-/// | 2048×870 | 1.78 Mpx | 50.96 | 1.22 |
-/// | 2560×816 | 2.09 Mpx | 78.53 | 1.88 |
-/// | 3384×1440 | 4.87 Mpx | 81.55 | 1.96 |
-/// | 3840×1632 | 6.27 Mpx | ~105 | ~2.5 |
+/// | 960 | 408 | **31.04** | 1 |
+/// | 1600 | 680 | 38.22 | 2 |
+/// | 1792 | 762 | 38.30 | 2 |
+/// | 1920 | 816 | **37.57** | 2 |
+/// | 1440 | 612 | 54.00 | 3 |
+/// | 2048 | 870 | 55.32 | 3 |
+/// | 2304 | 978 | 80.08 | 4 |
+/// | 2560 | 1088 | 79.43 | 4 |
+/// | 2880 | 1224 | 78.52 | 4 |
+/// | 3200 | 1360 | 79.42 | 4 |
+/// | 3384 | 1438 | 79.05 | 4 |
+/// | 3840 | 1632 | **79.94** | 4 |
 ///
-/// Two rows are the whole point: **2560×816 and 1920×1088 are both 2,088,960 px and cost 78.53
-/// against 40.73 ms — 1.93×.** The table is not even monotonic in pixels: 2048×870 beats
-/// 1984×844, and 1920×1088 beats both. So the lever is *width*, the ladder below is built from
-/// widths rather than from pixel budgets, and only the 1920-wide rungs meet the budget.
+/// **1440 costs more than 1600, and 2048 costs more than 1920** — a narrower frame on a slower
+/// tread — so cost is not monotonic in pixels or in width, and nothing but a measurement predicts
+/// it. Two consequences drive the ladder: only the ~38 ms tread meets this film's 41.7 ms budget,
+/// and **everything from 2304 up costs the same ~79 ms**, so 3384 — SVP's working width — is no
+/// cheaper than the source itself.
 ///
-/// See `reports/BUILD-DECISIONS.md` §29–30 for the full measurement, including why SVP — which
-/// resizes to 3384×1440 before it interpolates — is not helped by its own resize either.
+/// Heights follow the source's aspect because that is what the probe measures. An older version of
+/// this table carried 16:9 rows (1920×1088, 2560×816) from a different instrument at a different
+/// aspect, and quoted the *pipeline* rather than the engine for 3840 — which is why its "the resize
+/// is worth 22%" did not survive re-measurement. See `reports/BUILD-DECISIONS.md` §38.
 public enum InterpolationWidth {
 
     /// The width a *conversion* may fall back to when asked to be fast.
@@ -46,6 +56,14 @@ public enum InterpolationWidth {
     /// ~25–27 ms. A ladder carrying 1600 and 1280 therefore spends its probe budget walking rungs
     /// that cost the *same* as the one above them, which is how the 960 fallback came to be chosen
     /// without ever being measured. See invariant 54.
+    ///
+    /// **A later sweep at one film position found four treads, and did not reproduce 1280.** That
+    /// run puts 1440 and 2048 on a ~54 ms tread of their own and leaves 1280 unstable across reps
+    /// (58.51 / 34.98 / 35.16 ms), so 1280's placement is not settled. The ladder is unchanged:
+    /// 1440 and 2048 are both over budget anyway, and 1280 sits on the same tread as 1920 wherever
+    /// it lands. The open question is the *top* — 3840 and 2560 cost the same ~79 ms here, so the
+    /// walk spends two probes before reaching a rung that fits. That needs a second machine to
+    /// resolve, because the plateau's width is a property of the engine on this GPU. See §38.
     public static let ladder = [2560, 1920, 960]
 
     /// Milliseconds one interval of film time is worth: how long a render may take and still

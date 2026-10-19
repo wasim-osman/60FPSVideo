@@ -169,6 +169,9 @@ func parseOptions() -> Options {
                        the media engine is worth to a whole conversion; §36),
                        --model-quality normal|quality (the interpolator's own
                        tier; normal is what ships, quality is the slower one; §37),
+                       --precomputed-flow (hand the engine an all-zero motion
+                       field, removing estimation from the run — a stopwatch, and
+                       the output is a cross-fade),
                        --activity (hold the app's no-throttling assertion),
                        --container mp4|mkv (default: from OUT's extension),
                        --audio automatic|copy|transcode|drop.
@@ -863,6 +866,8 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     // The framework's model tier — `.normal` is the shipping one. Only two exist, and there is
     // nothing below `.normal`, which is why this is a measurement hatch and not a user setting.
     var modelQuality = VTFrameRateConversionConfiguration.QualityPrioritization.normal
+    // Hands the engine a zero flow field so the motion estimation is taken out of the run.
+    var precomputedFlow = false
 
     let rest = Array(CommandLine.arguments.dropFirst(4))
     var k = 0
@@ -894,6 +899,12 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
             case "quality": modelQuality = .quality
             default: fail("--model-quality needs normal or quality")
             }
+        case "--precomputed-flow":
+            // Hands the engine an all-zero optical flow, so the motion estimation is removed from
+            // the run rather than made cheaper. §29 attributes the whole gap against SVP to that
+            // estimation; if the attribution is right, this is where the time should go. The
+            // output is a cross-fade, so this is a stopwatch and not a setting. See `FlowSupply`.
+            precomputedFlow = true
         case "--output-size":
             // The delivered size, which is deliberately independent of `--quality`. It exists on
             // the harness so a screen-sized output can be measured on the real film — both its
@@ -1014,6 +1025,9 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
     if modelQuality != .normal {
         log("model  : .quality — the framework's slower tier (NOT the shipping setting)")
     }
+    if precomputedFlow {
+        log("flow   : SUPPLIED ZERO FIELD — motion estimation removed (output is a cross-fade)")
+    }
     if case .fixed(let size) = outputTarget {
         log("deliver: \(size.label)  (\(fitMode.label.lowercased()) into it)")
     }
@@ -1041,14 +1055,16 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--convert" {
                                           hardwareDecode: false)
                 }
             }
-            if modelQuality != .normal {
+            if modelQuality != .normal || precomputedFlow {
                 // Same seam as `--no-hwaccel`: only the engine factory differs, so the arms
-                // differ in exactly the one variable under test. The tier is bound to a `let`
-                // because the factory is `@Sendable` and may not close over a mutable local.
+                // differ in exactly the one variable under test. The settings are bound to
+                // `let`s because the factory is `@Sendable` and may not close over a mutable local.
                 let tier = modelQuality
+                let supply: FlowSupply = precomputedFlow ? .constant : .engine
                 converter.makeEngine = { source, output, depth in
                     VTFrameProcessorEngine(source: source, output: output, depth: depth,
-                                           qualityPrioritization: tier)
+                                           qualityPrioritization: tier,
+                                           flowSupply: supply)
                 }
             }
             if showProgress {
@@ -1238,6 +1254,7 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--measure-widt
     var intervals = 20
     var widths: [Int] = []
     var modelQuality = VTFrameRateConversionConfiguration.QualityPrioritization.normal
+    var precomputedFlow = false
 
     let rest = Array(CommandLine.arguments.dropFirst(3))
     var k = 0
@@ -1254,6 +1271,10 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--measure-widt
             case "quality": modelQuality = .quality
             default: fail("--model-quality needs normal or quality")
             }
+        case "--precomputed-flow":
+            // The sharpest form of the question: ms/interval with the motion estimation removed.
+            // A 20-interval probe resolves this and the end-to-end wall cannot.
+            precomputedFlow = true
         case "--start":
             k += 1
             guard k < rest.count, let value = Double(rest[k]) else {
@@ -1294,11 +1315,15 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--measure-widt
     log(String(format: "probe   : %d intervals, warm-up 2, depth 2, start %.1f s",
                intervals, startSeconds))
     log("model   : \(modelQuality == .normal ? ".normal (the shipping tier)" : ".quality")")
+    if precomputedFlow {
+        log("flow    : SUPPLIED ZERO FIELD — motion estimation removed (output is a cross-fade)")
+    }
     log("")
     log("  width     scaled        ms/interval   engine fps   vs budget   spare")
-    // Bound to a `let` because `measure`'s engine factory is `@Sendable` and may not close
+    // Bound to `let`s because `measure`'s engine factory is `@Sendable` and may not close
     // over a mutable local.
     let tier = modelQuality
+    let supply: FlowSupply = precomputedFlow ? .constant : .engine
     for width in widths {
         let scaled = InterpolationWidth.scaled(info, toWidth: width)
         guard let m = try? PlaybackCalibrator.measure(
@@ -1306,7 +1331,8 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--measure-widt
             width: width, intervals: intervals, depth: 2, startSeconds: startSeconds,
             makeEngine: { source, output, depth in
                 VTFrameProcessorEngine(source: source, output: output, depth: depth,
-                                       qualityPrioritization: tier)
+                                       qualityPrioritization: tier,
+                                       flowSupply: supply)
             }) else {
             log(String(format: "  %5d     %4d x %-4d   unmeasurable",
                        width, scaled.width, scaled.height))

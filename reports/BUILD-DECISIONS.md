@@ -3781,6 +3781,180 @@ encoded-output A/B cannot resolve a picture difference below roughly 59 dB, and 
 under that floor. Invariant 18 recorded that VT is not bit-exact; this is its size. Any future "does
 setting X change the picture?" question has to clear this bar, or be answered at a different seam.
 
+## 38. "Is the whole gap really the motion estimate?" — no. It is about half, and §29's table was measured with two instruments
+
+**What §29 claimed, and why it had to be re-tested rather than re-read.** §29 closed the playback
+question by attributing the entire gap against SVP to the motion model: `VTFrameProcessor` "computes
+dense per-pixel optical flow — 6,266,880 flow vectors per frame at 4K — **185×** as many motion
+estimates" as SVP's 33,840 block vectors. That was an inference from the header's silence, and the
+`--processors` probe undercut its premise. The flow field the framework *hands you* is **480×270 at
+4K — 129,600 vectors**, against the picture's 6.27 Mpx: **four times SVP's grid, not 185×**. At 1920
+it is **240×135 — 32,400**, which is *fewer* than SVP's. That does not by itself prove the
+*internal* estimator is coarse, because its working resolution is not observable from here. So the
+claim was tested instead of argued: **remove the estimation and time what is left.**
+
+**The experiment is one flag.** `VTFrameRateConversionParameters` accepts an optional
+`opticalFlow: VTFrameProcessorOpticalFlow`, so with `usePrecomputedFlow: true` the engine skips its
+own estimator and only warps the frames onto the field it is given. `--precomputed-flow` supplies an
+**all-zero** field in exactly the geometry and pixel format the `--processors` probe discovered
+(`240×135`, `'2C0h'` = `kCVPixelFormatType_TwoComponent16Half`) — so that probe was the thing that
+made this measurement possible at all. The two arms differ in one variable: whether the engine
+estimates motion. Same film, same position, same depth, same build, interleaved.
+
+**First the guard, because a flag that is ignored looks exactly like a flag that is cheap.** This is
+§37's lesson applied *before* the measurement rather than after it. The two encoded outputs were
+compared against the run-to-run floor invariant 18 established:
+
+| comparison | mean PSNR | min |
+| --- | --- | --- |
+| engine rep 1 vs rep 2 — the noise floor | **55.75 dB** | 49.85 |
+| zero-flow rep 1 vs rep 2 — the noise floor | **55.07 dB** | 47.04 |
+| **engine vs zero flow — the effect** | **39.59 dB** | 25.20 |
+
+The effect is **16 dB below the floor**, so the supplied field is genuinely consumed and the picture
+is genuinely different — the exact opposite of §37's tier comparison, which sat *under* the floor and
+could not be measured at all. The stopwatch numbers below are therefore timing two different amounts
+of work, not two spellings of the same work.
+
+**Per interval — five interleaved reps, 20 intervals each, warm-up discarded:**
+
+| interpolate at | estimation on (shipping) | estimation removed | Δ | against the 41.708 ms budget |
+| --- | --- | --- | --- | --- |
+| 3840×1632 | **79.15 ms** (sd 1.31) | **57.02 ms** (sd 1.31) | **−22.13 ms, −28.0%** (35σ) | 1.90× → **1.37× over** |
+| 1920×816 | **37.16 ms** (sd 0.61) | **24.66 ms** (sd 0.29) | **−12.50 ms, −33.6%** (33σ) | 0.89× → **0.59× of budget** |
+
+**Two facts follow, and the second is the one that matters.**
+
+**1. Estimation is about a third of the engine's cost, and that is an upper bound.** With the
+estimator skipped the engine is 28% cheaper at 4K and 34% cheaper at 1080p. It is an upper bound
+because a zero field may also let the synthesis take a cheaper path — a warp with nothing to occlude
+has less to do — so the true estimator cost is at or below this figure, never above it.
+
+**2. Even at zero cost, 4K does not fit.** 57.02 ms against a 41.708 ms budget is **1.37× over**. If
+estimation were the whole gap, removing it would have left the engine near-free; it left it **missing
+the budget by 15 ms**. So §29's "this is the whole gap" is false and the **185×** figure is
+withdrawn. What remains is the **synthesis** stage — the warp and blend at output resolution — which
+is precisely the stage SVP is allowed to degrade with `fi_auto` and artifacts masking and this engine
+is not. That half of the gap is real, and no configuration the framework exposes reaches it.
+
+At 1080p the answer is different and better: removing estimation takes that rung from **1.12× real
+time to 1.69×**. There, estimation is a third of a cost that already fits — headroom rather than a
+wall — which is why the player's 1920 answer was never estimation's fault.
+
+### The same question through a whole conversion, where four sessions live
+
+1200 frames of the real 4K HDR film, four sessions, interleaved, three repetitions:
+
+| rep | estimation on | estimation removed | engine `slotWait` | removed `slotWait` | driver busy (on / removed) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 53.1 s | **27.2 s** | 25.5 s | **0.0 s** | 27.1 / 27.0 s |
+| 2 | 55.4 s | 48.4 s | 32.0 s | 25.0 s | 22.9 / 23.1 s |
+| 3 | 68.7 s | 30.3 s | 43.7 s | 5.3 s | 24.6 / 24.6 s |
+
+**The decomposition is exact, and that is the point.** In every rep the wall difference equals the
+`slotWait` difference to within 0.4 s — 25.9 vs 25.5, 7.0 vs 7.0, 38.4 vs 38.4 — while driver busy
+does not move, because the reader cannot see a flag that changes the engine. So the flag does not
+make the conversion do less total work; **it removes idle.** The engine stops being the constraint
+and the ffmpeg reader becomes it: in rep 1 the removed arm spends **27.0 s of its 27.2 s wall in the
+driver**. That is §36's finding from the other side — there, work freed from the reader moved into
+`slotWait`; here, work removed from the engine drains it.
+
+Best case **53.1 → 27.2 s, 1.95×**. Rep 2 is contaminated by something outside the run — its removed
+arm idles 25.0 s where rep 1's idles 0.0 — so the honest summary is **1.95× when the machine is quiet
+and less when it is not**, and the residual 27.2 s is reader-bound rather than engine-bound.
+
+**This arm is a stopwatch, not a feature.** It writes a cross-fade: frames blended with no motion
+compensation whatsoever. Nobody would watch it. Its only job is to price the estimator, and the
+estimator is now priced.
+
+### And the width table §29 rested on was measured with two instruments
+
+Re-measuring the curve with one instrument, one build, one sitting, three reps, exposed the problem —
+and then a more interesting fact. §29's table put **3840×1632 at "~105 ms (§24)"**, a *pipeline*
+figure cited from a different section, in the same column as engine-only measurements such as
+3384×1440's 81.55 ms, and read the difference as "the resize is worth 22%". On one instrument the
+resize is worth **nothing at all**:
+
+| width | height | ms/interval (mean of 3) |
+| --- | --- | --- |
+| 960 | 408 | **31.04** |
+| 1280 | 544 | 42.88 *(unstable: 58.51 / 34.98 / 35.16)* |
+| 1440 | 612 | 54.00 |
+| 1600 | 680 | 38.22 |
+| 1792 | 762 | 38.30 |
+| 1920 | 816 | **37.57** |
+| 2048 | 870 | 55.32 |
+| 2304 | 978 | 80.08 |
+| 2560 | 1088 | 79.43 |
+| 2880 | 1224 | 78.52 |
+| 3200 | 1360 | 79.42 |
+| 3384 | 1438 | 79.05 |
+| 3840 | 1632 | **79.94** |
+
+**3384 and 3840 cost the same — 79.05 against 79.94 ms, 1.1% apart.** SVP's resize buys nothing,
+which is what §29 *concluded* and not what its arithmetic said.
+
+**The curve has four treads and is not monotonic.** ~31 ms at 960; ~38 ms at 1600, 1792 and 1920;
+~54 ms at 1440 and 2048; ~79 ms at everything from 2304 up. **1440 costs more than 1600, and 2048
+costs more than 1920** — a narrower frame on a slower tread — so the cost is not a function of
+pixels, of width, or of any quantity monotonic in either. And **everything from 2304 to 3840 costs
+the same ~79 ms**, so the top of the ladder is a plateau **4.5× wide in pixels**.
+
+**The scaler is not doing this.** `--measure-widths` decodes at source size and asks ffmpeg to scale
+down, so the measurement could be swscale rather than the engine. It is not: timing the source alone
+at every width gives **under 1.5 ms/frame** throughout — 0.74–0.77 for every scaled width bar the
+first sample, and 3.95 at native 3840 where four times the bytes are piped — against 31–80 ms
+intervals. The treads are the engine's.
+
+**What that means for the ladder, and what it does not.** `InterpolationWidth.ladder` is
+`[2560, 1920, 960]`, and `candidates` puts the source's own width in front of it, so a 4K film walks
+**3840 → 2560 → 1920**: two probes spent on rungs that cost the same ~79 ms before the walk reaches
+one that fits. That is invariant 54's defect — walking rungs that cost the same as the one above
+them — surviving at the top of the ladder instead of the middle. **It was not changed here**, because
+the plateau's width is a property of this engine on this GPU, and a second machine would be needed to
+know whether 2560 is a real rung anywhere else. Recorded as the test that would justify the change,
+not acted on.
+
+**In one line.** Motion estimation is about a third of the engine's cost — **28% at 4K, 34% at
+1080p** — so §29 was wrong to call it the whole gap: with estimation removed entirely the 4K engine
+still costs **57 ms against a 41.7 ms budget, 1.37× over**, and what is left is the synthesis stage
+SVP may degrade and this engine may not. §29's width table was also measured with two instruments,
+and re-measured with one the resize it dismissed is worth **zero rather than 22%**, the curve has
+four treads rather than a monotone staircase, and every width from 2304 up costs the same.
+
+## Invariants 82–84
+
+**82. Motion estimation is about a third of the interpolation's cost, and it is not the gap to SVP.**
+With the engine's estimator skipped — `usePrecomputedFlow: true` plus an all-zero
+`VTFrameProcessorOpticalFlow` — the cost falls **79.15 → 57.02 ms** per interval at 3840 (−28.0%,
+35σ) and **37.16 → 24.66 ms** at 1920 (−33.6%, 33σ), five interleaved reps. That is an **upper
+bound**, because a zero field can also make the synthesis cheaper. The bound is what decides the
+argument: even at zero estimation cost the 4K engine misses the 41.708 ms budget by 15 ms, so
+estimation cannot be "the whole gap" and §29's **185×** is withdrawn. What is left is synthesis — the
+warp and blend at output size — which is the stage SVP's `fi_auto` and artifacts masking are allowed
+to degrade. At 1920 the same removal takes the rung from **1.12× to 1.69× real time**, so estimation
+there was headroom, not a wall.
+
+**83. A supplied motion field is consumed, and the stopwatch alone cannot prove it.** A flag that is
+ignored and a flag that is cheap look identical in a timing. Comparing the encoded outputs settles
+it: **39.59 dB** between the shipping engine and the zero-flow arm against a **55.75 / 55.07 dB**
+run-to-run floor (invariant 18) — the effect is **16 dB below the floor**, so the field is used. Note
+the inversion of invariant 81: there the effect sat *under* the floor and could not be measured; here
+it is far above it and the measurement is real. Any future "flag X saved N%" on this engine needs the
+same three-way comparison first. The flag's own cost is that it writes a cross-fade, so it is an
+instrument and not a feature.
+
+**84. The width curve has four treads and is not monotonic; §29's table was measured with two
+instruments.** One instrument, one build, three reps: **~31 ms** at 960, **~38 ms** at 1600/1792/1920,
+**~54 ms** at 1440/2048, **~79 ms** at everything 2304 and above. **1440 costs more than 1600** and
+**2048 costs more than 1920** — narrower on a slower tread — so cost is not monotonic in pixels or in
+width. **3384×1438 and 3840×1632 cost 79.05 and 79.94 ms, 1.1% apart**, so SVP's resize is worth
+zero rather than the 22% §29 implied by putting a 3384 *engine* figure and a 3840 *pipeline* figure
+(§24's ~105 ms) in one column. The scaler is not responsible: the source alone costs under 1.5 ms per
+frame at every width. Consequence recorded but not acted on — `candidates` walks 3840 → 2560, two
+rungs on the same ~79 ms plateau, so a 4K film spends two probes before reaching one that fits. That
+is invariant 54's defect at the top of the ladder, and it needs a second machine to resolve.
+
 ---
 
 **All three answers are in — 2026-10-08.**
